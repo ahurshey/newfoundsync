@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/desktop", "crates/android"]
+# android is built only for android targets (via cargo-apk / cargo-ndk); keep it
+# out of the default host build so `cargo build` / `cargo test` stay desktop-only.
+default-members = ["crates/core", "crates/desktop"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# Unwind (not abort): a panic in a background thread — a malformed packet from
+# another machine, a version mismatch — kills just that thread, not the whole
+# app. Robustness matters more than the small size win for a LAN tool.
+panic = "unwind"

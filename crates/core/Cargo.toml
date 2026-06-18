@@ -1,0 +1,18 @@
+[package]
+name = "newfoundsync-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Newfoundsync — platform-neutral LAN audio-sync engine"
+
+[lib]
+name = "newfoundsync_core"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+cpal = "0.18.1"
+rtrb = "0.3.4"
+mdns-sd = "0.20.0"
+audiopus = "0.2.0"

@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Prebuilt arm64 libopus for Android — reproduce with crates/android/build-libopus-android.ps1
+/crates/android/opus-android/
+# Dev signing key (generate locally; never commit keystores)
+/crates/android/release.keystore
+# Built APKs
+/dist/

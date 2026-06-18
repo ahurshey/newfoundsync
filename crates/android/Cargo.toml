@@ -1,0 +1,68 @@
+﻿[package]
+name = "newfoundsync-android"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Newfoundsync Android client"
+
+[lib]
+name = "newfoundsync"
+crate-type = ["cdylib"]
+
+[dependencies]
+newfoundsync-core = { path = "../core" }
+anyhow = "1"
+tracing = "0.1"
+log = "0.4"
+
+# Android-only deps: the UI/runtime glue. Not pulled in for host builds, so the
+# crate compiles to an empty cdylib on Windows/Linux (its body is cfg'd to android).
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.34", default-features = false, features = ["android-native-activity", "wgpu", "default_fonts"] }
+android-activity = { version = "0.6", features = ["native-activity"] }
+winit = { version = "0.30", features = ["android-native-activity"] }
+jni = "0.21"
+ndk-context = "0.1"
+android_logger = "0.14"
+
+# --- cargo-apk packaging (debug APK without a Gradle project) ---
+[package.metadata.android]
+package = "me.newfoundsync.client"
+# One ABI per build (audiopus_sys keys libopus off a single OPUS_LIB_DIR); the
+# build-apk.ps1 helper loops ABIs into per-ABI APKs. Default is phones (arm64);
+# x86_64 is for emulator smoke-tests.
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 35
+
+[package.metadata.android.application]
+label = "Newfoundsync"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_WIFI_STATE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+
+# Throwaway dev signing key for sideloadable release APKs (NOT a production key).
+# Generate with: keytool -genkeypair -keystore crates/android/release.keystore \
+#   -alias newfoundsync -keyalg RSA -keysize 2048 -validity 10000 \
+#   -storepass changeit -keypass changeit -dname "CN=Newfoundsync Dev"
+[package.metadata.android.signing.release]
+path = "release.keystore"
+keystore_password = "changeit"
+
+
+
+
+
+
+

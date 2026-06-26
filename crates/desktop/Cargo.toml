@@ -1,6 +1,6 @@
 [package]
 name = "newfoundsync"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Lightweight LAN audio sharing with tight multiroom sync (desktop)"
@@ -28,6 +28,8 @@ axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"
 # Native server GUI: pick the audio source / video options, show the client URL.
 eframe = "0.34"
+# Render a scannable QR of the connect URL (default features off → no image/svg deps).
+qrcode = { version = "0.14", default-features = false }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 rcgen = "0.14.8"
 rustls = { version = "0.23.40", features = ["ring"] }
@@ -48,6 +50,13 @@ windows = { version = "0.62", features = [
     "Win32_Media_Audio",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Dwm",
+    # GPU zero-copy video path: D3D11 VideoProcessor (BGRA→NV12) + DXGI surfaces fed to
+    # the Media Foundation encoder. The VideoProcessor/CreateTexture2D/ColorSpace1 symbols
+    # are gated behind Dxgi_Common — without these features they don't exist.
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
 ] }
 # `#[implement]` (COM callback for ActivateAudioInterfaceAsync) emits windows_core paths.
 windows-core = "0.62"

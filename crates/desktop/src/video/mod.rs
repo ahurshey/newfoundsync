@@ -8,3 +8,5 @@ pub mod codec;
 pub mod capture;
 #[cfg(target_os = "windows")]
 pub mod mf_encoder;
+#[cfg(target_os = "windows")]
+pub mod gpu;

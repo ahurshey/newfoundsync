@@ -1,10 +1,10 @@
-//! GPU hardware H.264 encoder via Windows Media Foundation.
+//! GPU hardware HEVC (H.265) encoder via Windows Media Foundation.
 //!
-//! Enumerates the system's hardware H.264 encoder MFT (AMD AMF / NVIDIA NVENC /
+//! Enumerates the system's hardware HEVC encoder MFT (AMD AMF / NVIDIA NVENC /
 //! Intel QuickSync — whatever the GPU exposes), drives it as an async MFT, and
 //! exposes the same `encode_bgra`/`force_keyframe` API as the software encoder.
 //! Input is system-memory NV12 (converted from the captured BGRA); output is an
-//! Annex-B H.264 elementary stream the openh264 decoder on the client reads.
+//! Annex-B HEVC elementary stream the browser's WebCodecs decoder reads.
 //!
 //! The encoder is created and used entirely on the video-encode thread, so the
 //! COM objects never cross threads.
@@ -15,10 +15,12 @@ use std::mem::ManuallyDrop;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
+use windows::Win32::System::Variant::VARIANT;
 
-pub struct MfH264Encoder {
+pub struct MfHevcEncoder {
     transform: IMFTransform,
     events: IMFMediaEventGenerator,
     width: u32,
@@ -27,11 +29,35 @@ pub struct MfH264Encoder {
     nv12: Vec<u8>,
     frame_idx: i64,
     sample_dur: i64, // 100-ns units per frame
+    // Kept alive for the encoder's lifetime on the GPU path; None on the system-memory path.
+    _dxgi_manager: Option<IMFDXGIDeviceManager>,
 }
 
-impl MfH264Encoder {
+impl MfHevcEncoder {
+    /// System-memory encoder (CPU NV12 → encode_bgra). The fallback path.
     pub fn new(width: u32, height: u32, fps: u32, bitrate_kbps: u32) -> Result<Self> {
-        // H.264 wants even dimensions; our presets already are.
+        Self::build(width, height, fps, bitrate_kbps, None)
+    }
+
+    /// D3D11-aware encoder bound to `device`: feed GPU NV12 textures via encode_texture (zero-copy).
+    pub fn new_d3d(
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+        device: &ID3D11Device,
+    ) -> Result<Self> {
+        Self::build(width, height, fps, bitrate_kbps, Some(device))
+    }
+
+    fn build(
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+        d3d: Option<&ID3D11Device>,
+    ) -> Result<Self> {
+        // HEVC wants even dimensions; our presets already are.
         if width % 2 != 0 || height % 2 != 0 {
             bail!("dimensions must be even ({width}x{height})");
         }
@@ -39,10 +65,10 @@ impl MfH264Encoder {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED); // per-thread; ignore "already init"
             MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).context("MFStartup")?;
 
-            // Find a HARDWARE H.264 encoder MFT.
+            // Find a HARDWARE HEVC (H.265) encoder MFT.
             let out_info = MFT_REGISTER_TYPE_INFO {
                 guidMajorType: MFMediaType_Video,
-                guidSubtype: MFVideoFormat_H264,
+                guidSubtype: MFVideoFormat_HEVC,
             };
             let flags = MFT_ENUM_FLAG(
                 MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0,
@@ -59,7 +85,7 @@ impl MfH264Encoder {
             )
             .context("MFTEnumEx")?;
             if count == 0 || activates.is_null() {
-                bail!("no hardware H.264 encoder MFT on this system");
+                bail!("no hardware HEVC encoder MFT on this system (GPU may not support HEVC encode)");
             }
             let slice = std::slice::from_raw_parts(activates, count as usize);
             let transform: IMFTransform = match slice[0].as_ref() {
@@ -80,6 +106,31 @@ impl MfH264Encoder {
                 let _ = attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1);
             }
 
+            // GPU path: bind the MFT to our D3D11 device so it can consume NV12 textures
+            // directly. MUST be done BEFORE SetOutputType, and only if the MFT is D3D11-aware.
+            let dxgi_manager = if let Some(device) = d3d {
+                let aware = transform
+                    .GetAttributes()
+                    .ok()
+                    .and_then(|a| a.GetUINT32(&MF_SA_D3D11_AWARE).ok())
+                    .unwrap_or(0);
+                if aware == 0 {
+                    bail!("HEVC MFT is not D3D11-aware (no zero-copy path)");
+                }
+                let mut token = 0u32;
+                let mut mgr: Option<IMFDXGIDeviceManager> = None;
+                MFCreateDXGIDeviceManager(&mut token, &mut mgr)
+                    .context("MFCreateDXGIDeviceManager")?;
+                let mgr = mgr.context("no DXGI device manager")?;
+                mgr.ResetDevice(device, token).context("ResetDevice")?;
+                transform
+                    .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, mgr.as_raw() as usize)
+                    .context("SET_D3D_MANAGER")?;
+                Some(mgr)
+            } else {
+                None
+            };
+
             let frame_size = ((width as u64) << 32) | height as u64;
             let frame_rate = ((fps as u64) << 32) | 1;
             let par = (1u64 << 32) | 1;
@@ -87,19 +138,20 @@ impl MfH264Encoder {
             // Output type FIRST (required for encoders).
             let out = MFCreateMediaType().context("MFCreateMediaType(out)")?;
             out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_HEVC)?;
             out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_kbps.saturating_mul(1000))?;
             out.SetUINT64(&MF_MT_FRAME_SIZE, frame_size)?;
             out.SetUINT64(&MF_MT_FRAME_RATE, frame_rate)?;
             out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-            out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)?;
+            // HEVC Main profile, 8-bit 4:2:0 (matches the NV12 input).
+            out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)?;
             out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, par)?;
             // ~2-second GOP so late joiners / frame-droppers recover without a
             // back-channel (matches the server's periodic-keyframe cadence).
             out.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, (fps * 2).max(1))?;
             transform
                 .SetOutputType(0, &out, 0)
-                .context("SetOutputType(H264)")?;
+                .context("SetOutputType(HEVC)")?;
 
             // Input type: system-memory NV12.
             let inp = MFCreateMediaType().context("MFCreateMediaType(in)")?;
@@ -113,6 +165,14 @@ impl MfH264Encoder {
                 .SetInputType(0, &inp, 0)
                 .context("SetInputType(NV12)")?;
 
+            // Low-latency hint: ask the GPU encoder to minimize latency (low-delay rate
+            // control, minimal/no frame reordering — i.e. effectively no B-frames). Best-effort:
+            // not every MFT exposes ICodecAPI, and a missing/declined property must NOT fail
+            // encoder init (there is no software HEVC fallback). VT_BOOL is the correct type here.
+            if let Ok(codec_api) = transform.cast::<ICodecAPI>() {
+                let _ = codec_api.SetValue(&CODECAPI_AVEncCommonLowLatency, &VARIANT::from(true));
+            }
+
             let info = transform.GetOutputStreamInfo(0).context("GetOutputStreamInfo")?;
             let provides_samples = (info.dwFlags
                 & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32
@@ -125,7 +185,7 @@ impl MfH264Encoder {
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
 
-            Ok(MfH264Encoder {
+            Ok(MfHevcEncoder {
                 transform,
                 events,
                 width,
@@ -134,6 +194,7 @@ impl MfH264Encoder {
                 nv12: vec![0u8; (width as usize * height as usize * 3) / 2],
                 frame_idx: 0,
                 sample_dur: 10_000_000 / fps.max(1) as i64,
+                _dxgi_manager: dxgi_manager,
             })
         }
     }
@@ -144,30 +205,52 @@ impl MfH264Encoder {
             bail!("short BGRA frame: {} < {expected}", bgra.len());
         }
         self.bgra_to_nv12(bgra);
-        let mut out = Vec::new();
-        unsafe {
+        let out = unsafe {
             let sample = self.make_input_sample()?;
-            // Block until the MFT asks for input, draining any output that arrives
-            // in the meantime, then feed exactly this frame.
-            loop {
-                let ev = self.events.GetEvent(MF_EVENT_FLAG_NONE).context("GetEvent")?;
-                match ev.GetType()? {
-                    t if t == METransformNeedInput.0 as u32 => {
-                        self.transform.ProcessInput(0, &sample, 0).context("ProcessInput")?;
-                        break;
-                    }
-                    t if t == METransformHaveOutput.0 as u32 => self.drain_output(&mut out)?,
-                    _ => {}
+            self.pump(&sample)?
+        };
+        self.frame_idx += 1;
+        Ok(out)
+    }
+
+    /// Encode an NV12 GPU texture directly (zero-copy GPU path). The encoder must have been
+    /// built via `new_d3d` and bound to the same device the texture lives on.
+    pub fn encode_texture(&mut self, nv12: &ID3D11Texture2D) -> Result<Vec<u8>> {
+        let out = unsafe {
+            let buf = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, nv12, 0, false)
+                .context("MFCreateDXGISurfaceBuffer")?;
+            let sample = MFCreateSample().context("MFCreateSample")?;
+            sample.AddBuffer(&buf)?;
+            sample.SetSampleTime(self.frame_idx * self.sample_dur)?;
+            sample.SetSampleDuration(self.sample_dur)?;
+            self.pump(&sample)?
+        };
+        self.frame_idx += 1;
+        Ok(out)
+    }
+
+    /// Feed one input sample to the async MFT and drain whatever output is ready. Shared by
+    /// the system-memory (`encode_bgra`) and GPU-texture (`encode_texture`) paths.
+    unsafe fn pump(&mut self, sample: &IMFSample) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        // Block until the MFT asks for input, draining any output that arrives meanwhile.
+        loop {
+            let ev = self.events.GetEvent(MF_EVENT_FLAG_NONE).context("GetEvent")?;
+            match ev.GetType()? {
+                t if t == METransformNeedInput.0 as u32 => {
+                    self.transform.ProcessInput(0, sample, 0).context("ProcessInput")?;
+                    break;
                 }
-            }
-            // Collect any output that's immediately ready (non-blocking).
-            while let Ok(ev) = self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
-                if ev.GetType()? == METransformHaveOutput.0 as u32 {
-                    self.drain_output(&mut out)?;
-                }
+                t if t == METransformHaveOutput.0 as u32 => self.drain_output(&mut out)?,
+                _ => {}
             }
         }
-        self.frame_idx += 1;
+        // Collect any output that's immediately ready (non-blocking).
+        while let Ok(ev) = self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+            if ev.GetType()? == METransformHaveOutput.0 as u32 {
+                self.drain_output(&mut out)?;
+            }
+        }
         Ok(out)
     }
 
@@ -283,7 +366,7 @@ impl MfH264Encoder {
     }
 }
 
-impl Drop for MfH264Encoder {
+impl Drop for MfHevcEncoder {
     fn drop(&mut self) {
         unsafe {
             let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
@@ -306,7 +389,7 @@ mod tests {
     #[ignore = "needs a GPU H.264 encoder; run alone"]
     fn mf_encode_openh264_decode_roundtrip() {
         let (w, h) = (640u32, 480u32);
-        let mut enc = match MfH264Encoder::new(w, h, 30, 4000) {
+        let mut enc = match MfHevcEncoder::new(w, h, 30, 4000) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("skipping: no hardware encoder ({e:#})");

@@ -18,7 +18,7 @@ use windows::Win32::Media::Audio::{
     IAudioSessionEnumerator, IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+    CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
@@ -31,11 +31,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 /// A selectable capture source — an app (audio session) or a window. `pid` is what
 /// we feed to process-loopback capture (its whole process tree); `name` is the label.
+/// `hwnd` is the raw window handle for titled-window entries (used for per-window VIDEO
+/// capture); it's `None` for windowless audio sessions (background players).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioApp {
     pub pid: u32,
     pub name: String,
     pub exe: String,
+    pub hwnd: Option<isize>,
 }
 
 /// The combined picker list: every titled window (recognizable, e.g. "YouTube Music
@@ -68,7 +71,7 @@ fn build_sources(exclude_pid: u32) -> Vec<AudioApp> {
 fn enumerate_sessions(exclude_pid: u32) -> Vec<AudioApp> {
     let mut apps: Vec<AudioApp> = Vec::new();
     unsafe {
-        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let result = (|| -> windows::core::Result<()> {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
@@ -105,6 +108,7 @@ fn enumerate_sessions(exclude_pid: u32) -> Vec<AudioApp> {
                     pid,
                     name: exe.clone(),
                     exe,
+                    hwnd: None, // audio-only session: no window to capture video from
                 });
             }
             Ok(())
@@ -112,12 +116,10 @@ fn enumerate_sessions(exclude_pid: u32) -> Vec<AudioApp> {
         if let Err(e) = result {
             tracing::debug!("audio session enumeration failed: {e}");
         }
-        // Balance our own CoInitializeEx. Only when it actually initialized COM on this
-        // thread (S_OK/S_FALSE); a RPC_E_CHANGED_MODE means we didn't, so we must not
-        // decrement someone else's init count. This runs on a short-lived enum thread.
-        if hr.is_ok() {
-            CoUninitialize();
-        }
+        // No explicit CoUninitialize: this runs on the short-lived `source-enum` thread,
+        // which exits immediately after returning, and Windows tears down its COM apartment
+        // on thread exit. An explicit CoUninitialize here did a synchronous teardown that
+        // could DEADLOCK whenever the caller blocked the GUI/STA thread on our join().
     }
     apps
 }
@@ -201,6 +203,7 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
             pid,
             name: label,
             exe,
+            hwnd: Some(hwnd.0 as isize), // captured here so SCREEN VIDEO can grab just this window
         });
     }));
     TRUE

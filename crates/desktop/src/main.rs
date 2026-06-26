@@ -109,6 +109,7 @@ fn main() -> Result<()> {
         Some(VideoConfig {
             resolution,
             fps: if cli.fps == "60" { Fps::F60 } else { Fps::F30 },
+            quality_pct: 100, // headless: baseline quality (the GUI exposes the slider)
         })
     } else {
         None
@@ -162,6 +163,7 @@ fn run_headless(
         buffer_ms,
         capture_source,
         video,
+        video_target: media::VideoTarget::PrimaryMonitor, // headless: whole monitor (no window picker)
         encoder,
     })?;
 
@@ -184,6 +186,9 @@ fn run_headless(
     );
 
     let clients = Arc::new(AtomicUsize::new(0));
+    // Per-client registry (headless: no GUI to drive it, but the server still
+    // tracks identities for the control channel — harmless and keeps the API one shape).
+    let clients_reg = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // The sender must outlive the server (a dropped sender makes every client
     // reconnect-loop); `block_on` below keeps this whole scope alive.
     let (_state_tx, state_rx) = watch::channel(Arc::new(StreamState::from_media(&media)));
@@ -191,7 +196,7 @@ fn run_headless(
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(webserver::run(state_rx, clients, addr, use_tls))?;
+    runtime.block_on(webserver::run(state_rx, clients, clients_reg, addr, use_tls))?;
     Ok(())
 }
 

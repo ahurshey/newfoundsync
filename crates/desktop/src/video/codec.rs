@@ -83,13 +83,14 @@ impl H264Encoder {
 pub enum VideoEncoder {
     Cpu(H264Encoder),
     #[cfg(target_os = "windows")]
-    Hardware(crate::video::mf_encoder::MfH264Encoder),
+    Hardware(crate::video::mf_encoder::MfHevcEncoder),
 }
 
 impl VideoEncoder {
-    /// Build the encoder for the requested backend. `Auto` tries GPU, falling
-    /// back to CPU; `Hardware` errors if the GPU encoder is unavailable; `Cpu`
-    /// always uses openh264.
+    /// Build the video encoder. Video is now **HEVC (H.265)**, which has no software
+    /// encoder here (openh264 is H.264-only) — so it's GPU-only via Media Foundation with
+    /// NO fallback. The `backend` selection is therefore moot for video (all map to GPU HEVC);
+    /// it's kept in the signature so the GUI/CLI flag stays wired.
     pub fn new(
         backend: EncoderBackend,
         width: u32,
@@ -97,41 +98,18 @@ impl VideoEncoder {
         fps: u32,
         bitrate_kbps: u32,
     ) -> Result<VideoEncoder> {
-        let cpu = || H264Encoder::new(width, height, fps, bitrate_kbps).map(VideoEncoder::Cpu);
-
-        match backend {
-            EncoderBackend::Cpu => cpu(),
-            #[cfg(target_os = "windows")]
-            EncoderBackend::Hardware => {
-                let hw = crate::video::mf_encoder::MfH264Encoder::new(
-                    width,
-                    height,
-                    fps,
-                    bitrate_kbps,
-                )
-                .context("hardware (Media Foundation) encoder")?;
-                tracing::info!("video: hardware (GPU) encoder active");
-                Ok(VideoEncoder::Hardware(hw))
-            }
-            #[cfg(target_os = "windows")]
-            EncoderBackend::Auto => {
-                match crate::video::mf_encoder::MfH264Encoder::new(width, height, fps, bitrate_kbps)
-                {
-                    Ok(hw) => {
-                        tracing::info!("video: hardware (GPU) encoder active");
-                        Ok(VideoEncoder::Hardware(hw))
-                    }
-                    Err(e) => {
-                        tracing::warn!("video: GPU encoder unavailable ({e:#}); using CPU");
-                        cpu()
-                    }
-                }
-            }
-            #[cfg(not(target_os = "windows"))]
-            EncoderBackend::Hardware | EncoderBackend::Auto => {
-                tracing::warn!("video: hardware encode is Windows-only; using CPU");
-                cpu()
-            }
+        let _ = backend; // no software HEVC → backend choice can't change the codec
+        #[cfg(target_os = "windows")]
+        {
+            let hw = crate::video::mf_encoder::MfHevcEncoder::new(width, height, fps, bitrate_kbps)
+                .context("GPU (Media Foundation) HEVC encoder — HEVC video has no software fallback")?;
+            tracing::info!("video: GPU HEVC encoder active");
+            Ok(VideoEncoder::Hardware(hw))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (width, height, fps, bitrate_kbps);
+            anyhow::bail!("HEVC video encoding requires Windows (Media Foundation)")
         }
     }
 

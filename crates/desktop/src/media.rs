@@ -6,7 +6,7 @@
 //!
 //! Wire frames (binary, server→browser):
 //!   audio: [0x01][pts i64 BE][Opus bytes]
-//!   video: [0x02][pts i64 BE][flags u8][H.264 Annex-B bytes]
+//!   video: [0x02][pts i64 BE][flags u8][HEVC (H.265) Annex-B bytes]
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +43,15 @@ pub enum CaptureSource {
     App { pid: u32 },
 }
 
+/// What the screen-video capture grabs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoTarget {
+    /// The whole primary monitor (default).
+    PrimaryMonitor,
+    /// A single window, identified by its raw `HWND` value (from [`CaptureSource`]'s picker).
+    Window { hwnd: isize },
+}
+
 /// Static config the server hands each browser on connect (as JSON).
 #[derive(Clone, Debug)]
 pub struct MediaConfig {
@@ -60,7 +69,7 @@ impl MediaConfig {
     pub fn to_json(&self) -> String {
         format!(
             "{{\"name\":\"{}\",\"sampleRate\":{},\"channels\":{},\"audioCodec\":\"{}\",\"video\":{},\"frameRate\":{},\"bufferMs\":{},\"videoCodec\":\"{}\"}}",
-            self.name.replace('"', "'"),
+            self.name.replace('\\', "\\\\").replace('"', "'"), // escape backslash first → valid JSON
             self.sample_rate,
             self.channels,
             self.audio_codec,
@@ -92,6 +101,8 @@ pub struct MediaOptions {
     pub buffer_ms: i64,
     pub capture_source: CaptureSource,
     pub video: Option<VideoConfig>,
+    /// What the screen-video capture grabs (whole monitor or a single window).
+    pub video_target: VideoTarget,
     pub encoder: EncoderBackend,
 }
 
@@ -127,7 +138,7 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
     #[cfg(target_os = "windows")]
     let video = match opts.video {
         Some(vcfg) => Some(
-            VideoProducer::start(vcfg, opts.encoder, lead_ns, video_tx.clone())
+            VideoProducer::start(vcfg, opts.video_target, opts.encoder, lead_ns, video_tx.clone())
                 .context("start video producer")?,
         ),
         None => None,
@@ -155,9 +166,10 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         video: video_on,
         frame_rate: fps,
         buffer_ms: opts.buffer_ms,
-        // openh264/MF emit Main-profile H.264; the browser auto-detects the exact
-        // level from the in-band SPS, so a baseline-ish hint is fine.
-        video_codec: "avc1.4D4028",
+        // GPU MF emits Main-profile HEVC (H.265). The level here (5.1) just needs to be
+        // >= the stream's real level (covers up to 4K); the decoder reads the exact
+        // params from the in-band VPS/SPS/PPS. "hev1" = parameter sets are in-band.
+        video_codec: "hev1.1.6.L153.B0",
     };
 
     Ok(Media {
@@ -185,18 +197,33 @@ impl AudioCapture {
     {
         match source {
             CaptureSource::System => {
+                tracing::info!("[capture] starting audio source = SYSTEM endpoint loopback (cpal)");
                 let c = SystemCapture::start(on_frame).context("start system capture")?;
                 let name = c.device_name.clone();
                 Ok((AudioCapture::System(c), name))
             }
             #[cfg(target_os = "windows")]
             CaptureSource::AllExceptSelf => {
+                // NOTE: this mode is "everything EXCEPT us" by design — it captures every
+                // other app AND general Windows system sounds. If the operator expects a
+                // single app but hears everything, the wrong source is likely active here.
+                tracing::info!(
+                    "[capture] starting audio source = ALL APPS EXCEPT SELF \
+                     (process-loopback EXCLUDE-self; by design = all other apps + system sounds)"
+                );
                 let c = crate::capture::process::ProcessCapture::start_exclude_current(on_frame)
                     .context("start process-loopback capture")?;
                 Ok((AudioCapture::Process(c), "All apps (survives mute)".to_string()))
             }
             #[cfg(target_os = "windows")]
             CaptureSource::App { pid } => {
+                // INCLUDE the target's process tree only. If audio from OTHER apps leaks in
+                // with this mode active, the leak is the OS/driver not honoring the per-PID
+                // filter (or the picked PID hosting more than expected) — not the wiring.
+                tracing::info!(
+                    "[capture] starting audio source = SINGLE APP pid={pid} \
+                     (process-loopback INCLUDE target tree; only this app + its children should be captured)"
+                );
                 let c = crate::capture::process::ProcessCapture::start_include(pid, on_frame)
                     .context("start per-app process-loopback capture")?;
                 Ok((AudioCapture::Process(c), format!("App (PID {pid}, survives mute)")))
@@ -224,17 +251,40 @@ struct VideoProducer {
 impl VideoProducer {
     fn start(
         cfg: VideoConfig,
+        target: VideoTarget,
         encoder_backend: EncoderBackend,
         lead_ns: i64,
         tx: broadcast::Sender<Frame>,
     ) -> Result<VideoProducer> {
-        use crate::video::capture::{CapturedFrame, ScreenCapture};
+        use crate::video::capture::{annexb_has_keyframe, CapturedFrame, GpuParams, ScreenCapture};
         use crate::video::codec::VideoEncoder;
         use rayon::prelude::*;
 
         const KEYFRAME_SECS: u64 = 2;
 
-        let capture = ScreenCapture::start_primary().context("start screen capture")?;
+        let (dw, dh) = cfg.resolution.dims();
+        let fps = cfg.fps.value();
+        let bitrate = cfg.suggested_bitrate_kbps();
+
+        // Try the GPU zero-copy fast-lane unless the user forced CPU. It's built inside the
+        // capture callback (the only place the WGC device/context are valid); if it can't init
+        // there it silently degrades to the CPU slot path below — which is why we still spawn
+        // the producer thread and create its system-memory encoder LAZILY (only if a frame ever
+        // reaches the slot, i.e. only when the GPU lane is NOT handling frames).
+        let gpu = if encoder_backend == EncoderBackend::Cpu {
+            None
+        } else {
+            Some(GpuParams { tx: tx.clone(), lead_ns, dw, dh, fps, bitrate_kbps: bitrate })
+        };
+
+        let capture = match target {
+            VideoTarget::PrimaryMonitor => {
+                ScreenCapture::start_primary(gpu).context("start screen capture")?
+            }
+            VideoTarget::Window { hwnd } => {
+                ScreenCapture::start_window(hwnd, gpu).context("start window capture")?
+            }
+        };
         let slot = capture.slot.clone();
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -242,65 +292,83 @@ impl VideoProducer {
         let thread = thread::Builder::new()
             .name("video-producer".into())
             .spawn(move || {
-                let (dw, dh) = cfg.resolution.dims();
-                let fps = cfg.fps.value();
-                let bitrate = cfg.suggested_bitrate_kbps();
-                let mut encoder = match VideoEncoder::new(encoder_backend, dw, dh, fps, bitrate) {
-                    Ok(e) => {
-                        tracing::info!(backend = e.backend_label(), "video encoder ready");
-                        e
-                    }
-                    Err(e) => {
-                        tracing::error!("video encoder init failed: {e:#}");
-                        return;
-                    }
-                };
                 let frame_dur = Duration::from_nanos(1_000_000_000 / fps as u64);
                 let key_interval = (fps as u64 * KEYFRAME_SECS).max(1);
                 let mut frame_count: u64 = 0;
                 let mut scaled = Vec::new();
                 let mut last: Option<CapturedFrame> = None;
                 let mut prev_rx: usize = 0;
+                let mut encoder: Option<VideoEncoder> = None;
+                let mut encoder_failed = false;
+                let started_at = Instant::now();
+                let mut got_any = false;
+                let mut warned_no_frame = false;
 
                 while !stop_t.load(Ordering::Relaxed) {
                     let tick = Instant::now();
                     if let Some(f) = slot.lock().unwrap().take() {
                         last = Some(f);
+                        got_any = true;
+                    }
+                    if !got_any && !warned_no_frame && started_at.elapsed() > Duration::from_secs(3) {
+                        // The GPU fast-lane bypasses this slot, so silence here doesn't mean "no
+                        // video" — only that the CPU path is idle (GPU active, or source occluded).
+                        tracing::debug!("video-producer: no CPU-path frame in 3s (GPU lane may be active)");
+                        warned_no_frame = true;
                     }
                     // Only encode when at least one browser is watching.
                     let rx = tx.receiver_count();
-                    if rx > 0 {
+                    if rx > 0 && !encoder_failed {
                         if let Some(frame) = &last {
-                            scale_bgra(
-                                &frame.bgra,
-                                frame.width as usize,
-                                frame.height as usize,
-                                dw as usize,
-                                dh as usize,
-                                &mut scaled,
-                            );
-                            let periodic = frame_count % key_interval == 0;
-                            // Emit a keyframe on the periodic cadence AND whenever a new
-                            // client subscribes (reconnect / source swap), so it gets a
-                            // decodable picture within a frame instead of waiting ~2 s.
-                            let new_subscriber = rx > prev_rx;
-                            let want_key = periodic || new_subscriber;
-                            if want_key {
-                                encoder.force_keyframe();
-                            }
-                            match encoder.encode_bgra(&scaled) {
-                                Ok(bits) if !bits.is_empty() => {
-                                    let pts = mono_now() + lead_ns;
-                                    let mut msg = Vec::with_capacity(10 + bits.len());
-                                    msg.push(MSG_VIDEO);
-                                    msg.extend_from_slice(&pts.to_be_bytes());
-                                    msg.push(if want_key { 1 } else { 0 });
-                                    msg.extend_from_slice(&bits);
-                                    let _ = tx.send(Arc::new(msg));
-                                    frame_count += 1;
+                            // Lazily build the system-memory encoder on the first slot frame.
+                            if encoder.is_none() {
+                                match VideoEncoder::new(encoder_backend, dw, dh, fps, bitrate) {
+                                    Ok(e) => {
+                                        tracing::info!(backend = e.backend_label(), "video encoder ready (CPU path)");
+                                        encoder = Some(e);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("video encoder init failed: {e:#}");
+                                        encoder_failed = true;
+                                    }
                                 }
-                                Ok(_) => {}
-                                Err(e) => tracing::debug!("video encode: {e}"),
+                            }
+                            if let Some(enc) = encoder.as_mut() {
+                                scale_bgra(
+                                    &frame.bgra,
+                                    frame.width as usize,
+                                    frame.height as usize,
+                                    dw as usize,
+                                    dh as usize,
+                                    &mut scaled,
+                                );
+                                let periodic = frame_count % key_interval == 0;
+                                // Emit a keyframe on the periodic cadence AND whenever a new
+                                // client subscribes (reconnect / source swap).
+                                let new_subscriber = rx > prev_rx;
+                                if periodic || new_subscriber {
+                                    enc.force_keyframe(); // a REQUEST; the GPU may honor it on its own GOP cadence
+                                }
+                                match enc.encode_bgra(&scaled) {
+                                    Ok(bits) if !bits.is_empty() => {
+                                        let pts = mono_now() + lead_ns;
+                                        // Flag the keyframe from the ACTUAL emitted bitstream (scan for
+                                        // an IRAP NAL), not the request — force_keyframe is a no-op on
+                                        // the GPU MFT (GOP-driven), so the request would mislabel IDRs
+                                        // and the client (which discards non-key chunks until a real
+                                        // keyframe) would stay black.
+                                        let is_key = annexb_has_keyframe(&bits);
+                                        let mut msg = Vec::with_capacity(10 + bits.len());
+                                        msg.push(MSG_VIDEO);
+                                        msg.extend_from_slice(&pts.to_be_bytes());
+                                        msg.push(if is_key { 1 } else { 0 });
+                                        msg.extend_from_slice(&bits);
+                                        let _ = tx.send(Arc::new(msg));
+                                        frame_count += 1;
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => tracing::debug!("video encode: {e}"),
+                                }
                             }
                         }
                     }

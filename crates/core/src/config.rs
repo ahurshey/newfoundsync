@@ -36,7 +36,7 @@ pub const DEFAULT_BITRATE_BPS: i32 = 510_000;
 /// generous, resilient middle). User-adjustable up to [`MAX_BUFFER_MS`].
 pub const DEFAULT_BUFFER_MS: i64 = 3_000;
 /// Upper bound for the buffer slider — enough to ride out a truly awful link.
-pub const MAX_BUFFER_MS: i64 = 10_000;
+pub const MAX_BUFFER_MS: i64 = 15_000;
 /// Default server lead (ms): how far ahead of `mono_now()` the server stamps a
 /// frame's PTS, giving receivers budget to clock-sync and buffer before playout.
 pub const DEFAULT_LEAD_MS: i64 = 50;

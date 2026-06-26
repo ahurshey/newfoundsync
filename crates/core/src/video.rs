@@ -154,6 +154,10 @@ impl Default for EncoderBackend {
 pub struct VideoConfig {
     pub resolution: Resolution,
     pub fps: Fps,
+    /// Encode quality as a percentage of the baseline bitrate (100 = default). The GUI's
+    /// quality slider sets this so the user can trade picture quality for bandwidth and
+    /// encoder load depending on their server/network.
+    pub quality_pct: u16,
 }
 
 impl Default for VideoConfig {
@@ -162,6 +166,7 @@ impl Default for VideoConfig {
         VideoConfig {
             resolution: Resolution::P1080,
             fps: Fps::F30,
+            quality_pct: 100,
         }
     }
 }
@@ -174,9 +179,12 @@ impl VideoConfig {
         let (w, h) = self.resolution.dims();
         let px = w as u64 * h as u64;
         let fps = self.fps.value() as u64;
-        // ~0.06 bits per pixel per frame baseline for screen content.
-        let bps = px * fps * 6 / 100;
-        ((bps / 1000) as u32).clamp(2_000, 60_000)
+        // ~0.07 bits per pixel per frame for screen content (baseline), then scaled by the
+        // user's quality setting (100 = baseline). HEVC squeezes more out of every bit, so
+        // even the low end stays sharp.
+        let base = px * fps * 7 / 100;
+        let scaled = base * self.quality_pct.max(1) as u64 / 100;
+        ((scaled / 1000) as u32).clamp(1_000, 80_000)
     }
 }
 
@@ -221,10 +229,14 @@ mod tests {
 
     #[test]
     fn bitrate_scales_and_clamps() {
-        let lo = VideoConfig { resolution: Resolution::P720, fps: Fps::F30 }.suggested_bitrate_kbps();
-        let hi = VideoConfig { resolution: Resolution::P2160, fps: Fps::F60 }.suggested_bitrate_kbps();
+        let lo = VideoConfig { resolution: Resolution::P720, fps: Fps::F30, quality_pct: 100 }.suggested_bitrate_kbps();
+        let hi = VideoConfig { resolution: Resolution::P2160, fps: Fps::F60, quality_pct: 100 }.suggested_bitrate_kbps();
         assert!(lo < hi);
-        assert!((2_000..=60_000).contains(&lo));
-        assert!((2_000..=60_000).contains(&hi));
+        assert!((1_000..=80_000).contains(&lo));
+        assert!((1_000..=80_000).contains(&hi));
+        // Quality scaling: higher pct → higher bitrate.
+        let hq = VideoConfig { resolution: Resolution::P1080, fps: Fps::F60, quality_pct: 200 }.suggested_bitrate_kbps();
+        let lq = VideoConfig { resolution: Resolution::P1080, fps: Fps::F60, quality_pct: 50 }.suggested_bitrate_kbps();
+        assert!(hq > lq);
     }
 }

@@ -24,6 +24,11 @@ const MSG_AUDIO = 0x01;
 const MSG_VIDEO = 0x02;
 const MSG_CLOCK_REQ = 0x10;
 const MSG_CLOCK_RSP = 0x11;
+const MSG_SET_VOLUME = 0x20; // server→client: set this device's remote volume (f32 LE)
+const MSG_HELLO = 0x21; // client→server: identify with a stable id + friendly name
+const MSG_SET_TRIM = 0x23; // server→client: set this device's sync offset, ms (i32 LE)
+const MSG_CLIENT_SYNC = 0x24; // client→server: report this device's ACTUAL effective sync, ms (i32 LE)
+const MSG_CALIB_CTRL = 0x22; // server↔client: calibration orchestration (ROLE / STATUS sub-types)
 
 const els = {
   dot: document.getElementById("dot"),
@@ -34,6 +39,7 @@ const els = {
   fsbtn: document.getElementById("fsbtn"),
   zoomout: document.getElementById("zoomout"),
   zoomin: document.getElementById("zoomin"),
+  themebtn: document.getElementById("themebtn"),
   controls: document.getElementById("controls"),
   mute: document.getElementById("mute"),
   stop: document.getElementById("stop"),
@@ -65,6 +71,10 @@ const els = {
   buf: document.getElementById("buf"),
   ai: document.getElementById("ai"),
   vi: document.getElementById("vi"),
+  namemodal: document.getElementById("namemodal"),
+  nameinput: document.getElementById("nameinput"),
+  namesave: document.getElementById("namesave"),
+  nameskip: document.getElementById("nameskip"),
 };
 const ctx2d = els.canvas.getContext("2d", { alpha: false });
 
@@ -90,9 +100,36 @@ let ac = null;
 let gain = null;
 let analyser = null; // taps the output for the audio visualizer
 let wakeLock = null;
-let volume = 1; // 0..1, persisted
+let volume = 1; // 0..1, persisted (the device's own slider)
 let muted = false;
+let remoteVol = 1; // 0..1, server-controlled (SET_VOLUME); multiplies the local volume
 let trimMs = 0; // per-device sync trim (ms), persisted: + = play later, - = earlier
+let remoteTrimMs = 0; // server-controlled sync offset (SET_TRIM, ms); ADDS to the local trim
+let chosenName = null; // in-memory device name; survives a failed localStorage write this session
+
+// The playout offset that actually drives scheduling = this device's own trim plus the
+// server-pushed offset. Used everywhere we translate a server PTS / shared-clock tick into
+// a local playout time (including calibration), so a server nudge can't silently misalign.
+function effTrimMs() {
+  return trimMs + remoteTrimMs;
+}
+
+// Tell the server our ACTUAL current sync offset (own trim + the server's remote offset), so the
+// server GUI shows each device's real value instead of the commanded 0. Coalesced: a slider drag
+// or a burst of calibration setTrim() calls schedules one send that carries the latest value.
+let _syncReportTimer = 0;
+function reportSync() {
+  if (_syncReportTimer) return; // a send is already queued; it reads effTrimMs() when it fires
+  _syncReportTimer = setTimeout(() => {
+    _syncReportTimer = 0;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const buf = new ArrayBuffer(5);
+    const dv = new DataView(buf);
+    dv.setUint8(0, MSG_CLIENT_SYNC);
+    dv.setInt32(1, Math.round(effTrimMs()), true); // i32 LE ms
+    try { ws.send(buf); } catch (e) {}
+  }, 150);
+}
 
 // Acoustic auto-calibration state (see the "Acoustic auto-calibration" section below).
 // Two roles: "ref" plays a dial-up sync tone on the shared-clock beat; "listen" hears
@@ -115,7 +152,19 @@ const calib = {
   toneBuf: null, // the dial-up tone AudioBuffer (ref role)
   refSources: null, // [AudioBufferSourceNode] live scheduled tones (so we can stop them)
   runSeq: 0, // monotonic listener-session counter (stale-finally guard)
+  // ---- Server-orchestrated "Calibrate all" (Phase B) ----
+  orchestrated: false, // this session was started by the server, not a local button
+  refSeed: null, // reference code seed (shared by ref + followers); null ⇒ manual default
+  selfSeed: null, // this follower's distinct self-test seed (CDMA, currently informational)
+  slot: 0, // this follower's TDMA self-test slot (stagger so self-tests don't collide)
 };
+// Coded path is active either by the local flag OR a server-orchestrated session.
+function calibCoded() { return CALCFG.CODED || calib.orchestrated; }
+// Per-slot TDMA stagger for followers' self-tests. ONE self-test is measureSelfLoop's 5 reps ×
+// ~1.67 s ≈ 8.4 s, so the slot must exceed that for the (loud, identical) chirps to truly
+// serialize and not overlap in the shared room. (A distinct coded self-test per follower would
+// allow a shorter slot, but the self-test deliberately reuses the proven chirp path.)
+const CALIB_SELF_SLOT_MS = 9500;
 
 // Reconstruct the slider's filled portion (custom WebKit track removes accent-color).
 function paintSlider(el) {
@@ -134,13 +183,16 @@ function loadVolume() {
   paintSlider(els.vol);
 }
 function applyGain() {
-  if (gain) gain.gain.value = muted ? 0 : volume;
+  // Effective gain = the device's own volume × the server-controlled remote volume.
+  if (gain) gain.gain.value = muted ? 0 : volume * remoteVol;
   const off = muted || volume === 0;
   els.mute.textContent = off ? "🔇 Muted" : "🔊 Sound on";
   els.mute.classList.toggle("muted", off);
 }
 els.vol.addEventListener("input", () => {
-  volume = parseFloat(els.vol.value);
+  const v = parseFloat(els.vol.value);
+  if (!Number.isFinite(v)) return; // never let a NaN reach gain.gain.value / localStorage
+  volume = v;
   muted = false;
   paintSlider(els.vol);
   try {
@@ -160,23 +212,43 @@ function loadTrim() {
     if (!Number.isNaN(t)) trimMs = t;
   } catch (e) {}
   els.trim.value = String(trimMs);
-  els.trimval.textContent = (trimMs >= 0 ? "+" : "") + trimMs + " ms";
+  els.trimval.textContent = (trimMs >= 0 ? "+" : "") + trimMs.toFixed(1) + " ms";
   paintSlider(els.trim);
 }
 function setTrim(ms) {
-  trimMs = Math.max(-2000, Math.min(3000, Math.round(ms))); // 1 ms resolution (calibration needs sub-10 ms)
+  if (!Number.isFinite(ms)) return; // a NaN would poison serverPtsToPerfMs → all scheduling stops (unrecoverable without reload)
+  trimMs = Math.max(-2000, Math.min(3000, Math.round(ms * 10) / 10)); // 0.1 ms resolution (calibration is sub-ms)
   els.trim.value = String(trimMs);
-  els.trimval.textContent = (trimMs >= 0 ? "+" : "") + trimMs + " ms";
+  els.trimval.textContent = (trimMs >= 0 ? "+" : "") + trimMs.toFixed(1) + " ms";
   paintSlider(els.trim);
   try {
     localStorage.setItem("nfs_trim", String(trimMs));
   } catch (e) {}
   aPlayhead = null; // re-anchor audio so the change takes effect immediately
   flushVideo(); // re-time the video queue to the new offset
+  reportSync(); // let the server GUI reflect this device's real sync
 }
 els.trim.addEventListener("input", () => setTrim(parseFloat(els.trim.value)));
 els.trimdown.addEventListener("click", () => setTrim(trimMs - 10));
 els.trimup.addEventListener("click", () => setTrim(trimMs + 10));
+
+// ---- Light/dark theme toggle (persisted; default dark). The <head> pre-applies the saved
+// theme before paint to avoid a flash; here we keep the button icon + theme-color meta in sync.
+function applyTheme(light) {
+  document.documentElement.classList.toggle("light", light);
+  if (els.themebtn) {
+    els.themebtn.setAttribute("aria-checked", light ? "true" : "false");
+    const knob = els.themebtn.querySelector(".themeknob");
+    if (knob) knob.textContent = light ? "☀" : "🌙";
+  }
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute("content", light ? "#f4f6fa" : "#0b0f15");
+  try { localStorage.setItem("nfs_theme", light ? "light" : "dark"); } catch (e) {}
+}
+applyTheme(document.documentElement.classList.contains("light")); // sync icon/meta with the pre-applied theme
+if (els.themebtn) {
+  els.themebtn.addEventListener("click", () => applyTheme(!document.documentElement.classList.contains("light")));
+}
 
 loadVolume();
 loadTrim();
@@ -404,7 +476,16 @@ function onStart() {
   try {
     if (!ac) {
       const Ctx = window.AudioContext || window.webkitAudioContext;
-      ac = new Ctx({ latencyHint: "playback" }); // do NOT pin sampleRate
+      // Pin to 48 kHz to MATCH the Opus decode rate: if the context ran at the device's
+      // native rate (often 44.1 kHz), Web Audio would resample every ~20 ms frame
+      // independently → audible boundary seams. A 48 kHz graph plays our buffers verbatim.
+      // Some devices reject a forced rate → fall back to an unpinned context (then behaves
+      // exactly as before, no regression).
+      try {
+        ac = new Ctx({ latencyHint: "playback", sampleRate: 48000 });
+      } catch (e) {
+        ac = new Ctx({ latencyHint: "playback" });
+      }
       gain = ac.createGain();
       gain.connect(ac.destination);
       analyser = ac.createAnalyser(); // tap for the visualizer (analyses; no onward connection needed)
@@ -489,6 +570,108 @@ function stop() {
 // =============================================================================
 // WebSocket connect / reconnect
 // =============================================================================
+
+// A stable identity for the server's per-client list. Persists across reloads and
+// reconnects (localStorage) so the server can remember this device's volume.
+// Best-effort friendly device label from the user agent. Browsers don't expose the real
+// hostname, but the UA usually reveals the platform (and, on Android, the model). Returns
+// null if we can't tell — the caller falls back to a random room name.
+function uaDeviceLabel() {
+  const ua = navigator.userAgent || "";
+  if (/iPhone/.test(ua)) return "iPhone";
+  if (/iPad/.test(ua) || (/Macintosh/.test(ua) && "ontouchend" in document)) return "iPad";
+  if (/Android/.test(ua)) {
+    const m = ua.match(/;\s*([^;()]+?)\s+Build\//); // e.g. "...; Pixel 7 Build/..."
+    if (m && m[1] && m[1].trim().length > 1) return m[1].trim();
+    return "Android phone";
+  }
+  if (/Windows/.test(ua)) return "Windows PC";
+  if (/Macintosh|Mac OS X/.test(ua)) return "Mac";
+  if (/CrOS/.test(ua)) return "Chromebook";
+  if (/Linux/.test(ua)) return "Linux PC";
+  return null;
+}
+function randomRoomName() {
+  const adj = ["Sunny", "Quiet", "Cozy", "Brisk", "Amber", "Misty", "Lively", "Calm", "Bright", "Bold"];
+  const noun = ["Harbour", "Cabin", "Parlour", "Kitchen", "Loft", "Studio", "Deck", "Den", "Porch", "Hall"];
+  return `${adj[Math.floor(Math.random() * adj.length)]} ${noun[Math.floor(Math.random() * noun.length)]}`;
+}
+// First-run default name: the detected device label, else a random room name.
+function defaultDeviceName() {
+  return uaDeviceLabel() || randomRoomName();
+}
+
+function clientIdentity() {
+  let id = null,
+    name = null;
+  try {
+    id = localStorage.getItem("nfs_cid");
+    name = localStorage.getItem("nfs_cname");
+  } catch (e) {}
+  if (chosenName) name = chosenName; // in-session pick wins (covers a failed storage write)
+  if (!id) {
+    id = "c" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+    try { localStorage.setItem("nfs_cid", id); } catch (e) {}
+  }
+  if (!name) {
+    name = defaultDeviceName();
+    try { localStorage.setItem("nfs_cname", name); } catch (e) {}
+  }
+  return { id, name };
+}
+
+// Tell the server who we are: [0x21][id_len:u8][id utf8][name utf8].
+function sendHello() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const { id, name } = clientIdentity();
+  const enc = new TextEncoder();
+  const idB = enc.encode(id).subarray(0, 255); // id_len is a single byte
+  const nameB = enc.encode(name);
+  const buf = new Uint8Array(2 + idB.length + nameB.length);
+  buf[0] = MSG_HELLO;
+  buf[1] = idB.length;
+  buf.set(idB, 2);
+  buf.set(nameB, 2 + idB.length);
+  try { ws.send(buf); } catch (e) {}
+  reportSync(); // report our current sync offset right after identifying, so the GUI shows it on connect
+}
+
+// Has the user been offered the one-time "name this device" prompt yet?
+function needsNamePrompt() {
+  try { return localStorage.getItem("nfs_named") !== "1"; } catch (e) { return false; }
+}
+
+// Show the naming modal, prefilled with the current (random) name. Saving stores the
+// chosen name and re-announces it to the server; skipping keeps the random default.
+// Either way we won't ask again on this device.
+function maybePromptName() {
+  if (!needsNamePrompt() || !els.namemodal) return;
+  if (els.namemodal.style.display === "flex") return; // already open — a reconnect mustn't reset typing
+  els.nameinput.value = clientIdentity().name;
+  els.namemodal.style.display = "flex";
+  setTimeout(() => { try { els.nameinput.focus(); els.nameinput.select(); } catch (e) {} }, 60);
+}
+function closeNameModal(save) {
+  if (!els.namemodal) return;
+  if (save) {
+    const nm = (els.nameinput.value || "").trim().slice(0, 40);
+    if (nm) {
+      chosenName = nm; // remember in memory first, so a storage failure can't lose it
+      try { localStorage.setItem("nfs_cname", nm); } catch (e) {}
+      sendHello(); // re-announce with the chosen name (clientIdentity prefers chosenName)
+    }
+  }
+  try { localStorage.setItem("nfs_named", "1"); } catch (e) {} // asked once; don't nag
+  els.namemodal.style.display = "none";
+}
+if (els.namesave) els.namesave.addEventListener("click", () => closeNameModal(true));
+if (els.nameskip) els.nameskip.addEventListener("click", () => closeNameModal(false));
+if (els.nameinput)
+  els.nameinput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); closeNameModal(true); }
+    else if (e.key === "Escape") { e.preventDefault(); closeNameModal(false); }
+  });
+
 function connect() {
   teardownConnection(); // ensure a clean slate (no leaked timers/decoders)
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -503,6 +686,8 @@ function connect() {
     reconnectAttempts = 0;
     setState("syncing clock", "warn");
     startClockSync();
+    sendHello(); // identify so the server can list us + restore our volume
+    maybePromptName(); // first connect on this device → offer to name it
   };
   ws.onmessage = onMessage;
   ws.onclose = () => scheduleReconnect();
@@ -590,8 +775,9 @@ function startClockSync() {
 function serverPtsToPerfMs(ptsNs) {
   // ptsNs is server-mono ns; offsetNs maps it to performance.now() ms, then we add
   // the shared buffer (same on every client → same wall-clock instant) plus this
-  // device's local sync trim (to align speakers with different output latencies).
-  return (ptsNs - offsetNs) / 1e6 + bufferMs + trimMs;
+  // device's effective sync trim (local + server-pushed, to align speakers with
+  // different output latencies).
+  return (ptsNs - offsetNs) / 1e6 + bufferMs + effTrimMs();
 }
 
 // =============================================================================
@@ -618,9 +804,52 @@ function onMessage(ev) {
     return; // updateStats decides "buffering …" vs "playing"
   }
 
+  if (type === MSG_SET_VOLUME) {
+    // Server-controlled (remote) volume: multiplies this device's own slider.
+    const v = dv.getFloat32(1, true); // f32 LE
+    if (Number.isFinite(v)) {
+      remoteVol = Math.min(1, Math.max(0, v));
+      applyGain();
+    }
+    return;
+  }
+
+  if (type === MSG_SET_TRIM) {
+    // Server-controlled sync offset (ms): adds to this device's own trim.
+    const ms = dv.getInt32(1, true); // i32 LE
+    if (Number.isFinite(ms)) {
+      const next = Math.max(-5000, Math.min(5000, ms));
+      if (next !== remoteTrimMs) {
+        remoteTrimMs = next;
+        aPlayhead = null; // re-anchor audio so the new offset takes effect immediately
+        flushVideo(); // re-time the video queue too (mirror setTrim, so A/V stay aligned)
+        reportSync(); // report the new effective total back so the GUI reflects it
+      }
+    }
+    return;
+  }
+
+  if (type === MSG_CALIB_CTRL) {
+    // Server-orchestrated calibration (Phase B). Sub-type 1 = ROLE.
+    if (dv.getUint8(1) === 1 && ev.data.byteLength >= 12) {
+      const role = dv.getUint8(2);
+      const refSeed = dv.getUint32(3, true);
+      const selfSeed = dv.getUint32(7, true);
+      const slot = dv.getUint8(11);
+      calibOnRole(role, refSeed, selfSeed, slot);
+    }
+    return;
+  }
+
   if (type === MSG_AUDIO) {
     if (!audioDecoder || offsetNs === null) return;
-    if (audioDecoder.decodeQueueSize > 200) return; // device fell behind; shed load
+    if (audioDecoder.decodeQueueSize > 200) {
+      // Device fell behind: shed this frame. Re-anchor so the next decoded frame snaps back
+      // to its true PTS instead of butting against the playhead and drifting permanently
+      // ahead of the other clients (a silent desync is worse than one brief gap).
+      aPlayhead = null;
+      return;
+    }
     const ptsNs = dv.getBigInt64(1, false);
     try {
       audioDecoder.decode(
@@ -653,7 +882,7 @@ function onConfig(text) {
   // Honor the full server buffer (up to 10 s). It's cheap now: video is buffered as
   // ENCODED chunks and only decoded just-in-time, so a deep buffer no longer means
   // a wall of decoded surfaces.
-  bufferMs = Math.min(Math.max(c.bufferMs || 3000, 200), 10000);
+  bufferMs = Math.min(Math.max(c.bufferMs || 3000, 200), 15000);
   const fps = c.frameRate || 30;
   // Encoded queue must hold the whole buffer's worth of frames (+ headroom).
   maxEvq = Math.ceil((fps * bufferMs) / 1000) + 90;
@@ -689,12 +918,12 @@ async function setupDecoders(c) {
   audioDecoder = new AudioDecoder({ output: onAudioData, error: (e) => onDecErr("audio", e) });
   audioDecoder.configure(acfg);
 
-  // ---- video: coarse support probe only; real configure waits for SPS/PPS ----
+  // ---- video: coarse support probe only; real configure waits for the keyframe ----
   if (c.video && window.VideoDecoder.isConfigSupported) {
-    const probe = { codec: c.videoCodec || "avc1.42E01F", optimizeForLatency: true };
+    const probe = { codec: c.videoCodec || "hev1.1.6.L153.B0", optimizeForLatency: true };
     const r = await VideoDecoder.isConfigSupported(probe).catch(() => null);
     if (r && !r.supported) {
-      showWarn("⚠ This device can't hardware-decode this video. Audio will still play.");
+      showWarn("⚠ This device can't decode the video codec (HEVC/H.265). Audio will still play.");
     } else {
       els.fsbtn.style.display = "flex";
     }
@@ -738,15 +967,11 @@ function onDecErr(kind, e) {
 // =============================================================================
 function onVideoChunk(tsUs, key, annexb) {
   if (!gotParams) {
-    if (!key) return; // wait for a keyframe (carries SPS/PPS)
-    const nals = splitNalsAnnexB(annexb);
-    const sps = nals.find((n) => nalType(n) === 7);
-    const pps = nals.find((n) => nalType(n) === 8);
-    if (!sps || !pps) return; // keyframe without params; wait for the next one
-    const description = buildAvcC(sps, pps);
+    if (!key) return; // wait for a keyframe (HEVC IRAP carries VPS/SPS/PPS in-band)
+    // HEVC straight from Annex-B: configure WITHOUT a description, so the decoder reads
+    // VPS/SPS/PPS from the in-band keyframe and we can feed raw Annex-B access units.
     const vcfg = {
-      codec: codecFromSps(sps),
-      description,
+      codec: (cfg && cfg.videoCodec) || "hev1.1.6.L153.B0",
       optimizeForLatency: true,
       hardwareAcceleration: videoAccel,
     };
@@ -762,14 +987,13 @@ function onVideoChunk(tsUs, key, annexb) {
         videoDecoder.configure(vcfg);
         gotParams = true;
       } catch (e2) {
-        showWarn("⚠ Video decoder couldn't start: " + e2.message);
+        showWarn("⚠ Video decoder couldn't start — this device may not support HEVC/H.265. Audio still plays. (" + e2.message + ")");
         return;
       }
     }
   }
-  const avcc = annexBToAvcc(annexb);
-  if (!avcc) return;
-  evq.push({ key, tsUs, data: avcc });
+  // Feed Annex-B directly (decoder configured without a description = Annex-B mode).
+  evq.push({ key, tsUs, data: annexb });
   // Overflow = we're receiving faster than we can decode/play. Drop the oldest and
   // force the decoder to resync at the next keyframe (don't break the delta chain).
   if (evq.length > maxEvq) {
@@ -864,8 +1088,9 @@ setInterval(() => {
 // =============================================================================
 // Audio: decode -> Web Audio. Gapless scheduler — frames are queued back-to-back
 // at a running "playhead" so there are NO per-frame clock-jitter seams. The synced
-// clock only sets the initial anchor and re-anchors on a big drift (resume / gap /
-// trim change). This is what makes a deep buffer play smoothly instead of garbled.
+// clock sets the initial anchor; small drift is corrected by gently nudging the playback
+// rate (≤±1%, inaudible), and we only hard re-anchor on a real discontinuity (resume /
+// gap / trim change). This is what makes a deep buffer play smoothly instead of garbled.
 // =============================================================================
 function onAudioData(ad) {
   aFrames++;
@@ -876,13 +1101,27 @@ function onAudioData(ad) {
   const dur = ad.numberOfFrames / ad.sampleRate; // seconds this frame occupies
   const targetAc = ac.currentTime + (serverPtsToPerfMs(ad.timestamp * 1000) - performance.now()) / 1000;
 
-  // (Re)anchor on the first frame, or whenever we've drifted far from the target.
-  if (aPlayhead === null || Math.abs(aPlayhead - targetAc) > 0.3) {
+  // Drift correction (VLC-style): hard re-anchor ONLY on the first frame or a real
+  // discontinuity (resume / gap / trim change); for normal small drift, nudge the playback
+  // RATE a hair instead of jumping. A ±1% rate change is essentially inaudible and pulls the
+  // playhead back onto the synced clock over a few seconds — no click.
+  const A_DEADBAND = 0.008; // ±8 ms: within this, don't correct (avoid hunting)
+  const A_HARD_RESET = 0.4; // beyond this it's a discontinuity, not drift → jump
+  const A_MAX_ADJ = 0.01; //  cap the rate change at ±1%
+  const A_DRIFT_K = 0.1; //   reach the cap at ~100 ms of drift
+  if (aPlayhead === null || Math.abs(aPlayhead - targetAc) > A_HARD_RESET) {
     aPlayhead = Math.max(targetAc, ac.currentTime + 0.03);
   }
   // Never schedule in the past (would drop or pile up at "now" → clicks).
   if (aPlayhead < ac.currentTime + 0.005) {
     aPlayhead = ac.currentTime + 0.01;
+  }
+  // drift > 0 ⇒ we're scheduling later than the clock wants (behind) ⇒ speed up slightly;
+  // drift < 0 ⇒ ahead ⇒ slow down slightly. Converges drift → 0 without a jump.
+  let rate = 1.0;
+  const drift = aPlayhead - targetAc;
+  if (Math.abs(drift) > A_DEADBAND) {
+    rate = Math.min(1 + A_MAX_ADJ, Math.max(1 - A_MAX_ADJ, 1 + A_DRIFT_K * drift));
   }
 
   const ch = ad.numberOfChannels;
@@ -897,9 +1136,10 @@ function onAudioData(ad) {
   if (firstPlayoutAc === null) firstPlayoutAc = aPlayhead; // for the "buffering" countdown
   const src = ac.createBufferSource();
   src.buffer = buf;
+  if (rate !== 1.0) src.playbackRate.value = rate; // gentle catch-up/slow-down
   src.connect(gain);
   src.start(aPlayhead);
-  aPlayhead += dur; // next frame butts right up against this one
+  aPlayhead += dur / rate; // advance by the ACTUAL playout time (rate changes it)
 }
 
 // =============================================================================
@@ -1065,7 +1305,7 @@ window.nfsDebug = function () {
 // =============================================================================
 const CALCFG = {
   TICK_S: 1.5, // the reference emits the tone every TICK_S on the shared clock
-  WINDOW_TICKS: 3, // ticks observed per measurement
+  WINDOW_TICKS: 5, // ticks observed per measurement (more hits → lower run-to-run variance)
   TONE_AMP: 0.45, // tone level (straight to output, bypasses volume/mute)
   // A clean upward sine sweep ("whoop"). A chirp has near-ideal autocorrelation (pulse
   // compression) → a sharp, unambiguous matched-filter peak, and it sounds smooth rather
@@ -1079,9 +1319,42 @@ const CALCFG = {
   // larger than this can't be auto-detected — get within ~0.7s by ear first.
   SEARCH_HALF_S: 0.7,
   MIN_SCORE: 0.1, // matched-filter detection threshold (0..1) — lenient; tick window + median reject false hits
-  MIN_DETECTIONS: 2, // need at least this many tone hits to trust a measurement
-  STEP_MS: 3, // converge when the residual is within this many ms (trim grid is now 1 ms)
-  MAX_ITERS: 3, // measure→correct cycles (no buffer-drain wait between them)
+  MIN_DETECTIONS: 3, // need at least this many tone hits to trust a measurement (more = lower variance)
+  STEP_MS: 1, // converge when the residual is within this many ms (trim grid is now 0.1 ms)
+  MAX_ITERS: 4, // measure→correct cycles (no buffer-drain wait between them)
+  // Partial GCC-PHAT exponent for the matched filter's TIMING peak (0 = plain matched filter,
+  // 1 = full PHAT). Whitening the cross-spectrum sharpens the peak and locks the direct-path
+  // arrival in reverberant rooms; partial (~0.7) keeps detection robust in lower-SNR conditions.
+  PHAT_BETA: 0.7,
+
+  // ---- Coded continuous signal (Phase A) — now the DEFAULT. The chirp above remains a
+  // fallback: window.setCalibCoded(false) reverts this device (persists in localStorage).
+  // A looping band-limited pseudonoise code converges faster (it's "on" continuously, so a
+  // short capture sees several periods to average) and packs more data into the tone. Still
+  // wants on-device tuning (level, band, period, audibility); flip back to the chirp if a room
+  // gives it trouble. (Phase B "Calibrate all" forces the coded path regardless of this flag.)
+  CODED: true,
+  CODE_SEED: 0x9e3779b9, // PRNG seed — reference and follower MUST share it
+  CODE_N: 16383, // code length @16 kHz → period ≈ 1.024 s. The follower windows around its OWN
+  // measured loopback (not the idealized beat), so the detectable RESIDUAL (ref−follower latency
+  // mismatch) is ±~0.46 s — robust to a high-latency speaker without needing a longer period.
+  CODE_F0: 1200, // band low (Hz)
+  CODE_F1: 6000, // band high (Hz)
+  CODE_AMP: 0.32, // playback level (straight to output, bypasses volume/mute)
+  CODE_PERIODS: 4, // periods recorded per measurement (more → more peaks to median, lower variance)
+  CODE_MIN_DETECTIONS: 2, // coded peaks are continuous + reliable → accept a measurement at 2 hits
+  CODE_MAX_ITERS: 2, // converges fast → far fewer measure→correct cycles than the chirp path
+};
+// Coded is the default; an explicit per-device choice (sticky in localStorage) overrides it.
+// Absent ⇒ keep the default (true); only a stored "0" reverts this device to the chirp.
+try {
+  const v = localStorage.getItem("nfs_calib_coded");
+  if (v !== null) CALCFG.CODED = v === "1";
+} catch (e) {}
+window.setCalibCoded = (on) => {
+  CALCFG.CODED = !!on;
+  try { localStorage.setItem("nfs_calib_coded", on ? "1" : "0"); } catch (e) {}
+  return CALCFG.CODED;
 };
 
 function setCalibStatus(text) {
@@ -1122,6 +1395,101 @@ function fillChirp(out, rate, amp, f0, f1) {
   }
 }
 
+// ---- Coded continuous signal (Phase A) -----------------------------------------------
+// A band-limited pseudonoise "code": a deterministic ±1 PRNG sequence band-passed to a
+// pleasant mid-band, taken over exactly one period. It's broadband and noise-like → a sharp,
+// REAL autocorrelation peak (so it reuses the existing real matched-filter + PHAT, unlike a
+// BPSK code whose peak would rotate with the unknown channel carrier phase). Played looped
+// and clock-aligned by the reference; the follower matched-filters one identical period.
+//
+// These four helpers are the SINGLE source of truth: they run on the main thread (to build the
+// reference's AudioBuffer) AND are injected verbatim into the DSP worker (to build the template),
+// via `.toString()` below — so the played signal and the template are guaranteed identical.
+function calCodePrng(seed, n) {
+  // mulberry32 → ±1 chips. Deterministic: same seed ⇒ same sequence on both devices.
+  let a = seed >>> 0;
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    const u = ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    out[i] = u < 0.5 ? -1 : 1;
+  }
+  return out;
+}
+function calBiquad(x, c) {
+  // Direct-form-I biquad; c = [b0,b1,b2,a1,a2] (a0 normalized to 1).
+  const b0 = c[0], b1 = c[1], b2 = c[2], a1 = c[3], a2 = c[4];
+  const y = new Float32Array(x.length);
+  let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+  for (let i = 0; i < x.length; i++) {
+    const xi = x[i];
+    const yi = b0 * xi + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    x2 = x1; x1 = xi; y2 = y1; y1 = yi;
+    y[i] = yi;
+  }
+  return y;
+}
+function calBiquadLP(rate, fc) {
+  const w = (2 * Math.PI * fc) / rate, cs = Math.cos(w), sn = Math.sin(w);
+  const alpha = sn / (2 * Math.SQRT1_2), a0 = 1 + alpha;
+  return [(1 - cs) / 2 / a0, (1 - cs) / a0, (1 - cs) / 2 / a0, (-2 * cs) / a0, (1 - alpha) / a0];
+}
+function calBiquadHP(rate, fc) {
+  const w = (2 * Math.PI * fc) / rate, cs = Math.cos(w), sn = Math.sin(w);
+  const alpha = sn / (2 * Math.SQRT1_2), a0 = 1 + alpha;
+  return [(1 + cs) / 2 / a0, -(1 + cs) / a0, (1 + cs) / 2 / a0, (-2 * cs) / a0, (1 - alpha) / a0];
+}
+// One steady-state period of the band-limited code at `rate`, peak-normalized to 1. Filtering
+// the doubled sequence and taking the SECOND copy removes the filter's start transient, so the
+// result is genuinely periodic (correlating a window that straddles a period boundary still locks).
+function calBuildCode(seed, n, rate, f0, f1) {
+  const raw = calCodePrng(seed, n);
+  const dbl = new Float32Array(2 * n);
+  dbl.set(raw, 0);
+  dbl.set(raw, n);
+  let y = calBiquad(dbl, calBiquadHP(rate, f0));
+  y = calBiquad(y, calBiquadLP(rate, f1));
+  const out = new Float32Array(n);
+  let peak = 1e-9;
+  for (let i = 0; i < n; i++) {
+    const v = y[n + i];
+    out[i] = v;
+    const a = v < 0 ? -v : v;
+    if (a > peak) peak = a;
+  }
+  const g = 1 / peak;
+  for (let i = 0; i < n; i++) out[i] *= g;
+  return out;
+}
+// General linear resample (up or down) — used to render the 16 kHz canonical code to the
+// reference's AudioContext rate for playback. (The worker keeps the 16 kHz canonical as-is.)
+function calResample(x, inRate, outRate) {
+  if (inRate === outRate) return x;
+  const ratio = inRate / outRate;
+  const n = Math.max(1, Math.round(x.length / ratio));
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const pos = i * ratio, i0 = pos | 0, frac = pos - i0;
+    const a = x[i0] || 0, b = (i0 + 1 < x.length ? x[i0 + 1] : x[i0]) || 0;
+    out[i] = a + (b - a) * frac;
+  }
+  return out;
+}
+// Build the reference's playback AudioBuffer: the 16 kHz canonical code, resampled to the
+// context rate and scaled. (The follower correlates the mic — resampled back to 16 kHz —
+// against the same 16 kHz canonical, so both sides share one definition of the signal.)
+function makeCodeBuffer(rate) {
+  const seed = calib.refSeed || CALCFG.CODE_SEED; // orchestrated uses the server-assigned seed
+  const canon = calBuildCode(seed, CALCFG.CODE_N, 16000, CALCFG.CODE_F0, CALCFG.CODE_F1);
+  const up = calResample(canon, 16000, rate);
+  const b = ac.createBuffer(1, up.length, rate);
+  const ch = b.getChannelData(0);
+  for (let i = 0; i < up.length; i++) ch[i] = CALCFG.CODE_AMP * up[i];
+  return b;
+}
+
 // Mic capture worklet (runs on the audio render thread). Batches ~4096 samples and
 // posts them with the ac-frame index of the batch's first sample, so the main thread
 // can place mic samples on the same ac clock as the reference.
@@ -1154,7 +1522,12 @@ registerProcessor("mic-tap", MicTap);
 // DSP worker: resample the mic to 16 kHz and matched-filter the known dial-up template
 // across it, returning every strong tone hit (ac-time + score). Off the main thread so
 // the gapless audio scheduler never stalls.
-const DSP_WORKER_SRC = `
+// Inject the code-generation helpers (defined once, above) into the worker verbatim, so the
+// follower's template is byte-identical to what the reference plays. Single source of truth.
+const CALCODE_SRC = [calCodePrng, calBiquad, calBiquadLP, calBiquadHP, calBuildCode]
+  .map((f) => f.toString())
+  .join("\n");
+const DSP_WORKER_SRC = CALCODE_SRC + "\n" + `
 const RS = 16000;
 self.onmessage = (e) => {
   try { self.postMessage(analyze(e.data)); }
@@ -1224,7 +1597,10 @@ function fft(re, im, inverse) {
 // FFT-based normalized cross-correlation of the template across the mic, then pick peaks.
 function analyze(p) {
   const mic = resample(p.mic, p.micRate, RS);
-  const tmpl = makeChirp(p.chirp, RS);
+  // Template: one period of the coded signal (Phase A) or the chirp (default). Both at RS.
+  const tmpl = p.code
+    ? calBuildCode(p.code.seed, p.code.n, RS, p.code.f0, p.code.f1)
+    : makeChirp(p.chirp, RS);
   const L = tmpl.length, M = mic.length;
   if (M < L + 1) return { peaks: [] };
   const N = nextPow2(M + L);
@@ -1233,12 +1609,23 @@ function analyze(p) {
   for (let i = 0; i < M; i++) sr[i] = mic[i];
   for (let j = 0; j < L; j++) tr[j] = tmpl[j];
   fft(sr, si, false); fft(tr, ti, false);
-  for (let i = 0; i < N; i++) { // S * conj(T) → cross-correlation after the inverse FFT
+  // X = S * conj(T) (kept in sr,si for the normalized correlation). Also build a partial-PHAT
+  // weighted copy X / (|X|^beta + eps) in tr,ti: whitening the cross-spectrum sharpens the peak
+  // and pulls it onto the direct-path arrival in reverberant rooms. beta=0 → plain matched filter.
+  const beta = p.phatBeta || 0;
+  for (let i = 0; i < N; i++) {
     const xr = sr[i] * tr[i] + si[i] * ti[i];
     const xi = si[i] * tr[i] - sr[i] * ti[i];
     sr[i] = xr; si[i] = xi;
+    if (beta > 0) {
+      const mag = Math.pow(Math.sqrt(xr * xr + xi * xi) + 1e-12, beta);
+      tr[i] = xr / mag; ti[i] = xi / mag;
+    } else {
+      tr[i] = xr; ti[i] = xi;
+    }
   }
-  fft(sr, si, true);
+  fft(sr, si, true); // → normalized-correlation domain (detection + score)
+  fft(tr, ti, true); // → PHAT-weighted correlation domain (fine, reverberation-robust timing)
   let te = 0; for (let j = 0; j < L; j++) te += tmpl[j] * tmpl[j];
   const pe = new Float64Array(M + 1);
   for (let i = 0; i < M; i++) pe[i + 1] = pe[i] + mic[i] * mic[i];
@@ -1251,6 +1638,19 @@ function analyze(p) {
     corr[k] = c;
     if (c > top) top = c;
   }
+  // Sub-sample lag for a detected peak: snap to the PHAT correlation's local max within ±2
+  // samples of the (normalized) peak, then parabolic-interpolate between samples → fractional lag.
+  const phatLag = (bk) => {
+    let bp = bk;
+    const lo = Math.max(1, bk - 2), hi = Math.min(lim - 1, bk + 2);
+    for (let j = lo; j <= hi; j++) if (tr[j] > tr[bp]) bp = j;
+    if (bp < 1 || bp > lim - 1) return bp;
+    const ym = tr[bp - 1], y0 = tr[bp], yp = tr[bp + 1];
+    const denom = ym - 2 * y0 + yp;
+    let d = denom !== 0 ? (0.5 * (ym - yp)) / denom : 0;
+    if (d > 0.5) d = 0.5; else if (d < -0.5) d = -0.5;
+    return bp + d;
+  };
   const minScore = p.minScore, minSep = Math.max(1, Math.round(p.minSepSec * RS));
   const peaks = [];
   let k = 0;
@@ -1259,7 +1659,7 @@ function analyze(p) {
       const end = Math.min(lim, k + minSep);
       let bk = k, bv = corr[k];
       for (let j = k; j <= end; j++) { if (corr[j] > bv) { bv = corr[j]; bk = j; } }
-      peaks.push({ time: p.micT0 + bk / RS, score: bv }); // ac-time of the tone's start
+      peaks.push({ time: p.micT0 + phatLag(bk) / RS, score: bv }); // sub-sample ac-time of the tone
       k = bk + minSep;
     } else k++;
   }
@@ -1314,12 +1714,14 @@ async function setupMic(stream) {
   node.connect(sink);
   sink.connect(ac.destination);
   node.port.onmessage = onMicBlock;
-  calib.mic = { stream, source, node, sink };
+  const mic = { stream, source, node, sink };
+  calib.mic = mic;
   if (!calib.worker) {
     const wurl = URL.createObjectURL(new Blob([DSP_WORKER_SRC], { type: "application/javascript" }));
     calib.worker = new Worker(wurl);
     URL.revokeObjectURL(wurl);
   }
+  return mic; // hand back the exact nodes so a superseded caller can tear down ITS own tap
 }
 
 function teardownMic() {
@@ -1336,6 +1738,11 @@ function teardownMic() {
 
 function endCalibSession() {
   calib.active = false;
+  // Silence any self-test chirps scheduled into the future (mirrors stopRef for the ref role).
+  if (calib.selfSources) {
+    for (const s of calib.selfSources) { try { s.onended = null; s.stop(); } catch (e) {} }
+    calib.selfSources = null;
+  }
   // Resolve any in-flight measurement so its awaiter unwinds before we kill the worker.
   if (calib.pendingResolve) {
     try { calib.pendingResolve(null); } catch (e) {}
@@ -1371,21 +1778,31 @@ function calibAbort(msg) {
   endCalibSession();
   calib.role = null;
   calib.running = false;
+  calib.orchestrated = false; // clear any server-orchestration state
+  calib.refSeed = null;
+  calib.selfSeed = null;
+  calib.slot = 0;
   applyGain(); // un-mute our music (a listen/ref session muted it)
   if (els.caliblisten) { els.caliblisten.textContent = "🎤 Listen & align"; els.caliblisten.disabled = false; }
   if (els.calibref) els.calibref.disabled = false;
+  // Collapse the role panel on every abort/cancel/error path (the startListen finally only covers
+  // a normal run-completion). Without this, the mic-denied / mic-setup-fail early returns leave the
+  // panel open, so the next top-level Calibrate tap just toggles it closed and emits no tone.
+  // calibOnRole re-reveals the panel immediately after it calls calibAbort, so orchestration is fine.
+  if (els.calibroles) els.calibroles.style.display = "none";
   if (was && msg) setCalibStatus(msg);
 }
 
 // ---- Reference role: emit the dial-up tone on the shared-clock beat -----------------
 function refTick() {
   if (calib.role !== "ref" || !ac || offsetNs === null) return;
-  const tickNs = CALCFG.TICK_S * 1e9;
+  // Coded path: schedule code periods back-to-back (continuous); chirp path: one tone per TICK_S.
+  const tickNs = (calib.codePeriodS || CALCFG.TICK_S) * 1e9;
   const nowServerNs = performance.now() * 1e6 + offsetNs;
   const lookaheadNs = 2.0e9;
   for (let t = Math.ceil(nowServerNs / tickNs) * tickNs; t <= nowServerNs + lookaheadNs; t += tickNs) {
     if (calib.scheduled.has(t)) continue;
-    const perfMs = (t - offsetNs) / 1e6 + trimMs; // emit as if it were content for tick t
+    const perfMs = (t - offsetNs) / 1e6 + effTrimMs(); // emit as if it were content for tick t
     const acT = ac.currentTime + (perfMs - performance.now()) / 1000;
     if (acT <= ac.currentTime + 0.03) continue; // too late to schedule cleanly — retry next pass
     calib.scheduled.add(t); // only mark scheduled once we actually start a source
@@ -1411,13 +1828,27 @@ function startRef() {
   calib.role = "ref";
   calib.scheduled = new Set();
   calib.refSources = [];
-  calib.toneBuf = makeToneBuffer(ac.sampleRate, CALCFG.CHIRP_F0, CALCFG.CHIRP_F1); // up-sweep
+  if (calibCoded()) {
+    if (!calib.orchestrated) calib.refSeed = CALCFG.CODE_SEED; // manual ref uses the default seed
+    calib.toneBuf = makeCodeBuffer(ac.sampleRate); // looping band-limited pseudonoise code
+    calib.codePeriodS = CALCFG.CODE_N / 16000;
+  } else {
+    calib.toneBuf = makeToneBuffer(ac.sampleRate, CALCFG.CHIRP_F0, CALCFG.CHIRP_F1); // up-sweep chirp
+    calib.codePeriodS = null;
+  }
   if (gain) { try { gain.gain.cancelScheduledValues(ac.currentTime); } catch (e) {} gain.gain.value = 0; } // mute music — only the tone should sound
   refTick();
   calib.refTimer = setInterval(refTick, 400);
   els.calibref.textContent = "⏹ Stop tone";
   els.caliblisten.disabled = true;
-  setCalibStatus("Playing the sync tone every " + CALCFG.TICK_S + "s (music muted here). On another device in the room, tap 🎤 Listen & align.");
+  setCalibStatus(
+    (calibCoded()
+      ? "Playing a continuous sync code (music muted here). "
+      : "Playing the sync tone every " + CALCFG.TICK_S + "s (music muted here). ") +
+      (calib.orchestrated
+        ? "Other devices are aligning to this one."
+        : "On another device in the room, tap 🎤 Listen & align.")
+  );
 }
 
 function stopRef() {
@@ -1430,6 +1861,7 @@ function stopRef() {
   if (calib.role === "ref") calib.role = null;
   calib.scheduled = null;
   calib.toneBuf = null;
+  calib.codePeriodS = null;
   if (wasRef) applyGain(); // restore music to the saved volume/mute
   if (els.calibref) els.calibref.textContent = "🔊 Play sync tone";
   if (els.caliblisten) els.caliblisten.disabled = false;
@@ -1449,6 +1881,16 @@ function calibWorkerAnalyze(payload, transfer) {
   });
 }
 
+// Median of a SORTED numeric array. For an even count, average the two central elements —
+// picking the upper one (arr[n>>1]) biases every correction toward over-shoot at the low
+// detection counts that are the common case here.
+function calibMedian(sorted) {
+  const n = sorted.length;
+  if (!n) return null;
+  const m = n >> 1;
+  return n & 1 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2;
+}
+
 // Measure THIS device's own speaker→mic loopback (output latency + air + mic-in) with a
 // few DOWN-sweeps — distinct from the reference's up-sweep so they never confuse. This is
 // the systematic latency the "listen-only" method can't otherwise see; subtracting the
@@ -1460,7 +1902,8 @@ async function measureSelfLoop(run) {
   const capMs = Math.round((lead + MAXLAG + CALCFG.CHIRP_MS / 1000 + 0.2) * 1000);
   const MIN_SELF_SCORE = 0.3; // must CLEARLY hear our own (loud, clean) echo to trust it
   const loops = [], scores = [];
-  for (let i = 0; i < 3 && calib.running && calib.runSeq === run; i++) {
+  calib.selfSources = [];
+  for (let i = 0; i < 5 && calib.running && calib.runSeq === run; i++) {
     calib.micChunks = []; calib.micT0 = null; calib.micLen = 0; calib.micNextFrame = null;
     calib.active = true;
     const Temit = ac.currentTime + lead;
@@ -1468,6 +1911,10 @@ async function measureSelfLoop(run) {
     src.buffer = selfBuf;
     src.connect(ac.destination); // straight to output (bypasses the muted music gain)
     src.start(Temit);
+    // Track it so an abort/cancel during the capture sleep can silence a chirp that's
+    // already scheduled into the future (otherwise it "whoops" after the user hit Cancel).
+    calib.selfSources.push(src);
+    src.onended = () => { const i = calib.selfSources ? calib.selfSources.indexOf(src) : -1; if (i >= 0) calib.selfSources.splice(i, 1); };
     await calibSleep(capMs);
     // If a newer session took over during the sleep, bail WITHOUT clearing calib.active —
     // that flag now belongs to the new session's mic capture and must not be stomped.
@@ -1478,7 +1925,7 @@ async function measureSelfLoop(run) {
     let o = 0;
     for (const c of calib.micChunks) { mic.set(c, o); o += c.length; }
     const res = await calibWorkerAnalyze(
-      { mic, micRate: ac.sampleRate, micT0: calib.micT0, chirp: { ms: CALCFG.CHIRP_MS, f0: CALCFG.CHIRP_F1, f1: CALCFG.CHIRP_F0 }, minScore: 0.05, minSepSec: 0.05 },
+      { mic, micRate: ac.sampleRate, micT0: calib.micT0, chirp: { ms: CALCFG.CHIRP_MS, f0: CALCFG.CHIRP_F1, f1: CALCFG.CHIRP_F0 }, minScore: 0.05, minSepSec: 0.05, phatBeta: CALCFG.PHAT_BETA },
       [mic.buffer]
     );
     if (!res || !res.peaks) continue;
@@ -1493,8 +1940,10 @@ async function measureSelfLoop(run) {
   }
   const ok = loops.length;
   loops.sort((a, b) => a - b);
-  const med = ok ? loops[ok >> 1] : null;
-  const spread = ok ? loops[ok - 1] - loops[0] : 0;
+  const med = calibMedian(loops);
+  // Consistency gate: with ≥4 reps, drop the single worst on each end so one outlier (a stray
+  // reflection / glitchy rep) doesn't falsely fail an otherwise-tight self-test.
+  const spread = ok >= 4 ? loops[ok - 2] - loops[1] : ok ? loops[ok - 1] - loops[0] : 0;
   try { console.log("[calib] selfLoop reps=" + ok + " medMs=" + (med != null ? Math.round(med * 1000) : "—") + " spreadMs=" + Math.round(spread * 1000) + " maxScore=" + (scores.length ? Math.max.apply(null, scores).toFixed(2) : "—")); } catch (e) {}
   if (ok < 2) return null; // not enough clean reads → fall back to browser estimate
   if (spread > 0.03) return null; // inconsistent → don't trust
@@ -1504,18 +1953,27 @@ async function measureSelfLoop(run) {
 
 // One measurement: record a few ticks, find the reference tone near each of our own
 // playout beats, return the median arrival gap (ms). → {medGapMs,n} | {n} | {error} | null.
-async function runListenMeasurement(run) {
+async function runListenMeasurement(run, selfLoopSec) {
   calib.micChunks = [];
   calib.micT0 = null;
   calib.micLen = 0;
   calib.micNextFrame = null;
   const AC0 = ac.currentTime, P0 = performance.now(); // sample the perf↔ac mapping once
-  const toneDur = CALCFG.CHIRP_MS / 1000;
+  const coded = calibCoded();
+  // Period of the repeating event we align to: one code period (coded) or one tick (chirp).
+  const periodS = coded ? CALCFG.CODE_N / 16000 : CALCFG.TICK_S;
+  // Coded path's event is the (instantaneous) code-phase-0; the chirp spans CHIRP_MS.
+  const toneDur = coded ? 0 : CALCFG.CHIRP_MS / 1000;
+  // Search half-width around each expected beat, kept < period/2 so a neighbouring period
+  // can't alias into this one.
+  const half = coded ? periodS * 0.45 : CALCFG.SEARCH_HALF_S;
   calib.active = true;
   // (Our own music is muted for the whole listen session in startListen, so the mic hears
-  // the reference's tone cleanly.) Size the window so ≥ WINDOW_TICKS ticks are fully
-  // hearable (each tone + its search window lands inside the recording).
-  const captureMs = Math.round((CALCFG.WINDOW_TICKS * CALCFG.TICK_S + 2 * CALCFG.SEARCH_HALF_S + toneDur + 0.6) * 1000);
+  // the reference cleanly.) Coded: record CODE_PERIODS periods (the code is continuous, so a
+  // short capture sees several). Chirp: size so ≥ WINDOW_TICKS tones land fully inside.
+  const captureMs = coded
+    ? Math.round((CALCFG.CODE_PERIODS * periodS + 2 * half + 0.6) * 1000)
+    : Math.round((CALCFG.WINDOW_TICKS * CALCFG.TICK_S + 2 * CALCFG.SEARCH_HALF_S + toneDur + 0.6) * 1000);
   await calibSleep(captureMs);
   // Superseded mid-capture → bail without clearing the new session's calib.active flag.
   if (!calib.running || calib.runSeq !== run) return null;
@@ -1527,8 +1985,11 @@ async function runListenMeasurement(run) {
   for (const c of calib.micChunks) { mic.set(c, o); o += c.length; }
   const recStart = calib.micT0; // ac-time of first recorded sample
   const recEnd = calib.micT0 + micLenSec; // …and last
+  const tmplParams = coded
+    ? { code: { seed: calib.refSeed || CALCFG.CODE_SEED, n: CALCFG.CODE_N, f0: CALCFG.CODE_F0, f1: CALCFG.CODE_F1 } }
+    : { chirp: { ms: CALCFG.CHIRP_MS, f0: CALCFG.CHIRP_F0, f1: CALCFG.CHIRP_F1 } };
   const res = await calibWorkerAnalyze(
-    { mic, micRate: ac.sampleRate, micT0: calib.micT0, chirp: { ms: CALCFG.CHIRP_MS, f0: CALCFG.CHIRP_F0, f1: CALCFG.CHIRP_F1 }, minScore: CALCFG.MIN_SCORE, minSepSec: CALCFG.TICK_S * 0.5 },
+    { mic, micRate: ac.sampleRate, micT0: calib.micT0, ...tmplParams, minScore: coded ? 0.04 : CALCFG.MIN_SCORE, minSepSec: periodS * 0.5, phatBeta: CALCFG.PHAT_BETA },
     [mic.buffer]
   );
   if (!res) return null;
@@ -1536,31 +1997,36 @@ async function runListenMeasurement(run) {
   const peaks = res.peaks || [];
   const top = res.top || 0; // best matched-filter score anywhere (diagnostics)
   const rms = res.rms || 0; // overall mic level (0 = silence)
-  const tickNs = CALCFG.TICK_S * 1e9;
+  const tickNs = periodS * 1e9;
   const startServerNs = P0 * 1e6 + offsetNs;
   const endServerNs = startServerNs + captureMs * 1e6;
-  const half = CALCFG.SEARCH_HALF_S;
   const gaps = [];
   for (let t = Math.ceil(startServerNs / tickNs) * tickNs; t <= endServerNs; t += tickNs) {
-    const SL = AC0 + (t - startServerNs) / 1e9 + trimMs / 1000; // our playout beat for tick t (ac time)
-    // Only count ticks whose whole symmetric window + tone length lies inside the
-    // recording — a tone must never be "missing" merely because it fell past the audio.
-    if (SL - half < recStart || SL + half + toneDur > recEnd) continue;
+    const SL = AC0 + (t - startServerNs) / 1e9 + effTrimMs() / 1000; // our playout beat for tick t (ac time)
+    // Coded path: center the search on our OWN measured loopback so the window tracks the small
+    // residual (ref−follower latency mismatch), not the raw arrival latency — otherwise a
+    // high-latency reference speaker (Bluetooth/HDMI) could fall outside ±half and alias to the
+    // next period. Chirp path keeps centering on the beat (its ±0.7 s window already covers it).
+    const center = coded ? SL + selfLoopSec : SL;
+    // Only count beats whose whole symmetric window + tone length lies inside the recording —
+    // a tone must never be "missing" merely because it fell past the captured audio.
+    if (center - half < recStart || center + half + toneDur > recEnd) continue;
     let best = null;
     for (const pk of peaks) {
-      const g = pk.time - SL;
+      const g = pk.time - center;
       if (g >= -half && g <= half) {
         if (best === null || pk.score > best.score) best = pk; // strongest match = direct path
       }
     }
-    if (best) gaps.push(best.time - SL);
+    if (best) gaps.push(best.time - SL); // raw gap (arrival − beat); corr subtracts selfLoop later
   }
   // Diagnostics — inspect window.nfsCalib or the console if a measurement comes up empty.
   const diag = { micLenSec: +micLenSec.toFixed(2), micLevel: +rms.toFixed(4), peaks: peaks.length, topScore: +top.toFixed(3), detections: gaps.length, gapsMs: gaps.map((g) => Math.round(g * 1000)) };
   try { window.nfsCalib = diag; console.log("[calib]", JSON.stringify(diag)); } catch (e) {}
-  if (gaps.length < CALCFG.MIN_DETECTIONS) return { n: gaps.length, top, micLenSec, rms };
+  const minDet = coded ? CALCFG.CODE_MIN_DETECTIONS : CALCFG.MIN_DETECTIONS;
+  if (gaps.length < minDet) return { n: gaps.length, top, micLenSec, rms };
   gaps.sort((a, b) => a - b);
-  return { medGapMs: gaps[gaps.length >> 1] * 1000, n: gaps.length, top, micLenSec, rms };
+  return { medGapMs: calibMedian(gaps) * 1000, n: gaps.length, top, micLenSec, rms };
 }
 
 async function startListen() {
@@ -1576,6 +2042,7 @@ async function startListen() {
   calib.role = "listen";
   calib.running = true;
   const myRun = ++calib.runSeq; // identity for the stale-finally / supersede guard
+  const owns = () => calib.running && calib.runSeq === myRun; // still this session's turn?
   els.caliblisten.textContent = "✕ Cancel";
   els.calibref.disabled = true;
   els.warn.style.display = "none";
@@ -1591,28 +2058,50 @@ async function startListen() {
     showWarn("⚠ Aligning needs microphone access. Allow the prompt, or sync by ear with the slider.");
     calibAbort(""); setCalibStatus(""); return;
   }
-  if (!calib.running) { stream.getTracks().forEach((t) => t.stop()); return; } // cancelled during prompt
+  if (!owns()) { stream.getTracks().forEach((t) => t.stop()); return; } // cancelled/superseded during prompt
 
   const tr = stream.getAudioTracks()[0];
   const st = tr && tr.getSettings ? tr.getSettings() : {};
   const aecForced = st.echoCancellation === true; // iOS Safari often ignores the constraint
 
+  let myMic;
   try {
-    await setupMic(stream);
+    myMic = await setupMic(stream);
   } catch (e) {
     try { stream.getTracks().forEach((t) => t.stop()); } catch (e2) {}
     showWarn("⚠ Couldn't start the microphone. Use the slider to sync by ear.");
     calibAbort(""); setCalibStatus(""); return;
+  }
+  if (!owns()) {
+    // Superseded/cancelled while parked inside setupMic's first-run worklet compile: we installed
+    // our mic tap AFTER the new session's teardown ran. Disconnect only OUR nodes (not the global
+    // calib.mic, which the new run may now own) so our tap can't leak blocks into its capture.
+    if (myMic) { try { myMic.node.port.onmessage = null; myMic.source.disconnect(); myMic.node.disconnect(); myMic.sink.disconnect(); } catch (e) {} }
+    try { stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+    if (calib.mic === myMic) calib.mic = null;
+    return;
   }
 
   // Mute our own music for the whole session — our speaker sits next to our mic and would
   // otherwise drown out the reference's tone. Restored in finally (via applyGain).
   if (gain) { try { gain.gain.cancelScheduledValues(ac.currentTime); } catch (e) {} gain.gain.value = 0; }
 
+  // TDMA: stagger each follower's self-test by a FULL self-test length (slot × ~8.4 s) so the
+  // loud, identical chirps serialize and never overlap in the shared room. Slot 0 starts at once;
+  // the reference's code keeps playing throughout (the chirp self-test is separable from it by
+  // shape). The listen phase that follows is collision-free, so it stays simultaneous.
+  if (calib.orchestrated && calib.slot > 0) {
+    setCalibStatus("Waiting for my self-test slot…");
+    calibSendStatus("queued");
+    await calibSleep(calib.slot * CALIB_SELF_SLOT_MS);
+    if (!owns()) return; // cancelled / superseded during the wait
+  }
+
   // Measure our OWN speaker→mic loopback first — this is the systematic latency the
   // listen-only method can't otherwise see (the ~100 ms residual). Subtracting the
   // measured value (vs the browser's estimate) is what gets us to a few ms.
   setCalibStatus("Measuring this device's own latency…");
+  if (calib.orchestrated) calibSendStatus("self-test…");
   const selfLoopSec = await measureSelfLoop(myRun);
   const selfLoopMs = selfLoopSec != null ? selfLoopSec * 1000 : estOutLatMs();
   try { window.nfsSelfLoopMs = Math.round(selfLoopMs); window.nfsSelfMeasured = selfLoopSec != null; } catch (e) {}
@@ -1624,14 +2113,16 @@ async function startListen() {
   // boundary (the tone train is periodic, so a >½-tick offset would alias to the wrong
   // tick). Restored on any non-success exit. The remaining alias risk is only a large
   // trim on the REFERENCE device — keep the anchor near 0.
+  if (!owns()) return; // cancelled/superseded during the self-test — leave trim & session to the owner
   setTrim(0);
   let bestTrim = 0, bestAbs = Infinity, everHeard = false, committed = false;
-  const owns = () => calib.running && calib.runSeq === myRun; // still this session's turn?
+  const maxIters = calibCoded() ? CALCFG.CODE_MAX_ITERS : CALCFG.MAX_ITERS; // coded converges faster
+  if (calib.orchestrated) calibSendStatus("listening…");
   try {
-    for (let iter = 0; iter < CALCFG.MAX_ITERS && owns(); iter++) {
-      setCalibStatus("Listening for the sync tone… " + selfStr + " (" + (iter + 1) + "/" + CALCFG.MAX_ITERS + ")");
+    for (let iter = 0; iter < maxIters && owns(); iter++) {
+      setCalibStatus("Listening for the sync tone… " + selfStr + " (" + (iter + 1) + "/" + maxIters + ")");
       const trimAt = trimMs;
-      const r = await runListenMeasurement(myRun);
+      const r = await runListenMeasurement(myRun, selfLoopMs / 1000); // window centers on our loopback (coded)
       if (!owns()) break; // cancelled, or superseded by a newer session
       if (r && r.error) throw new Error(r.error);
       if (r && r.noMic) {
@@ -1663,7 +2154,7 @@ async function startListen() {
       // by the un-measured prediction — so we never commit a worse, unvalidated trim.
       if (Math.abs(corr) < bestAbs) { bestAbs = Math.abs(corr); bestTrim = trimAt; }
       if (Math.abs(corr) <= CALCFG.STEP_MS) break; // trimAt is aligned → done
-      if (iter === CALCFG.MAX_ITERS - 1) break; // last pass: don't apply what we can't verify
+      if (iter === maxIters - 1) break; // last pass: don't apply what we can't verify
       setTrim(trimAt + corr); // probe the predicted trim; the next iteration measures it
       setCalibStatus("Adjusting " + (corr >= 0 ? "+" : "") + Math.round(corr) + " ms…");
     }
@@ -1673,15 +2164,18 @@ async function startListen() {
       const moved = Math.round(bestTrim - startTrim);
       const latNote = selfLoopSec != null ? " (own latency " + Math.round(selfLoopMs) + " ms)" : " (own latency estimated — accuracy limited)";
       setCalibStatus("✔ Aligned to the reference — nudged this device " + (moved >= 0 ? "+" : "") + moved + " ms." + latNote);
+      if (calib.orchestrated) calibSendStatus("aligned " + (moved >= 0 ? "+" : "") + moved + " ms");
     } else if (owns()) {
       showWarn("⚠ Couldn't complete a measurement. Try again.");
       setCalibStatus("");
+      if (calib.orchestrated) calibSendStatus("no lock");
     }
   } catch (e) {
     if (calib.runSeq === myRun) {
       if (e && e.soft) showWarn("⚠ " + e.soft);
       else showWarn("⚠ Align error: " + (e && e.message ? e.message : e));
       setCalibStatus("");
+      if (calib.orchestrated) calibSendStatus("failed");
     }
   } finally {
     if (calib.runSeq === myRun) { // a newer session hasn't taken over
@@ -1690,10 +2184,45 @@ async function startListen() {
       endCalibSession();
       calib.role = null;
       calib.running = false;
+      calib.orchestrated = false; // an orchestrated follower session is now finished
       els.caliblisten.textContent = "🎤 Listen & align";
       els.caliblisten.disabled = false;
       els.calibref.disabled = false;
+      // Collapse the role panel now the run is over: the top-level "Calibrate" button is a
+      // toggle, so if we leave the panel open the NEXT tap just closes it and starts nothing
+      // ("no tone on the 2nd calibrate"). Hiding it here makes the next tap re-open + re-run.
+      // (#calibstatus is a separate sibling, so the "✔ Aligned" result stays visible.)
+      if (els.calibroles) els.calibroles.style.display = "none";
     }
+  }
+}
+
+// ---- Server-orchestrated calibration (Phase B) --------------------------------------
+// Report short progress text back to the server (shown per-client in the server GUI).
+function calibSendStatus(text) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const b = new TextEncoder().encode(String(text).slice(0, 64));
+  const buf = new Uint8Array(2 + b.length);
+  buf[0] = MSG_CALIB_CTRL;
+  buf[1] = 2; // STATUS
+  buf.set(b, 2);
+  try { ws.send(buf); } catch (e) {}
+}
+
+// Server assigned this device a calibration role. role: 0 = stop/idle, 1 = reference, 2 = follower.
+function calibOnRole(role, refSeed, selfSeed, slot) {
+  calibAbort(""); // cancel whatever this device was doing (also clears the orchestrated flags)
+  if (role === 0) { setCalibStatus(""); calibSendStatus("idle"); return; }
+  if (!ac || ac.state !== "running" || offsetNs === null) { calibSendStatus("not playing"); return; }
+  calib.orchestrated = true;
+  calib.refSeed = refSeed >>> 0;
+  calib.selfSeed = selfSeed >>> 0;
+  calib.slot = slot | 0;
+  if (els.calibroles) els.calibroles.style.display = ""; // reveal the calibrate panel so it's visible
+  if (role === 1) {
+    startRef(); // reference: loop the shared code continuously
+  } else if (role === 2) {
+    startListen(); // follower: align to the reference (staggered self-test by slot)
   }
 }
 
@@ -1709,6 +2238,12 @@ els.calib.addEventListener("click", () => {
     setCalibStatus("Same-room sync: on one device tap 🔊 Play sync tone, on another tap 🎤 Listen & align.");
   }
 });
-els.calibref.addEventListener("click", () => { if (calib.role === "ref") stopRef(); else startRef(); });
-els.caliblisten.addEventListener("click", startListen);
+els.calibref.addEventListener("click", () => {
+  if (calib.role === "ref") stopRef();
+  else { calib.orchestrated = false; calib.refSeed = null; startRef(); } // manual ref uses the default seed
+});
+els.caliblisten.addEventListener("click", () => {
+  if (calib.role !== "listen") { calib.orchestrated = false; calib.refSeed = null; calib.selfSeed = null; calib.slot = 0; }
+  startListen();
+});
 els.calibcancel.addEventListener("click", () => { calibAbort(""); els.calibroles.style.display = "none"; setCalibStatus(""); });

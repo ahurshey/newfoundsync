@@ -8,3 +8,7 @@ Cargo.lock.bak
 /crates/android/release.keystore
 # Built APKs
 /dist/
+
+# Runtime server logs / watchdog crash dumps (stderr+stdout capture) — not source
+/nfs-*.log
+/nfs-*.out

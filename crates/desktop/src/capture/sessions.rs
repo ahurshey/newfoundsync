@@ -54,6 +54,35 @@ pub fn list_sources(exclude_pid: u32) -> Vec<AudioApp> {
         .unwrap_or_default()
 }
 
+/// Resolve a picked PID (usually a top-level WINDOW process) to the process that actually owns an
+/// audio RENDER session — the one whose audio process-loopback can isolate. Browsers render audio
+/// in a hidden child audio-service process, and UWP apps run under ApplicationFrameHost, so the
+/// window PID is frequently NOT the renderer; INCLUDE on it then grabs the wrong tree (or, if the
+/// OS will not honor the per-PID filter, the whole mix). Strategy: if `target` already owns a
+/// session keep it; else pick a session whose exe matches `target`'s exe (the app's own audio
+/// child, e.g. the browser's audio service); else return `target` unchanged. Runs on a short-lived
+/// MTA thread (COM), like `list_sources`.
+pub fn resolve_render_pid(target: u32) -> u32 {
+    std::thread::Builder::new()
+        .name("render-pid-resolve".into())
+        .spawn(move || {
+            let target_exe = process_name(target).unwrap_or_default().to_lowercase();
+            let sessions = enumerate_sessions(0); // 0 = exclude nothing (PID 0 is dropped inside)
+            if sessions.iter().any(|s| s.pid == target) {
+                return target; // already an audio renderer
+            }
+            if !target_exe.is_empty() {
+                if let Some(s) = sessions.iter().find(|s| s.exe.to_lowercase() == target_exe) {
+                    return s.pid; // same-exe audio child (e.g. the browser's audio service)
+                }
+            }
+            target // fallback: keep the picked PID and INCLUDE its process tree
+        })
+        .ok()
+        .and_then(|h| h.join().ok())
+        .unwrap_or(target)
+}
+
 fn build_sources(exclude_pid: u32) -> Vec<AudioApp> {
     let mut out = enumerate_windows(exclude_pid); // EnumWindows (no COM needed)
     let win_exes: HashSet<String> = out.iter().map(|w| w.exe.to_lowercase()).collect();

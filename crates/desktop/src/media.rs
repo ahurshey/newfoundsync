@@ -217,16 +217,18 @@ impl AudioCapture {
             }
             #[cfg(target_os = "windows")]
             CaptureSource::App { pid } => {
-                // INCLUDE the target's process tree only. If audio from OTHER apps leaks in
-                // with this mode active, the leak is the OS/driver not honoring the per-PID
-                // filter (or the picked PID hosting more than expected) — not the wiring.
+                // The picked PID is often a WINDOW process whose audio is rendered by a different
+                // process (a browser's audio-service child, or a UWP app under ApplicationFrameHost).
+                // Resolve to the process that actually owns an audio render session so INCLUDE
+                // captures THAT app, not the wrong tree / whole mix.
+                let render_pid = crate::capture::sessions::resolve_render_pid(pid);
                 tracing::info!(
-                    "[capture] starting audio source = SINGLE APP pid={pid} \
-                     (process-loopback INCLUDE target tree; only this app + its children should be captured)"
+                    "[capture] starting audio source = SINGLE APP: picked pid={pid} -> capturing render pid={render_pid} \
+                     (process-loopback INCLUDE; if audio from other apps STILL leaks, this Windows build is not honoring the per-PID filter)"
                 );
-                let c = crate::capture::process::ProcessCapture::start_include(pid, on_frame)
+                let c = crate::capture::process::ProcessCapture::start_include(render_pid, on_frame)
                     .context("start per-app process-loopback capture")?;
-                Ok((AudioCapture::Process(c), format!("App (PID {pid}, survives mute)")))
+                Ok((AudioCapture::Process(c), format!("App (PID {render_pid}, survives mute)")))
             }
             #[cfg(not(target_os = "windows"))]
             CaptureSource::AllExceptSelf | CaptureSource::App { .. } => {

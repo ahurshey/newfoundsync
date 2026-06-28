@@ -182,9 +182,21 @@ function loadVolume() {
   els.vol.value = String(volume);
   paintSlider(els.vol);
 }
+// Perceptual (logarithmic) volume taper: map a 0..1 slider POSITION to audio gain on a dB curve so
+// equal slider travel = equal loudness change. A linear gain made you drag almost to the bottom
+// before it got quieter (the top half is only ~6 dB); this matches how ears hear it (0.9 ≈ -6 dB,
+// 0.5 ≈ -30 dB), so a small pull audibly reduces volume and fine control is even across the range.
+function volGain(pos) {
+  if (!(pos > 0)) return 0; // 0 / NaN → silence
+  if (pos >= 1) return 1; // full
+  const MIN_DB = -60; // bottom of the usable range
+  return Math.pow(10, (MIN_DB * (1 - pos)) / 20);
+}
+
 function applyGain() {
-  // Effective gain = the device's own volume × the server-controlled remote volume.
-  if (gain) gain.gain.value = muted ? 0 : volume * remoteVol;
+  // Effective gain = the device's own volume × the server-controlled remote volume, each on the
+  // perceptual taper (so the master/per-client server sliders feel right too — they fold into remoteVol).
+  if (gain) gain.gain.value = muted ? 0 : volGain(volume) * volGain(remoteVol);
   const off = muted || volume === 0;
   els.mute.textContent = off ? "🔇 Muted" : "🔊 Sound on";
   els.mute.classList.toggle("muted", off);
@@ -337,8 +349,8 @@ applyVizUI();
 let ws = null;
 let cfg = null;
 let bufferMs = 3000;
-let offsetNs = null; // median(serverNs - clientPerfNs)
-let offsets = [];
+let offsetNs = null; // best-RTT median(serverNs - clientPerfNs)
+let offsets = []; // recent clock samples: [{ off: ns, rtt: ms }]
 let pending = []; // clock-req send times (FIFO)
 let audioDecoder = null;
 let videoDecoder = null;
@@ -767,9 +779,20 @@ function sendClockReq() {
 }
 
 function startClockSync() {
-  for (let i = 0; i < 6; i++) setTimeout(sendClockReq, i * 30); // burst
+  for (let i = 0; i < 10; i++) setTimeout(sendClockReq, i * 25); // cold-start burst (best-RTT picks from these)
   clearInterval(keepaliveTimer);
-  keepaliveTimer = setInterval(sendClockReq, 2000); // keepalive + drift correction
+  keepaliveTimer = setInterval(sendClockReq, 1000); // 1 Hz keepalive — fresher offset → tighter drift tracking
+}
+
+// Clock-offset estimate: keep a window of recent samples and trust only the lowest-RTT ones.
+// A low round-trip means little queueing/path asymmetry, so that sample's midpoint offset is the
+// most accurate; the median over the best subset rejects the odd remaining outlier. This is what
+// pins every client to the SAME server-clock offset → tight cross-device sync (and stable drift).
+const CLOCK_WINDOW = 30; // samples retained
+const CLOCK_BEST = 5; //    estimate from the 5 lowest-RTT of them
+function bestOffsets() {
+  const byRtt = [...offsets].sort((a, b) => a.rtt - b.rtt);
+  return byRtt.slice(0, Math.min(CLOCK_BEST, byRtt.length)).map((s) => s.off);
 }
 
 function serverPtsToPerfMs(ptsNs) {
@@ -796,11 +819,17 @@ function onMessage(ev) {
     const t4 = performance.now();
     if (t1 === undefined) return;
     const serverNs = Number(dv.getBigInt64(1, false));
-    const midPerfNs = ((t1 + t4) / 2) * 1e6;
-    offsets.push(serverNs - midPerfNs);
-    if (offsets.length > 15) offsets.shift();
-    const sorted = [...offsets].sort((a, b) => a - b);
-    offsetNs = sorted[Math.floor(sorted.length / 2)];
+    const rtt = t4 - t1; // ms
+    if (rtt > 0) {
+      // Skip a degenerate/mispaired sample: best-RTT selection actively favors the lowest RTT,
+      // so a spuriously tiny/negative one would poison the estimate. (Unreachable over the
+      // reliable ordered WS, but cheap insurance for the sync foundation.)
+      const midPerfNs = ((t1 + t4) / 2) * 1e6;
+      offsets.push({ off: serverNs - midPerfNs, rtt });
+      if (offsets.length > CLOCK_WINDOW) offsets.shift();
+    }
+    const best = bestOffsets().sort((a, b) => a - b);
+    if (best.length) offsetNs = best[Math.floor(best.length / 2)]; // median of the lowest-RTT samples
     return; // updateStats decides "buffering …" vs "playing"
   }
 
@@ -1266,10 +1295,9 @@ function updateStats() {
 }
 
 function syncJitterMs() {
-  if (offsets.length < 2) return 0;
-  const mn = Math.min(...offsets),
-    mx = Math.max(...offsets);
-  return (mx - mn) / 1e6 / 2;
+  const best = bestOffsets(); // spread of the samples actually used for the estimate
+  if (best.length < 2) return 0;
+  return (Math.max(...best) - Math.min(...best)) / 1e6 / 2;
 }
 
 // Diagnostics hook (for support/QA): window.nfsDebug() reports the live playout lead.

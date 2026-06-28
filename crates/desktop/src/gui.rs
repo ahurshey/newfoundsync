@@ -880,7 +880,7 @@ impl ServerApp {
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new(
-                            "Accept the one-time security warning (Advanced → proceed) — it's a \
+                            "Accept the one-time security warning (Advanced -> proceed) — it's a \
                              self-signed certificate, needed so the browser allows playback.",
                         )
                         .size(11.5)
@@ -965,7 +965,7 @@ impl ServerApp {
                             egui::RichText::new("Aligning all devices…").size(11.5).color(c_accent()),
                         );
                     } else if ui
-                        .button("🎚 Calibrate all")
+                        .button("Calibrate all")
                         .on_hover_text(
                             "Earliest-connected device plays a sync code; the rest listen on \
                              their mics and align at once. Devices must be in the same room \
@@ -1308,7 +1308,7 @@ impl ServerApp {
                 egui::RichText::new(
                     "Reliable TCP stream (WebSocket/TLS): lost Wi-Fi packets are re-sent and this \
                      jitter buffer hides the stall. Bigger = more dropout-proof but more delay; \
-                     identical on every client → lock-step.",
+                     identical on every client -> lock-step.",
                 )
                 .size(11.0)
                 .color(c_dim()),
@@ -1329,14 +1329,14 @@ impl ServerApp {
         } else if dirty {
             if clients_n > 0 {
                 format!(
-                    "▶  Apply changes — reconnects {clients_n} device{}",
+                    "Apply changes — reconnects {clients_n} device{}",
                     if clients_n == 1 { "" } else { "s" }
                 )
             } else {
-                "▶  Apply changes".to_string()
+                "Apply changes".to_string()
             }
         } else {
-            "✓  Stream is up to date".to_string()
+            "Stream is up to date".to_string()
         };
         let (fill, txt_col) = if dirty && !busy {
             (c_accent(), egui::Color32::WHITE)
@@ -1417,12 +1417,16 @@ impl eframe::App for ServerApp {
         ui.horizontal(|ui| {
             ui.heading("Newfoundsync");
             let (pill, pcol) = if busy {
-                ("● Starting…".to_string(), c_accent_hi())
+                ("Starting…".to_string(), c_accent_hi())
             } else if stream_live {
-                (format!("● Live · {clients_n} listening"), c_ok())
+                (format!("Live · {clients_n} listening"), c_ok())
             } else {
-                ("● Stopped".to_string(), c_err())
+                ("Stopped".to_string(), c_err())
             };
+            // Status LED — drawn, not a glyph: egui's bundled font has no "●", so a literal renders
+            // as a tofu box. A painted dot always renders and matches the status colour.
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(13.0, 16.0), egui::Sense::hover());
+            ui.painter().circle_filled(egui::pos2(dot.left() + 6.0, dot.center().y), 4.5, pcol);
             ui.label(egui::RichText::new(pill).color(pcol).size(12.5).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 theme_toggle(ui); // sliding light/dark switch (knob right = light)

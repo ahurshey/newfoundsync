@@ -35,6 +35,3 @@ round mark (blue disc + Newfoundland); the larger sizes show the full emblem.
   procedural teal-square fallback if it ever fails to load.
 - **In-app branding**: the emblem texture in the egui header (26 px) and on the
   idle landing screen (112 px).
-
-Android launcher mipmaps are a follow-up (Android is paused) — re-run with the
-mipmap export once Android resumes.

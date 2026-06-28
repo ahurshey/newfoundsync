@@ -1,5 +1,5 @@
-//! Newfoundsync core — the platform-neutral audio-sync engine shared by the
-//! desktop binary (Windows/Linux) and the Android client.
+//! Newfoundsync core — the platform-neutral audio-sync engine used by the
+//! desktop binary (Windows/Linux).
 //!
 //! Everything here builds on every target: the wire protocol, NTP-style clock
 //! sync, codec (PCM/Opus), jitter buffer + deadline scheduler, cpal playback,

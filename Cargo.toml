@@ -1,9 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/desktop", "crates/android"]
-# android is built only for android targets (via cargo-apk / cargo-ndk); keep it
-# out of the default host build so `cargo build` / `cargo test` stay desktop-only.
-default-members = ["crates/core", "crates/desktop"]
+members = ["crates/core", "crates/desktop"]
 
 [profile.release]
 opt-level = 3

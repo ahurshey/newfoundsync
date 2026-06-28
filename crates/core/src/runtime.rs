@@ -1,7 +1,7 @@
 //! Client runtime: assemble the platform-neutral modules into a running client.
 //!
 //! [`ClientHandle`] starts everything in its constructor and tears it down on
-//! drop, so callers (the desktop UI/CLI or the Android app) just build one and
+//! drop, so callers (the desktop UI/CLI) just build one and
 //! hold it. The server runtime lives in the desktop crate because it depends on
 //! platform-specific capture.
 

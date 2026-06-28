@@ -465,9 +465,16 @@ async fn serve(
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Binary(b))) if b.first() == Some(&MSG_CLOCK_REQ) => {
-                        let mut r = Vec::with_capacity(9);
+                        // True 4-timestamp NTP: t2 = the instant we dequeued the request, t3 = the
+                        // instant just before we send the reply. The client cancels (t3 - t2) server
+                        // dwell out of BOTH its offset and its RTT, removing the per-device DC bias the
+                        // old single-stamp scheme baked in. Reply: [tag][t2 i64 BE][t3 i64 BE].
+                        let t2 = mono_now();
+                        let mut r = Vec::with_capacity(17);
                         r.push(MSG_CLOCK_RSP);
-                        r.extend_from_slice(&mono_now().to_be_bytes());
+                        r.extend_from_slice(&t2.to_be_bytes());
+                        let t3 = mono_now();
+                        r.extend_from_slice(&t3.to_be_bytes());
                         if sender.send(Message::Binary(r)).await.is_err() {
                             break;
                         }

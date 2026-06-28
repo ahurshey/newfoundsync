@@ -160,8 +160,8 @@ const calib = {
 };
 // Coded path is active either by the local flag OR a server-orchestrated session.
 function calibCoded() { return CALCFG.CODED || calib.orchestrated; }
-// Per-slot TDMA stagger for followers' self-tests. ONE self-test is measureSelfLoop's 5 reps ×
-// ~1.67 s ≈ 8.4 s, so the slot must exceed that for the (loud, identical) chirps to truly
+// Per-slot TDMA stagger for followers' self-tests. ONE self-test is measureSelfLoop's 4 reps ×
+// ~1.67 s ≈ 6.7 s, so the slot must exceed that for the (loud, identical) chirps to truly
 // serialize and not overlap in the shared room. (A distinct coded self-test per follower would
 // allow a shorter slot, but the self-test deliberately reuses the proven chirp path.)
 const CALIB_SELF_SLOT_MS = 9500;
@@ -182,15 +182,18 @@ function loadVolume() {
   els.vol.value = String(volume);
   paintSlider(els.vol);
 }
-// Perceptual (logarithmic) volume taper: map a 0..1 slider POSITION to audio gain on a dB curve so
-// equal slider travel = equal loudness change. A linear gain made you drag almost to the bottom
-// before it got quieter (the top half is only ~6 dB); this matches how ears hear it (0.9 ≈ -6 dB,
-// 0.5 ≈ -30 dB), so a small pull audibly reduces volume and fine control is even across the range.
+// Perceptual (logarithmic) volume taper: map a 0..1 slider POSITION to gain on a dB curve so equal
+// slider travel = equal loudness change. A -40 dB range keeps the upper half usable and gentle
+// (0.9 ≈ -4 dB, 0.75 ≈ -10 dB, 0.5 ≈ -20 dB) — the textbook -60 dB dropped too fast (0.5 was -30 dB).
+// The bottom FADE fraction rolls off LINEARLY to true silence, so the low end is smooth and finely
+// controllable rather than stepping from a faint level straight to mute (per the audio-taper reference).
 function volGain(pos) {
-  if (!(pos > 0)) return 0; // 0 / NaN → silence
+  if (!(pos > 0)) return 0; // 0 / NaN → true silence
   if (pos >= 1) return 1; // full
-  const MIN_DB = -60; // bottom of the usable range
-  return Math.pow(10, (MIN_DB * (1 - pos)) / 20);
+  const MIN_DB = -40; // usable range (gentler than the -60 dB textbook value)
+  const FADE = 0.08; // bottom 8% of travel: linear roll-off to silence
+  const curve = (p) => Math.pow(10, (MIN_DB * (1 - p)) / 20);
+  return pos < FADE ? curve(FADE) * (pos / FADE) : curve(pos);
 }
 
 function applyGain() {
@@ -218,11 +221,20 @@ els.mute.addEventListener("click", () => {
 });
 els.stop.addEventListener("click", stop);
 
+// Persist whether THIS device has an established alignment (calibration / manual / server trim). The
+// output-latency model (onAudioData) runs ONLY for un-aligned devices, so this must survive reloads:
+// a calibration that legitimately lands on trim 0 is still "aligned" and must not re-engage the model.
+function markAligned(v) {
+  aligned = v;
+  try { localStorage.setItem("nfs_aligned", v ? "1" : "0"); } catch (e) {}
+}
 function loadTrim() {
   try {
     const t = parseFloat(localStorage.getItem("nfs_trim"));
     if (!Number.isNaN(t)) trimMs = t;
   } catch (e) {}
+  try { if (localStorage.getItem("nfs_aligned") === "1") aligned = true; } catch (e) {}
+  if (trimMs !== 0) aligned = true; // legacy: a saved nonzero trim predates the flag → still aligned
   els.trim.value = String(trimMs);
   els.trimval.textContent = (trimMs >= 0 ? "+" : "") + trimMs.toFixed(1) + " ms";
   paintSlider(els.trim);
@@ -240,9 +252,9 @@ function setTrim(ms) {
   flushVideo(); // re-time the video queue to the new offset
   reportSync(); // let the server GUI reflect this device's real sync
 }
-els.trim.addEventListener("input", () => setTrim(parseFloat(els.trim.value)));
-els.trimdown.addEventListener("click", () => setTrim(trimMs - 10));
-els.trimup.addEventListener("click", () => setTrim(trimMs + 10));
+els.trim.addEventListener("input", () => { setTrim(parseFloat(els.trim.value)); markAligned(effTrimMs() !== 0); });
+els.trimdown.addEventListener("click", () => { setTrim(trimMs - 10); markAligned(effTrimMs() !== 0); });
+els.trimup.addEventListener("click", () => { setTrim(trimMs + 10); markAligned(effTrimMs() !== 0); });
 
 // ---- Light/dark theme toggle (persisted; default dark). The <head> pre-applies the saved
 // theme before paint to avoid a flash; here we keep the button icon + theme-color meta in sync.
@@ -349,9 +361,12 @@ applyVizUI();
 let ws = null;
 let cfg = null;
 let bufferMs = 3000;
-let offsetNs = null; // best-RTT median(serverNs - clientPerfNs)
+let offsetNs = null; // smoothed best-RTT estimate of (serverNs - clientPerfNs)
 let offsets = []; // recent clock samples: [{ off: ns, rtt: ms }]
 let pending = []; // clock-req send times (FIFO)
+let clockSyncT0 = 0; // performance.now() when the current clock (re-)anchor started (gate timeout)
+let outLatMs = 0; // cached speaker output latency (ms); modeled in the anchor only for un-aligned devices
+let aligned = false; // true once an alignment is established (calibration / manual trim / server push)
 let audioDecoder = null;
 let videoDecoder = null;
 let gotParams = false; // have we configured the video decoder from SPS/PPS yet?
@@ -362,6 +377,8 @@ let gotParams = false; // have we configured the video decoder from SPS/PPS yet?
 let videoAccel = "no-preference";
 let aPlayhead = null; // AudioContext time of the next audio frame (gapless scheduler)
 let firstPlayoutAc = null; // ac time the first buffered audio is scheduled to sound
+let aRateInt = 0; // playout drift servo: integral accumulator (rate units, anti-windup clamped)
+let aRatePrev = 1.0; // last applied playback rate (per-frame slew limiting → smooth pitch)
 let evq = []; // ENCODED video queue [{key, tsUs, data}] — cheap, holds the whole buffer
 let vq = []; // DECODED render queue [{frame, targetPerf}] — small, kept just ahead
 let maxEvq = 400; // encoded queue cap (recomputed from fps + bufferMs)
@@ -779,6 +796,7 @@ function sendClockReq() {
 }
 
 function startClockSync() {
+  clockSyncT0 = performance.now(); // start the confidence-gate timeout clock for this (re-)anchor
   for (let i = 0; i < 10; i++) setTimeout(sendClockReq, i * 25); // cold-start burst (best-RTT picks from these)
   clearInterval(keepaliveTimer);
   keepaliveTimer = setInterval(sendClockReq, 1000); // 1 Hz keepalive — fresher offset → tighter drift tracking
@@ -790,6 +808,11 @@ function startClockSync() {
 // pins every client to the SAME server-clock offset → tight cross-device sync (and stable drift).
 const CLOCK_WINDOW = 30; // samples retained
 const CLOCK_BEST = 5; //    estimate from the 5 lowest-RTT of them
+const CLOCK_GATE_MS = 3; // commit the FIRST offset only once the best-5 agree within this (ms)
+const CLOCK_GATE_TIMEOUT_MS = 1500; // …but never hang: commit whatever we have after this long
+const CLOCK_SNAP_NS = 30e6; // |raw − current| beyond 30 ms ⇒ real clock jump → snap, don't slew
+const OFFSET_EMA = 0.2; // steady state: slew offsetNs toward the median so it doesn't STEP every keepalive
+//      (a stepping offset makes targetAc jump 1 Hz, which the drift servo would chase as pitch wobble)
 function bestOffsets() {
   const byRtt = [...offsets].sort((a, b) => a.rtt - b.rtt);
   return byRtt.slice(0, Math.min(CLOCK_BEST, byRtt.length)).map((s) => s.off);
@@ -798,9 +821,19 @@ function bestOffsets() {
 function serverPtsToPerfMs(ptsNs) {
   // ptsNs is server-mono ns; offsetNs maps it to performance.now() ms, then we add
   // the shared buffer (same on every client → same wall-clock instant) plus this
-  // device's effective sync trim (local + server-pushed, to align speakers with
-  // different output latencies).
+  // device's effective sync trim (local + server-pushed). This is the shared content→wall-clock
+  // map used by BOTH audio and video, so it stays output-latency-agnostic; the audio path applies
+  // the speaker-output-latency correction itself (onAudioData), since video carries no such delay.
   return (ptsNs - offsetNs) / 1e6 + bufferMs + effTrimMs();
+}
+
+// Cache the speaker output latency the browser reports (ms). Read lazily/throttled from onAudioData
+// and on resume; the smooth drift servo absorbs any change, so no hard re-anchor is needed.
+function refreshOutLat() {
+  let s = 0;
+  if (ac && typeof ac.outputLatency === "number" && ac.outputLatency > 0 && ac.outputLatency < 0.6) s = ac.outputLatency;
+  else if (ac && typeof ac.baseLatency === "number" && ac.baseLatency > 0 && ac.baseLatency < 0.6) s = ac.baseLatency;
+  outLatMs = s * 1000;
 }
 
 // =============================================================================
@@ -818,18 +851,46 @@ function onMessage(ev) {
     const t1 = pending.shift();
     const t4 = performance.now();
     if (t1 === undefined) return;
-    const serverNs = Number(dv.getBigInt64(1, false));
-    const rtt = t4 - t1; // ms
-    if (rtt > 0) {
-      // Skip a degenerate/mispaired sample: best-RTT selection actively favors the lowest RTT,
-      // so a spuriously tiny/negative one would poison the estimate. (Unreachable over the
-      // reliable ordered WS, but cheap insurance for the sync foundation.)
-      const midPerfNs = ((t1 + t4) / 2) * 1e6;
-      offsets.push({ off: serverNs - midPerfNs, rtt });
+    // Offset (ns, server-ahead-of-client) and path RTT (ms). Prefer true 4-timestamp NTP when the
+    // server stamped receive (t2) and send (t3): that cancels server dwell out of BOTH the offset
+    // and the RTT. Fall back to the legacy single-stamp midpoint for older servers (9-byte reply).
+    const rawRttMs = t4 - t1; // client-measured round trip — never negative (perf clock is monotonic)
+    let off, rtt;
+    if (ev.data.byteLength >= 17) {
+      const t2ns = Number(dv.getBigInt64(1, false)); // server mono ns at request dequeue
+      const t3ns = Number(dv.getBigInt64(9, false)); // server mono ns just before send
+      const t1ns = t1 * 1e6,
+        t4ns = t4 * 1e6;
+      off = (t2ns - t1ns + (t3ns - t4ns)) / 2; // ns
+      rtt = (t4ns - t1ns - (t3ns - t2ns)) / 1e6; // ms, path-only (dwell removed)
+    } else {
+      const serverNs = Number(dv.getBigInt64(1, false));
+      rtt = rawRttMs; // ms (server dwell folded in)
+      off = serverNs - ((t1 + t4) / 2) * 1e6; // ns
+    }
+    if (rawRttMs >= 0) {
+      // Key the sample on the RAW round trip (always valid), and FLOOR the dwell-corrected RTT so a
+      // coarse-clock sample whose path RTT computes ~0 (or slightly negative) is RETAINED, not dropped.
+      // Dropping good samples could starve the best-set and stall the confidence gate.
+      offsets.push({ off, rtt: Math.max(rtt, 0.001) });
       if (offsets.length > CLOCK_WINDOW) offsets.shift();
     }
     const best = bestOffsets().sort((a, b) => a - b);
-    if (best.length) offsetNs = best[Math.floor(best.length / 2)]; // median of the lowest-RTT samples
+    if (best.length) {
+      const rawOff = best[Math.floor(best.length / 2)]; // median of the lowest-RTT samples
+      if (offsetNs === null) {
+        // Confidence gate: don't anchor playout on a single (possibly delayed) first reply — wait
+        // until enough low-RTT samples AGREE, or a short timeout, so a cold-start outlier can't
+        // plant a 100–300 ms mis-anchor that then crawls back over seconds.
+        const spreadMs = (best[best.length - 1] - best[0]) / 1e6;
+        const confident = best.length >= CLOCK_BEST && spreadMs <= CLOCK_GATE_MS;
+        if (confident || performance.now() - clockSyncT0 > CLOCK_GATE_TIMEOUT_MS) offsetNs = rawOff;
+      } else if (Math.abs(rawOff - offsetNs) > CLOCK_SNAP_NS) {
+        offsetNs = rawOff; // big jump (clock reset / network change) → snap, don't crawl
+      } else {
+        offsetNs += OFFSET_EMA * (rawOff - offsetNs); // steady state: gently slew (smooths the 1 Hz step)
+      }
+    }
     return; // updateStats decides "buffering …" vs "playing"
   }
 
@@ -850,6 +911,7 @@ function onMessage(ev) {
       const next = Math.max(-5000, Math.min(5000, ms));
       if (next !== remoteTrimMs) {
         remoteTrimMs = next;
+        markAligned(effTrimMs() !== 0); // server push (or reset to 0) re-evaluates whether we're aligned
         aPlayhead = null; // re-anchor audio so the new offset takes effect immediately
         flushVideo(); // re-time the video queue too (mirror setTrim, so A/V stay aligned)
         reportSync(); // report the new effective total back so the GUI reflects it
@@ -1127,31 +1189,51 @@ function onAudioData(ad) {
     ad.close();
     return;
   }
+  if (!aligned && (outLatMs === 0 || aFrames % 250 === 0)) refreshOutLat(); // seed on first real frame + keep fresh
   const dur = ad.numberOfFrames / ad.sampleRate; // seconds this frame occupies
-  const targetAc = ac.currentTime + (serverPtsToPerfMs(ad.timestamp * 1000) - performance.now()) / 1000;
+  // For an UN-aligned device, pull the AUDIO anchor earlier by the reported output-buffer latency so
+  // sound EMERGES at the shared instant (not merely written to the buffer then) — this shrinks the
+  // fixed cross-device skew from devices having different output latencies, with no calibration.
+  // Audio only: video carries no speaker delay. Once aligned, effTrim already folds output latency in,
+  // so we skip it (subtracting again would double-count and desync the device).
+  const outLatSec = aligned ? 0 : outLatMs / 1000;
+  const targetAc = ac.currentTime + (serverPtsToPerfMs(ad.timestamp * 1000) - performance.now()) / 1000 - outLatSec;
 
-  // Drift correction (VLC-style): hard re-anchor ONLY on the first frame or a real
-  // discontinuity (resume / gap / trim change); for normal small drift, nudge the playback
-  // RATE a hair instead of jumping. A ±1% rate change is essentially inaudible and pulls the
-  // playhead back onto the synced clock over a few seconds — no click.
-  const A_DEADBAND = 0.008; // ±8 ms: within this, don't correct (avoid hunting)
+  // Drift correction: hard re-anchor ONLY on the first frame or a real discontinuity (resume / gap /
+  // trim change). Otherwise nudge the playback RATE a hair instead of jumping — a ±1% change is
+  // essentially inaudible. The servo is PI: the Proportional term reacts to the current drift, and a
+  // slow Integral term removes the standing crystal-ppm offset that a P-only loop would park just
+  // outside the deadband and never close. The integrator is clamped + frozen on every re-anchor
+  // (anti-windup), and the steady offsetNs (now EMA-smoothed) keeps it from chasing clock noise.
+  const A_DEADBAND = 0.002; // ±2 ms: P-term dead-zone (anti-hunt only; the I-term carries steady state)
   const A_HARD_RESET = 0.4; // beyond this it's a discontinuity, not drift → jump
-  const A_MAX_ADJ = 0.01; //  cap the rate change at ±1%
-  const A_DRIFT_K = 0.1; //   reach the cap at ~100 ms of drift
+  const A_MAX_ADJ = 0.01; //  cap the TOTAL rate change at ±1%
+  const A_DRIFT_K = 0.1; //   proportional gain (reach the cap at ~100 ms of drift)
+  const A_INT_K = 0.02; //    integral gain (per second of drift) — converges the standing offset
+  const A_INT_LEAK = 0.999; // slow leak: keeps the I-term from sustaining a pure limit cycle inside the deadband
+  const A_RATE_SLEW = 0.0008; // max rate change per frame → playbackRate moves smoothly (no pitch step)
   if (aPlayhead === null || Math.abs(aPlayhead - targetAc) > A_HARD_RESET) {
     aPlayhead = Math.max(targetAc, ac.currentTime + 0.03);
+    aRateInt = 0; // anti-windup: clear the integrator on every hard re-anchor
+    aRatePrev = 1.0;
   }
   // Never schedule in the past (would drop or pile up at "now" → clicks).
   if (aPlayhead < ac.currentTime + 0.005) {
     aPlayhead = ac.currentTime + 0.01;
   }
-  // drift > 0 ⇒ we're scheduling later than the clock wants (behind) ⇒ speed up slightly;
-  // drift < 0 ⇒ ahead ⇒ slow down slightly. Converges drift → 0 without a jump.
-  let rate = 1.0;
+  // drift > 0 ⇒ scheduling later than the clock wants (behind) ⇒ speed up; drift < 0 ⇒ ahead ⇒ slow.
   const drift = aPlayhead - targetAc;
-  if (Math.abs(drift) > A_DEADBAND) {
-    rate = Math.min(1 + A_MAX_ADJ, Math.max(1 - A_MAX_ADJ, 1 + A_DRIFT_K * drift));
-  }
+  const pTerm = Math.abs(drift) > A_DEADBAND ? A_DRIFT_K * drift : 0; // deadband gates only the P-term
+  aRateInt = aRateInt * A_INT_LEAK + A_INT_K * drift * dur; // leaky integrate (the leak adds damping near lock)
+  const desired = pTerm + aRateInt; // unclamped control effort (rate offset from 1.0)
+  const clamped = Math.max(-A_MAX_ADJ, Math.min(A_MAX_ADJ, desired)); // ±1% actuator saturation
+  // Back-calculation anti-windup: bleed the clamp excess back out of the integrator so it can't wind up.
+  // Only against the CLAMP — NOT the slew limiter, which is a transient ramp the rate still reaches.
+  aRateInt += clamped - desired;
+  aRateInt = Math.max(-A_MAX_ADJ, Math.min(A_MAX_ADJ, aRateInt)); // hard safety clamp
+  let rate = 1 + clamped;
+  rate = Math.max(aRatePrev - A_RATE_SLEW, Math.min(aRatePrev + A_RATE_SLEW, rate)); // slew-limit the ramp
+  aRatePrev = rate;
 
   const ch = ad.numberOfChannels;
   const frames = ad.numberOfFrames;
@@ -1165,7 +1247,7 @@ function onAudioData(ad) {
   if (firstPlayoutAc === null) firstPlayoutAc = aPlayhead; // for the "buffering" countdown
   const src = ac.createBufferSource();
   src.buffer = buf;
-  if (rate !== 1.0) src.playbackRate.value = rate; // gentle catch-up/slow-down
+  src.playbackRate.value = rate; // gentle PI catch-up/slow-down (slew-limited, ≤±1%)
   src.connect(gain);
   src.start(aPlayhead);
   aPlayhead += dur / rate; // advance by the ACTUAL playout time (rate changes it)
@@ -1177,6 +1259,7 @@ function onAudioData(ad) {
 function onVisibility() {
   if (document.visibilityState === "visible") {
     if (ac && ac.state !== "running") ac.resume().catch(() => {});
+    refreshOutLat(); // output latency can change across a background interval (device switch)
     requestWakeLock();
     // After a background interval the clock and queue are stale: re-anchor.
     flushVideo();
@@ -1308,6 +1391,11 @@ window.nfsDebug = function () {
     trimMs,
     firstPlayoutInSec: firstPlayoutAc !== null && ac ? +(firstPlayoutAc - ac.currentTime).toFixed(3) : null,
     offsetSynced: offsetNs !== null,
+    syncJitterMs: +syncJitterMs().toFixed(3),
+    ratePpm: +((aRatePrev - 1) * 1e6).toFixed(0), // current playback-rate nudge (parts per million)
+    rateIntPpm: +(aRateInt * 1e6).toFixed(0), //     integral term alone (ppm) — should settle to ~crystal ppm
+    aligned, //                                      false ⇒ outLat model active
+    outLatMs: +outLatMs.toFixed(1),
     audioFrames: aFrames,
     evq: evq.length,
     vq: vq.length,
@@ -1931,7 +2019,7 @@ async function measureSelfLoop(run) {
   const MIN_SELF_SCORE = 0.3; // must CLEARLY hear our own (loud, clean) echo to trust it
   const loops = [], scores = [];
   calib.selfSources = [];
-  for (let i = 0; i < 5 && calib.running && calib.runSeq === run; i++) {
+  for (let i = 0; i < 4 && calib.running && calib.runSeq === run; i++) {
     calib.micChunks = []; calib.micT0 = null; calib.micLen = 0; calib.micNextFrame = null;
     calib.active = true;
     const Temit = ac.currentTime + lead;
@@ -2189,6 +2277,9 @@ async function startListen() {
     if (owns() && everHeard) {
       if (trimMs !== bestTrim) setTrim(bestTrim);
       committed = true;
+      markAligned(true); // calibration folds full output latency into trim → don't also model outLat (persisted)
+      aPlayhead = null; // re-anchor NOW: if bestTrim==current trim, setTrim above was skipped, so the
+      //                   outLatSec→0 transition would otherwise be slewed in over seconds (a brief desync)
       const moved = Math.round(bestTrim - startTrim);
       const latNote = selfLoopSec != null ? " (own latency " + Math.round(selfLoopMs) + " ms)" : " (own latency estimated — accuracy limited)";
       setCalibStatus("✔ Aligned to the reference — nudged this device " + (moved >= 0 ? "+" : "") + moved + " ms." + latNote);

@@ -299,6 +299,11 @@ fn theme_visuals() -> egui::Visuals {
     v
 }
 
+/// The egui zoom factor that the UI is designed around — shown to the user as "100%". The window
+/// opens here, and the −/+ control and the percentage readout are all relative to this baseline,
+/// so 100% means "the size this app is tuned for" rather than the raw 1.0 device scale.
+const UI_ZOOM_BASE: f32 = 0.6;
+
 /// Apply the theme + desktop-tuned spacing/fonts/zoom once at startup.
 fn setup_style(ctx: &egui::Context) {
     use egui::{FontId, TextStyle};
@@ -319,9 +324,11 @@ fn setup_style(ctx: &egui::Context) {
     s.text_styles.insert(TextStyle::Small, FontId::proportional(12.0));
     ctx.set_style(s);
 
-    // Open a touch more compact on high-DPI / 4K screens. The −/+ buttons fine-tune
-    // it live, so this is just the starting point (90%).
-    ctx.set_zoom_factor(0.9);
+    // Open at the design baseline (shown as 100%). The −/+ buttons fine-tune it live.
+    ctx.set_zoom_factor(UI_ZOOM_BASE);
+    // Disable egui's built-in Ctrl+/−/0 zoom: it steps/resets the RAW factor (Ctrl 0 → 1.0), which
+    // would disagree with our rebased readout. The −/+ buttons (relative to UI_ZOOM_BASE) own zoom.
+    ctx.options_mut(|o| o.zoom_with_keyboard = false);
 }
 
 /// An eyebrow section label (uppercase, dim, small).
@@ -1375,15 +1382,11 @@ impl eframe::App for ServerApp {
         ui.ctx()
             .layer_painter(egui::LayerId::background())
             .rect_filled(ui.ctx().screen_rect(), 0.0, c_bg());
-        // On the first frame (when the monitor's scale factor is known), shrink the default
-        // UI scale on high-DPI screens so the window isn't blown up on 4K/150–200% displays.
-        // Standard-DPI displays are left at 1.0. Users still adjust live with the ± buttons.
+        // Default the UI scale to the design baseline (shown as 100%) on the first frame
+        // (deterministic on every display). Users still adjust live with the ± buttons.
         if !self.did_initial_zoom {
             self.did_initial_zoom = true;
-            let native = ui.ctx().native_pixels_per_point().unwrap_or(1.0);
-            if native > 1.25 {
-                ui.ctx().set_zoom_factor((1.1 / native).clamp(0.6, 1.0));
-            }
+            ui.ctx().set_zoom_factor(UI_ZOOM_BASE);
         }
         ui.ctx().request_repaint_after(Duration::from_secs(1)); // keep counts/status live
         // Seed the "applied" baseline BEFORE poll_refresh() can self-heal a vanished source: it
@@ -1431,21 +1434,24 @@ impl eframe::App for ServerApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 theme_toggle(ui); // sliding light/dark switch (knob right = light)
                 ui.add_space(6.0);
-                if ui.small_button("+").on_hover_text("Bigger UI (Ctrl +)").clicked() {
+                // Zoom is shown/stepped relative to UI_ZOOM_BASE, so the design size reads as 100%
+                // and each click is ±10%. Floor at the baseline (100%); ceiling at 250%.
+                let step = UI_ZOOM_BASE * 0.1;
+                if ui.small_button("+").on_hover_text("Bigger UI").clicked() {
                     let z = ui.ctx().zoom_factor();
-                    ui.ctx().set_zoom_factor((z + 0.1).min(2.5));
+                    ui.ctx().set_zoom_factor((z + step).min(UI_ZOOM_BASE * 2.5));
                 }
-                let pct = (ui.ctx().zoom_factor() * 100.0).round() as i32;
+                let pct = (ui.ctx().zoom_factor() / UI_ZOOM_BASE * 100.0).round() as i32;
                 if ui
                     .small_button(format!("{pct}%"))
-                    .on_hover_text("Reset UI size (Ctrl 0)")
+                    .on_hover_text("Reset UI size to 100%")
                     .clicked()
                 {
-                    ui.ctx().set_zoom_factor(1.0);
+                    ui.ctx().set_zoom_factor(UI_ZOOM_BASE);
                 }
-                if ui.small_button("−").on_hover_text("Smaller UI (Ctrl −)").clicked() {
+                if ui.small_button("−").on_hover_text("Smaller UI").clicked() {
                     let z = ui.ctx().zoom_factor();
-                    ui.ctx().set_zoom_factor((z - 0.1).max(0.6));
+                    ui.ctx().set_zoom_factor((z - step).max(UI_ZOOM_BASE));
                 }
             });
         });

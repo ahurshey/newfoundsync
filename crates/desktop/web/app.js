@@ -94,6 +94,7 @@ function showWarn(html) {
 // ---- session state (one AudioContext for the whole session) -----------------
 let started = false;
 let stopping = false;
+let pendingSwReload = false; // a new build activated mid-playback → reload once the user stops
 let everPlayed = false; // reached playback once → don't re-show the buffering bar on re-anchors
 let wired = false; // one-time listeners attached
 let ac = null;
@@ -290,9 +291,31 @@ applyZoom();
 if (els.zoomout) els.zoomout.addEventListener("click", () => setZoom(pageZoom - 0.1));
 if (els.zoomin) els.zoomin.addEventListener("click", () => setZoom(pageZoom + 0.1));
 
-// ---- PWA: register the service worker (installable + offline app shell) -----
-// Network-first (see sw.js), so this never serves stale code while the server is reachable.
+// ---- PWA + self-heal --------------------------------------------------------
+// Emergency reset hatch: opening "…/?reset" unregisters the service worker, clears every cache
+// and saved setting, then reloads clean. Hand this URL to anyone whose client is stuck on a stale
+// build (it nukes the exact state that causes that). Runs first, before any other init.
+if (location.search.toLowerCase().includes("reset")) {
+  (async () => {
+    try { if (navigator.serviceWorker) { for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister(); } } catch (e) {}
+    try { if (window.caches) { for (const k of await caches.keys()) await caches.delete(k); } } catch (e) {}
+    try { localStorage.clear(); } catch (e) {}
+    location.replace(location.pathname); // reload clean, dropping ?reset
+  })();
+}
+
+// Register the SW (network-first — see sw.js — so it never serves stale code while the server is
+// reachable) and auto-heal: if a NEW build activates while this page is open, reload to pick it up.
+// Guarded so it never loops, never fires on first install, and never interrupts active playback.
 if ("serviceWorker" in navigator) {
+  const hadController = !!navigator.serviceWorker.controller; // false on first-ever load
+  let swReloaded = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!hadController || swReloaded) return; // first install → no reload; only react to a real update
+    swReloaded = true;
+    if (started) pendingSwReload = true; // mid-playback → defer the reload until they stop
+    else location.reload();
+  });
   window.addEventListener("load", () => {
     navigator.serviceWorker.register("/sw.js").catch((e) => console.warn("SW register failed", e));
   });
@@ -594,6 +617,7 @@ function stop() {
   els.start.style.display = "";
   els.srv.textContent = "";
   setState("stopped", "");
+  if (pendingSwReload) location.reload(); // a new build activated during playback → pick it up now
 }
 
 // =============================================================================

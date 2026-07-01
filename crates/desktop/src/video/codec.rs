@@ -98,18 +98,27 @@ impl VideoEncoder {
         fps: u32,
         bitrate_kbps: u32,
     ) -> Result<VideoEncoder> {
-        let _ = backend; // no software HEVC → backend choice can't change the codec
+        // Codec follows the backend: `Cpu` = software H.264 (openh264, cross-platform); anything
+        // else = GPU HEVC (Media Foundation, Windows-only). HEVC has no software encoder here and
+        // H.264 has no GPU encoder here, so this one choice selects both codec AND backend. The GUI
+        // "Codec" picker maps HEVC→Auto and H.264→Cpu; `--encoder cpu` selects H.264 on the CLI.
+        if backend == EncoderBackend::Cpu {
+            let e = H264Encoder::new(width, height, fps, bitrate_kbps)
+                .context("software H.264 (openh264) encoder")?;
+            tracing::info!("video: CPU H.264 (openh264) encoder active");
+            return Ok(VideoEncoder::Cpu(e));
+        }
         #[cfg(target_os = "windows")]
         {
             let hw = crate::video::mf_encoder::MfHevcEncoder::new(width, height, fps, bitrate_kbps)
-                .context("GPU (Media Foundation) HEVC encoder — HEVC video has no software fallback")?;
+                .context("GPU (Media Foundation) HEVC encoder — HEVC has no software encoder; pick the H.264 codec for CPU encode")?;
             tracing::info!("video: GPU HEVC encoder active");
             Ok(VideoEncoder::Hardware(hw))
         }
         #[cfg(not(target_os = "windows"))]
         {
             let _ = (width, height, fps, bitrate_kbps);
-            anyhow::bail!("HEVC video encoding requires Windows (Media Foundation)")
+            anyhow::bail!("HEVC video requires Windows (Media Foundation); select the H.264 codec for software encode")
         }
     }
 
@@ -129,6 +138,18 @@ impl VideoEncoder {
         }
     }
 
+    /// True if this emitted Annex-B access unit is a keyframe the browser can start/recover
+    /// decoding from. Codec-aware: H.264 (IDR = NAL type 5, 1-byte header) and HEVC (IRAP =
+    /// types 16..=23, 2-byte header) number their NAL units differently, so the same scan would
+    /// misdetect the other codec and leave the client stuck waiting for a keyframe.
+    pub fn is_keyframe(&self, au: &[u8]) -> bool {
+        match self {
+            VideoEncoder::Cpu(_) => annexb_has_h264_idr(au),
+            #[cfg(target_os = "windows")]
+            VideoEncoder::Hardware(_) => annexb_has_hevc_irap(au),
+        }
+    }
+
     /// Human-readable label of the backend actually in use (for logs/telemetry).
     pub fn backend_label(&self) -> &'static str {
         match self {
@@ -137,6 +158,40 @@ impl VideoEncoder {
             VideoEncoder::Hardware(_) => "GPU (Media Foundation)",
         }
     }
+}
+
+/// H.264: 1-byte NAL header; nal_type = byte & 0x1f; IDR slice = 5. Scans Annex-B start codes.
+fn annexb_has_h264_idr(au: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 3 < au.len() {
+        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+            if au[i + 3] & 0x1f == 5 {
+                return true;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// HEVC: 2-byte NAL header; nal_type = (byte0 >> 1) & 0x3f; IRAP (BLA/IDR/CRA) = 16..=23.
+#[cfg(target_os = "windows")]
+fn annexb_has_hevc_irap(au: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 3 < au.len() {
+        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+            let t = (au[i + 3] >> 1) & 0x3f;
+            if (16..=23).contains(&t) {
+                return true;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// H.264 decoder producing RGBA frames.

@@ -6,7 +6,8 @@
 //!
 //! Wire frames (binary, server→browser):
 //!   audio: [0x01][pts i64 BE][Opus bytes]
-//!   video: [0x02][pts i64 BE][flags u8][HEVC (H.265) Annex-B bytes]
+//!   video: [0x02][pts i64 BE][flags u8][Annex-B bytes — HEVC for a native capture, H.264 for a
+//!          web-uplink cast; the exact codec is advertised in MediaConfig.video_codec]
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +42,9 @@ pub enum CaptureSource {
     /// A single application (and its child processes), via process loopback.
     /// Survives output mute.
     App { pid: u32 },
+    /// No local capture — the audio/video is cast UP from a web client over the
+    /// WebSocket and relayed (via [`CastRelay`]) onto the same broadcast channels.
+    WebUplink,
 }
 
 /// What the screen-video capture grabs.
@@ -90,6 +94,53 @@ pub struct Media {
     #[cfg(target_os = "windows")]
     _video: Option<VideoProducer>,
     pub capture_device: String,
+    /// Present only for [`CaptureSource::WebUplink`]: the web layer pushes a casting
+    /// client's already-encoded frames here, which get re-stamped + fanned out like a
+    /// local capture. `None` for local sources.
+    pub cast_relay: Option<Arc<CastRelay>>,
+}
+
+/// Relays a casting web client's ALREADY-ENCODED frames onto the broadcast channels,
+/// re-stamping each with a fresh server-clock PTS so they're indistinguishable from
+/// a local capture (receivers' clock-sync/buffer/decode need no changes). The client
+/// did the encoding to the server-dictated quality; the server never decodes.
+pub struct CastRelay {
+    audio_tx: broadcast::Sender<Frame>,
+    video_tx: broadcast::Sender<Frame>,
+    lead_ns: i64,
+    // Encode targets handed to the caster in the CAST_GRANT (server-dictated quality, so all
+    // receivers get the operator's settings regardless of the caster's hardware).
+    pub audio_bps: u32,
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub video_on: bool,
+    pub width: u16,
+    pub height: u16,
+    pub fps: u8,
+    pub video_kbps: u32,
+}
+
+impl CastRelay {
+    /// Wrap+fan-out one Opus packet uploaded by the caster. Mirrors the local audio path.
+    pub fn push_audio(&self, opus: &[u8]) {
+        let pts = mono_now() + self.lead_ns;
+        let mut msg = Vec::with_capacity(9 + opus.len());
+        msg.push(MSG_AUDIO);
+        msg.extend_from_slice(&pts.to_be_bytes());
+        msg.extend_from_slice(opus);
+        let _ = self.audio_tx.send(Arc::new(msg)); // Err only if no clients
+    }
+
+    /// Wrap+fan-out one H.264 access unit (Annex-B) uploaded by the caster (Phase 2).
+    pub fn push_video(&self, key: bool, h264: &[u8]) {
+        let pts = mono_now() + self.lead_ns;
+        let mut msg = Vec::with_capacity(10 + h264.len());
+        msg.push(MSG_VIDEO);
+        msg.extend_from_slice(&pts.to_be_bytes());
+        msg.push(if key { 1 } else { 0 });
+        msg.extend_from_slice(h264);
+        let _ = self.video_tx.send(Arc::new(msg));
+    }
 }
 
 /// Settings for starting the media pipeline.
@@ -115,45 +166,93 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
     let (audio_tx, _) = broadcast::channel::<Frame>(512);
     let (video_tx, _) = broadcast::channel::<Frame>(256);
 
-    // --- audio producer -------------------------------------------------
-    let mut encoder = Encoder::new(opts.codec, opts.bitrate).context("build audio encoder")?;
-    let audio_pub = audio_tx.clone();
-    let on_frame = move |frame: &[i16]| {
-        // FFI callback (cpal/WGC) — trap panics so they can't unwind across C.
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| match encoder.encode(frame) {
-            Ok(payload) => {
-                let pts = mono_now() + lead_ns;
-                let mut msg = Vec::with_capacity(9 + payload.len());
-                msg.push(MSG_AUDIO);
-                msg.extend_from_slice(&pts.to_be_bytes());
-                msg.extend_from_slice(&payload);
-                let _ = audio_pub.send(Arc::new(msg)); // Err only if no clients
-            }
-            Err(e) => tracing::debug!("audio encode: {e}"),
-        }));
-    };
-    let (audio_capture, capture_device) = AudioCapture::start(opts.capture_source, on_frame)?;
+    // Web-uplink source = no local capture; a casting web client's already-encoded
+    // frames arrive over the WebSocket and are relayed onto these same channels.
+    let web_uplink = matches!(opts.capture_source, CaptureSource::WebUplink);
 
-    // --- video producer (Windows) --------------------------------------
+    // --- audio producer (skipped for web uplink) ------------------------
+    let (audio_capture, capture_device) = if web_uplink {
+        (AudioCapture::None, "Web client cast".to_string())
+    } else {
+        let mut encoder = Encoder::new(opts.codec, opts.bitrate).context("build audio encoder")?;
+        let audio_pub = audio_tx.clone();
+        let on_frame = move |frame: &[i16]| {
+            // FFI callback (cpal/WGC) — trap panics so they can't unwind across C.
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| match encoder.encode(frame) {
+                Ok(payload) => {
+                    let pts = mono_now() + lead_ns;
+                    let mut msg = Vec::with_capacity(9 + payload.len());
+                    msg.push(MSG_AUDIO);
+                    msg.extend_from_slice(&pts.to_be_bytes());
+                    msg.extend_from_slice(&payload);
+                    let _ = audio_pub.send(Arc::new(msg)); // Err only if no clients
+                }
+                Err(e) => tracing::debug!("audio encode: {e}"),
+            }));
+        };
+        AudioCapture::start(opts.capture_source, on_frame)?
+    };
+
+    // --- video producer (Windows; skipped for web uplink — Phase 1 is audio-only) ---
     #[cfg(target_os = "windows")]
-    let video = match opts.video {
-        Some(vcfg) => Some(
-            VideoProducer::start(vcfg, opts.video_target, opts.encoder, lead_ns, video_tx.clone())
-                .context("start video producer")?,
-        ),
-        None => None,
+    let video = if web_uplink {
+        None
+    } else {
+        match opts.video {
+            Some(vcfg) => Some(
+                VideoProducer::start(vcfg, opts.video_target, opts.encoder, lead_ns, video_tx.clone())
+                    .context("start video producer")?,
+            ),
+            None => None,
+        }
     };
     #[cfg(not(target_os = "windows"))]
-    if opts.video.is_some() {
+    if opts.video.is_some() && !web_uplink {
         tracing::warn!("video capture is Windows-only for now; serving audio only");
     }
 
-    let video_on = cfg!(target_os = "windows") && opts.video.is_some();
+    // Video is on for a local Windows capture with a VideoConfig, OR for a web uplink whose
+    // operator enabled video (Phase 2): the caster H.264-encodes to the targets below and the
+    // server relays it without decoding. A web uplink isn't gated on the host OS (no local capture).
+    let video_on = if web_uplink {
+        opts.video.is_some()
+    } else {
+        cfg!(target_os = "windows") && opts.video.is_some()
+    };
     let (fw, fps) = match opts.video {
         Some(v) => (v.resolution, v.fps.value()),
         None => (newfoundsync_core::video::Resolution::P1080, 30),
     };
     let _ = fw;
+    // Encode targets dictated to a web caster in the CAST_GRANT, so all receivers get the
+    // operator's chosen quality regardless of the caster's hardware. Zero when this isn't a
+    // web-uplink video source.
+    let (cast_w, cast_h, cast_fps, cast_kbps) = match opts.video {
+        Some(v) if web_uplink => {
+            let (w, h) = v.resolution.dims();
+            (w as u16, h as u16, v.fps.value() as u8, v.suggested_bitrate_kbps())
+        }
+        _ => (0u16, 0u16, 0u8, 0u32),
+    };
+
+    // For a web-uplink source, hand the web layer a relay it pushes the caster's frames into.
+    let cast_relay = if web_uplink {
+        Some(Arc::new(CastRelay {
+            audio_tx: audio_tx.clone(),
+            video_tx: video_tx.clone(),
+            lead_ns,
+            audio_bps: opts.bitrate.max(0) as u32,
+            sample_rate: newfoundsync_core::config::SAMPLE_RATE,
+            channels: newfoundsync_core::config::CHANNELS as u8,
+            video_on,
+            width: cast_w,
+            height: cast_h,
+            fps: cast_fps,
+            video_kbps: cast_kbps,
+        }))
+    } else {
+        None
+    };
 
     let config = MediaConfig {
         name: opts.name,
@@ -166,10 +265,16 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         video: video_on,
         frame_rate: fps,
         buffer_ms: opts.buffer_ms,
-        // GPU MF emits Main-profile HEVC (H.265). The level here (5.1) just needs to be
-        // >= the stream's real level (covers up to 4K); the decoder reads the exact
-        // params from the in-band VPS/SPS/PPS. "hev1" = parameter sets are in-band.
-        video_codec: "hev1.1.6.L153.B0",
+        // Native GPU MF capture emits Main-profile HEVC ("hev1" = params in-band, level 5.1 covers
+        // up to 4K; decoder reads exact params from the in-band VPS/SPS/PPS). We advertise H.264
+        // ("avc1"; clients switch to the AVCC decode path) in two cases: a *web-uplink* caster
+        // (browsers H.264-encode far more reliably than HEVC), and a native source whose operator
+        // picked the H.264 codec (software openh264 = EncoderBackend::Cpu).
+        video_codec: if video_on && (web_uplink || matches!(opts.encoder, EncoderBackend::Cpu)) {
+            "avc1.42E01F"
+        } else {
+            "hev1.1.6.L153.B0"
+        },
     };
 
     Ok(Media {
@@ -180,6 +285,7 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         #[cfg(target_os = "windows")]
         _video: video,
         capture_device,
+        cast_relay,
     })
 }
 
@@ -188,6 +294,8 @@ enum AudioCapture {
     System(SystemCapture),
     #[cfg(target_os = "windows")]
     Process(crate::capture::process::ProcessCapture),
+    /// No local capture (web-uplink source — frames arrive over the WebSocket).
+    None,
 }
 
 impl AudioCapture {
@@ -196,6 +304,8 @@ impl AudioCapture {
         F: FnMut(&[i16]) + Send + 'static,
     {
         match source {
+            // The web-uplink source never reaches here — start() handles it without local capture.
+            CaptureSource::WebUplink => unreachable!("WebUplink has no local capture"),
             CaptureSource::System => {
                 tracing::info!("[capture] starting audio source = SYSTEM endpoint loopback (cpal)");
                 let c = SystemCapture::start(on_frame).context("start system capture")?;
@@ -258,7 +368,7 @@ impl VideoProducer {
         lead_ns: i64,
         tx: broadcast::Sender<Frame>,
     ) -> Result<VideoProducer> {
-        use crate::video::capture::{annexb_has_keyframe, CapturedFrame, GpuParams, ScreenCapture};
+        use crate::video::capture::{CapturedFrame, GpuParams, ScreenCapture};
         use crate::video::codec::VideoEncoder;
         use rayon::prelude::*;
 
@@ -355,11 +465,11 @@ impl VideoProducer {
                                     Ok(bits) if !bits.is_empty() => {
                                         let pts = mono_now() + lead_ns;
                                         // Flag the keyframe from the ACTUAL emitted bitstream (scan for
-                                        // an IRAP NAL), not the request — force_keyframe is a no-op on
-                                        // the GPU MFT (GOP-driven), so the request would mislabel IDRs
+                                        // an IDR/IRAP NAL), not the request — force_keyframe is a no-op on
+                                        // the GPU MFT (GOP-driven), so the request would mislabel frames
                                         // and the client (which discards non-key chunks until a real
-                                        // keyframe) would stay black.
-                                        let is_key = annexb_has_keyframe(&bits);
+                                        // keyframe) would stay black. Codec-aware (H.264 IDR vs HEVC IRAP).
+                                        let is_key = enc.is_keyframe(&bits);
                                         let mut msg = Vec::with_capacity(10 + bits.len());
                                         msg.push(MSG_VIDEO);
                                         msg.extend_from_slice(&pts.to_be_bytes());

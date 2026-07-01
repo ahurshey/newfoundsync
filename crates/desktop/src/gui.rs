@@ -35,6 +35,8 @@ enum SourceKind {
     AllApps,
     App,
     System,
+    /// No local capture — a web client casts its screen/audio up and the server relays it.
+    WebUplink,
 }
 
 /// What the screen-video capture grabs — mirrors the audio source picker.
@@ -43,6 +45,9 @@ enum VideoSourceKind {
     Off,
     Screen,
     Window,
+    /// The casting web client's screen (pairs with a [`SourceKind::WebUplink`] audio source). No
+    /// local capture — the caster H.264-encodes its screen and the server relays it.
+    WebCast,
 }
 
 // (display label, parse token)
@@ -86,6 +91,8 @@ impl InitialConfig {
 
 /// Launch the GUI. Blocks until the window is closed.
 pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
+    // The single active web-caster's conn_id (web-uplink source), shared with the web server.
+    let cast: webserver::CastState = Arc::new(Mutex::new(None));
     let clients = Arc::new(AtomicUsize::new(0));
     let clients_reg: ClientRegistry = Arc::new(Mutex::new(HashMap::new()));
     let status = Arc::new(Mutex::new(String::from("Starting…")));
@@ -127,12 +134,13 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
     {
         let clients = clients.clone();
         let clients_reg = clients_reg.clone();
+        let cast = cast.clone();
         std::thread::Builder::new()
             .name("web-server".into())
             .spawn(move || match tokio::runtime::Runtime::new() {
                 Ok(rt) => {
                     if let Err(e) =
-                        rt.block_on(webserver::run(state_rx, clients, clients_reg, addr, true))
+                        rt.block_on(webserver::run(state_rx, clients, clients_reg, cast, addr, true))
                     {
                         tracing::error!("web server exited: {e:#}");
                     }
@@ -150,10 +158,19 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
     let (source, selected_pid) = match init.capture_source {
         CaptureSource::AllExceptSelf => (SourceKind::AllApps, None),
         CaptureSource::System => (SourceKind::System, None),
+        CaptureSource::WebUplink => (SourceKind::WebUplink, None),
         CaptureSource::App { pid } => (SourceKind::App, Some(pid)),
     };
     let (video_kind, res_idx, fps60) = match init.video {
-        Some(v) => (VideoSourceKind::Screen, res_to_idx(v.resolution), v.fps == Fps::F60),
+        Some(v) => {
+            // A web-uplink source carries the caster's screen, not a local capture.
+            let kind = if matches!(init.capture_source, CaptureSource::WebUplink) {
+                VideoSourceKind::WebCast
+            } else {
+                VideoSourceKind::Screen
+            };
+            (kind, res_to_idx(v.resolution), v.fps == Fps::F60)
+        }
         None => (VideoSourceKind::Off, 1, false),
     };
     let enc_idx = match init.encoder {
@@ -204,6 +221,9 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         enc_idx,
         video_quality_pct: init.video.map(|v| v.quality_pct).unwrap_or(100),
         buffer_ms: init.buffer_ms as i32,
+        port,
+        port_edit: port,
+        port_msg: String::new(),
         did_initial_zoom: false,
     };
     #[cfg(target_os = "windows")]
@@ -526,6 +546,13 @@ struct ServerApp {
     enc_idx: usize,
     video_quality_pct: u16, // HEVC quality as % of baseline bitrate (slider; 100 = default)
     buffer_ms: i32,
+    /// The HTTP port the server is CURRENTLY bound to (fixed for this run; used in the URL/QR).
+    port: u16,
+    /// Edit buffer for the GUI port field. Saving it persists for the NEXT launch (a live rebind
+    /// isn't worth juggling the TLS socket for a rare change), so a "restart to apply" note shows.
+    port_edit: u16,
+    /// Transient status under the port field ("Saved — restart to apply", or an error).
+    port_msg: String,
     did_initial_zoom: bool, // applied the high-DPI default UI scale once (first frame)
 }
 
@@ -782,6 +809,7 @@ impl ServerApp {
         let capture_source = match self.source {
             SourceKind::AllApps => CaptureSource::AllExceptSelf,
             SourceKind::System => CaptureSource::System,
+            SourceKind::WebUplink => CaptureSource::WebUplink,
             SourceKind::App => match self.selected_pid {
                 Some(pid) => CaptureSource::App { pid },
                 None => {
@@ -837,7 +865,7 @@ impl ServerApp {
 
     /// Full-width "connect" strip under the header: the URL plate (left) + the QR code,
     /// scan hint and one-time-cert disclosure (right). Read-only.
-    fn ui_connect_strip(&self, ui: &mut egui::Ui, qr: &Option<egui::TextureHandle>) {
+    fn ui_connect_strip(&mut self, ui: &mut egui::Ui, qr: &Option<egui::TextureHandle>) {
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.label(
@@ -873,27 +901,41 @@ impl ServerApp {
                             });
                         });
                     });
+                // Port: editable + persisted. The server binds the port once at startup, so a change
+                // applies on the next launch — we save it and show a "restart to apply" note here.
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Port").size(12.5).color(c_dim()));
+                    ui.add(egui::DragValue::new(&mut self.port_edit).range(1024.0..=65535.0).speed(1.0))
+                        .on_hover_text("HTTP port the web client is served on (1024–65535). Default 47000.");
+                    if ui.button("Save").clicked() {
+                        self.port_msg = if self.port_edit == self.port {
+                            format!("Already serving on port {}.", self.port)
+                        } else {
+                            match crate::settings::save_port(self.port_edit) {
+                                Ok(()) => format!("Saved — restart Newfoundsync to serve on port {}.", self.port_edit),
+                                Err(e) => format!("Couldn't save port: {e}"),
+                            }
+                        };
+                    }
+                    if !self.port_msg.is_empty() {
+                        ui.label(egui::RichText::new(&self.port_msg).size(11.5).color(c_accent_hi()));
+                    }
+                });
             });
             ui.add_space(16.0);
             ui.vertical(|ui| {
                 if let Some(tex) = qr {
                     ui.image(egui::load::SizedTexture::new(tex.id(), tex.size_vec2()));
                 }
-                ui.label(egui::RichText::new("📷  Scan to connect").strong().color(c_text()));
-                egui::CollapsingHeader::new(
-                    egui::RichText::new("First time on a device?").size(12.0).color(c_dim()),
-                )
-                .id_salt("cert_help")
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(
-                            "Accept the one-time security warning (Advanced -> proceed) — it's a \
-                             self-signed certificate, needed so the browser allows playback.",
-                        )
-                        .size(11.5)
-                        .color(c_dim()),
+                // Cert help folded into a hover (was a standalone "First time on a device?" line) to
+                // reclaim vertical space — hover "Scan to connect" for the one-time-cert explanation.
+                ui.label(egui::RichText::new("📷  Scan to connect").strong().color(c_text()))
+                    .on_hover_text(
+                        "First time on a device? Accept the one-time security warning \
+                         (Advanced -> proceed) — it's a self-signed certificate, needed so the \
+                         browser allows playback.",
                     );
-                });
             });
         });
     }
@@ -931,15 +973,10 @@ impl ServerApp {
 
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("CONNECTED CLIENTS").strong().size(13.0).color(c_dim()));
+                ui.label(egui::RichText::new("CONNECTED CLIENTS").strong().size(13.0).color(c_dim()))
+                    .on_hover_text("Volume & sync are live — they apply instantly, no Apply needed.");
                 ui.label(egui::RichText::new(format!("({clients_n})")).strong().color(c_accent()));
             });
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new("Volume & sync are live — they apply instantly, no Apply needed.")
-                    .size(11.0)
-                    .color(c_dim()),
-            );
             ui.add_space(6.0);
             // Master volume — scales every client's remote (server-controlled) volume.
             ui.horizontal(|ui| {
@@ -1136,16 +1173,30 @@ impl ServerApp {
         let audio_quality = self.audio_quality_text();
         card(ui, |ui| {
             eyebrow(ui, "AUDIO SOURCE");
-            ui.radio_value(
-                &mut self.source,
-                SourceKind::AllApps,
-                "All apps  —  recommended (keeps playing when Windows is muted)",
-            );
+            // Coupling: choosing a LOCAL audio source drops a cast-video selection (you can't relay
+            // the caster's screen while capturing local audio — the uplink is one source).
+            if ui
+                .radio_value(
+                    &mut self.source,
+                    SourceKind::AllApps,
+                    "All apps  —  recommended (keeps playing when Windows is muted)",
+                )
+                .clicked()
+                && self.video_kind == VideoSourceKind::WebCast
+            {
+                self.video_kind = VideoSourceKind::Off;
+            }
             #[cfg(target_os = "windows")]
             {
                 let apps = self.apps.clone();
                 ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.source, SourceKind::App, "Just one window / app:");
+                    if ui
+                        .radio_value(&mut self.source, SourceKind::App, "Just one window / app:")
+                        .clicked()
+                        && self.video_kind == VideoSourceKind::WebCast
+                    {
+                        self.video_kind = VideoSourceKind::Off;
+                    }
                     let label = if self.selected_pid.is_some() {
                         self.selected_name.clone()
                     } else {
@@ -1162,6 +1213,9 @@ impl ServerApp {
                                     self.selected_pid = Some(a.pid);
                                     self.selected_name = a.name.clone();
                                     self.source = SourceKind::App;
+                                    if self.video_kind == VideoSourceKind::WebCast {
+                                        self.video_kind = VideoSourceKind::Off;
+                                    }
                                 }
                             }
                             if apps.is_empty() {
@@ -1174,11 +1228,34 @@ impl ServerApp {
                     }
                 });
             }
-            ui.radio_value(
-                &mut self.source,
-                SourceKind::System,
-                "Full system output  —  goes silent when Windows is muted",
-            );
+            if ui
+                .radio_value(
+                    &mut self.source,
+                    SourceKind::System,
+                    "Full system output  —  goes silent when Windows is muted",
+                )
+                .clicked()
+                && self.video_kind == VideoSourceKind::WebCast
+            {
+                self.video_kind = VideoSourceKind::Off;
+            }
+            if ui
+                .radio_value(
+                    &mut self.source,
+                    SourceKind::WebUplink,
+                    "Web client cast  —  a client casts its audio up to here",
+                )
+                .on_hover_text(
+                    "Audio-only cast: a connected web client taps \"Cast\" and becomes the source. To \
+                     also relay the caster's SCREEN, pick \"Web client cast\" under Video Source instead.",
+                )
+                .clicked()
+            {
+                // The cast as an AUDIO source = audio only; drop any video selection so it's
+                // unambiguous. (Audio + video from the cast is the Video Source option, which also
+                // selects this radio.)
+                self.video_kind = VideoSourceKind::Off;
+            }
             ui.add_space(7.0);
             ui.label(
                 egui::RichText::new(format!("🎧 Streaming {audio_quality}"))
@@ -1192,18 +1269,29 @@ impl ServerApp {
     fn ui_video_source(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
             eyebrow(ui, "VIDEO SOURCE");
+            // Two ways to cast from a web client: "Web client cast" under AUDIO SOURCE = audio only;
+            // "Web client cast" here (below) = audio + video. Local Screen/Window pairs with a local
+            // audio source — selecting one auto-reconciles the other so the pickers never disagree.
             ui.radio_value(&mut self.video_kind, VideoSourceKind::Off, "Off  —  audio only");
-            ui.radio_value(&mut self.video_kind, VideoSourceKind::Screen, "Whole screen");
+            if ui
+                .radio_value(&mut self.video_kind, VideoSourceKind::Screen, "Whole screen")
+                .clicked()
+                && self.source == SourceKind::WebUplink
+            {
+                self.source = SourceKind::AllApps; // a local screen can't pair with a cast audio source
+            }
             #[cfg(target_os = "windows")]
             {
                 let windows: Vec<AudioApp> =
                     self.apps.iter().filter(|a| a.hwnd.is_some()).cloned().collect();
                 ui.horizontal(|ui| {
-                    ui.radio_value(
-                        &mut self.video_kind,
-                        VideoSourceKind::Window,
-                        "Just one window / app:",
-                    );
+                    if ui
+                        .radio_value(&mut self.video_kind, VideoSourceKind::Window, "Just one window / app:")
+                        .clicked()
+                        && self.source == SourceKind::WebUplink
+                    {
+                        self.source = SourceKind::AllApps;
+                    }
                     let label = if self.video_hwnd.is_some() && !self.video_name.is_empty() {
                         self.video_name.clone()
                     } else {
@@ -1236,6 +1324,22 @@ impl ServerApp {
                     }
                 });
             }
+            // Cast as a VIDEO source = audio + video from the caster. Selecting it also selects the
+            // "Web client cast" AUDIO source (it's one uplink), so the two pickers never contradict.
+            if ui
+                .radio_value(
+                    &mut self.video_kind,
+                    VideoSourceKind::WebCast,
+                    "Web client cast  —  a client casts its screen + audio up to here",
+                )
+                .on_hover_text(
+                    "The web client casts its SCREEN + audio; the server re-broadcasts both to everyone \
+                     at the quality below. (Also selects Web client cast as the audio source.)",
+                )
+                .clicked()
+            {
+                self.source = SourceKind::WebUplink;
+            }
             if self.video_kind != VideoSourceKind::Off {
                 ui.add_space(2.0);
                 egui::CollapsingHeader::new(
@@ -1256,13 +1360,20 @@ impl ServerApp {
                         ui.checkbox(&mut self.fps60, "60 fps");
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Encoder:");
-                        egui::ComboBox::from_id_salt("enc")
-                            .selected_text(ENC_LABELS[self.enc_idx].0)
+                        ui.label("Codec:").on_hover_text(
+                            "HEVC (H.265) = GPU hardware encode — best quality-per-bit, wide desktop \
+                             support. H.264 (AVC) = software (CPU) encode — heavier on the CPU at high \
+                             resolutions, but needs no HEVC-capable GPU and decodes on more browsers.",
+                        );
+                        // Codec ⟺ backend here: HEVC = GPU (enc_idx 0 = "auto"); H.264 = software
+                        // openh264 (enc_idx 2 = "cpu"). HEVC has no software encoder and H.264 has no
+                        // GPU encoder in this build, so one picker selects both.
+                        let is_h264 = self.enc_idx == 2;
+                        egui::ComboBox::from_id_salt("codec")
+                            .selected_text(if is_h264 { "H.264 (AVC) · software" } else { "HEVC (H.265) · GPU" })
                             .show_ui(ui, |ui| {
-                                for (i, (label, _)) in ENC_LABELS.iter().enumerate() {
-                                    ui.selectable_value(&mut self.enc_idx, i, *label);
-                                }
+                                ui.selectable_value(&mut self.enc_idx, 0, "HEVC (H.265) · GPU");
+                                ui.selectable_value(&mut self.enc_idx, 2, "H.264 (AVC) · software");
                             });
                     });
                     ui.horizontal(|ui| {
@@ -1306,19 +1417,16 @@ impl ServerApp {
                 }
             });
             ui.add_space(4.0);
+            // Buffer rationale folded into a hover on the slider (was a standalone 2-line paragraph)
+            // to reclaim vertical space for the ad strip below.
             ui.add(
                 egui::Slider::new(&mut self.buffer_ms, 200..=(config::MAX_BUFFER_MS as i32))
                     .suffix(" ms"),
-            );
-            ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new(
-                    "Reliable TCP stream (WebSocket/TLS): lost Wi-Fi packets are re-sent and this \
-                     jitter buffer hides the stall. Bigger = more dropout-proof but more delay; \
-                     identical on every client -> lock-step.",
-                )
-                .size(11.0)
-                .color(c_dim()),
+            )
+            .on_hover_text(
+                "Reliable TCP stream (WebSocket/TLS): lost Wi-Fi packets are re-sent and this \
+                 jitter buffer hides the stall. Bigger = more dropout-proof but more delay; \
+                 identical on every client -> lock-step.",
             );
         });
     }
@@ -1432,27 +1540,22 @@ impl eframe::App for ServerApp {
             ui.painter().circle_filled(egui::pos2(dot.left() + 6.0, dot.center().y), 4.5, pcol);
             ui.label(egui::RichText::new(pill).color(pcol).size(12.5).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                theme_toggle(ui); // sliding light/dark switch (knob right = light)
-                ui.add_space(6.0);
-                // Zoom is shown/stepped relative to UI_ZOOM_BASE, so the design size reads as 100%
-                // and each click is ±10%. Floor at the baseline (100%); ceiling at 250%.
+                // Match the web client's header: theme toggle on the LEFT, then just − / + (no
+                // percentage readout/reset). In a right-to-left layout the FIRST widget sits
+                // rightmost, so add +, − (renders left→right as − +), then the toggle LAST (leftmost).
+                // Step ±10% of the baseline; the window opens at UI_ZOOM_BASE and can shrink well
+                // below it (down to 40% of baseline) so users can make it as tiny as they like.
                 let step = UI_ZOOM_BASE * 0.1;
                 if ui.small_button("+").on_hover_text("Bigger UI").clicked() {
                     let z = ui.ctx().zoom_factor();
                     ui.ctx().set_zoom_factor((z + step).min(UI_ZOOM_BASE * 2.5));
                 }
-                let pct = (ui.ctx().zoom_factor() / UI_ZOOM_BASE * 100.0).round() as i32;
-                if ui
-                    .small_button(format!("{pct}%"))
-                    .on_hover_text("Reset UI size to 100%")
-                    .clicked()
-                {
-                    ui.ctx().set_zoom_factor(UI_ZOOM_BASE);
-                }
                 if ui.small_button("−").on_hover_text("Smaller UI").clicked() {
                     let z = ui.ctx().zoom_factor();
-                    ui.ctx().set_zoom_factor((z - step).max(UI_ZOOM_BASE));
+                    ui.ctx().set_zoom_factor((z - step).max(UI_ZOOM_BASE * 0.4));
                 }
+                ui.add_space(6.0);
+                theme_toggle(ui); // leftmost — matches the client (toggle, then − +)
             });
         });
         ui.separator();

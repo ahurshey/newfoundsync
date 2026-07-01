@@ -11,6 +11,7 @@
 mod capture;
 mod gui;
 mod media;
+mod settings;
 mod tls;
 mod video;
 mod webserver;
@@ -34,9 +35,10 @@ use webserver::StreamState;
 #[derive(Parser)]
 #[command(name = "newfoundsync", about = "LAN audio/video sharing with a web client")]
 struct Cli {
-    /// HTTP port for the web client + WebSocket.
-    #[arg(long, default_value_t = config::DEFAULT_HTTP_PORT)]
-    port: u16,
+    /// HTTP port for the web client + WebSocket. Overrides the saved GUI setting for this run;
+    /// if omitted, the port last set in the GUI is used, else the default (47000).
+    #[arg(long)]
+    port: Option<u16>,
     /// Display name shown to clients.
     #[arg(long)]
     name: Option<String>,
@@ -64,7 +66,7 @@ struct Cli {
     /// Video encoder: auto (GPU, CPU fallback) | hardware | cpu.
     #[arg(long, default_value = "auto")]
     encoder: String,
-    /// Audio source: allapps (survives mute) | system | app.
+    /// Audio source: allapps (survives mute) | system | app | web (a web client casts up to here).
     #[arg(long, default_value = "allapps")]
     capture: String,
     /// PID to capture when --capture app.
@@ -95,12 +97,13 @@ fn main() -> Result<()> {
     let capture_source = match cli.capture.as_str() {
         "allapps" | "exclude" | "all" => CaptureSource::AllExceptSelf,
         "system" => CaptureSource::System,
+        "web" | "uplink" | "cast" => CaptureSource::WebUplink,
         "app" => CaptureSource::App {
             pid: cli
                 .app_pid
                 .ok_or_else(|| anyhow!("--capture app requires --app-pid <PID>"))?,
         },
-        other => return Err(anyhow!("unknown capture '{other}' (use allapps|system|app)")),
+        other => return Err(anyhow!("unknown capture '{other}' (use allapps|system|app|web)")),
     };
     let video = if cli.video {
         let resolution = Resolution::parse(&cli.resolution).ok_or_else(|| {
@@ -115,6 +118,9 @@ fn main() -> Result<()> {
         None
     };
 
+    // Effective HTTP port: an explicit --port wins, else the port last saved in the GUI,
+    // else the built-in default. (The GUI lets users change + save this; it applies next launch.)
+    let port = cli.port.or_else(settings::load_port).unwrap_or(config::DEFAULT_HTTP_PORT);
     if cli.headless {
         run_headless(
             name,
@@ -124,12 +130,12 @@ fn main() -> Result<()> {
             codec,
             cli.bitrate,
             cli.buffer_ms,
-            cli.port,
+            port,
             !cli.insecure_http,
         )
     } else {
         gui::run(
-            cli.port,
+            port,
             name,
             gui::InitialConfig {
                 capture_source,
@@ -194,9 +200,12 @@ fn run_headless(
     let (_state_tx, state_rx) = watch::channel(Arc::new(StreamState::from_media(&media)));
     let _keep_media = media;
 
+    // Active web-caster slot (first client to request cast wins). Headless: no GUI stop button,
+    // but the slot still gates which client may relay, and frees on disconnect/stop.
+    let cast = Arc::new(std::sync::Mutex::new(None));
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(webserver::run(state_rx, clients, clients_reg, addr, use_tls))?;
+    runtime.block_on(webserver::run(state_rx, clients, clients_reg, cast, addr, use_tls))?;
     Ok(())
 }
 

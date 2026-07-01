@@ -71,6 +71,23 @@ const MSG_SET_TRIM: u8 = 0x23;
 /// of only the value the server commanded (which is 0 until the operator touches it).
 const MSG_CLIENT_SYNC: u8 = 0x24;
 
+// --- Web-client cast (uplink relay) — only meaningful when the active source is WebUplink. ---
+/// C→S: a casting client's Opus packet. `[0x30][opus bytes]` (server stamps PTS, re-broadcasts).
+const MSG_UP_AUDIO: u8 = 0x30;
+/// C→S: a casting client's H.264 access unit. `[0x31][key u8][Annex-B bytes]` (Phase 2).
+const MSG_UP_VIDEO: u8 = 0x31;
+/// C→S: claim the single caster slot. `[0x32]`.
+const MSG_CAST_REQUEST: u8 = 0x32;
+/// S→C: grant/deny + the server's encode targets the caster must use. Fixed 21-byte layout:
+/// `[0x33][grant u8][videoOn u8][w u16 LE][h u16 LE][fps u8][vKbps u32 LE][aBps u32 LE][sampleRate u32 LE][channels u8]`.
+const MSG_CAST_GRANT: u8 = 0x33;
+/// C↔S: stop casting (caster requests, or operator stops it via the clients panel). `[0x34]`.
+const MSG_CAST_STOP: u8 = 0x34;
+
+/// The connection id of the single active caster (web-uplink source), or `None`. Shared between
+/// the GUI (operator "Stop cast") and the per-client serve() tasks (claim/relay/release).
+pub type CastState = Arc<Mutex<Option<u64>>>;
+
 /// The currently-served stream. Swapped atomically via the `watch` channel when
 /// the source changes.
 #[derive(Clone)]
@@ -78,6 +95,9 @@ pub struct StreamState {
     pub config_json: String,
     pub audio_tx: broadcast::Sender<Frame>,
     pub video_tx: broadcast::Sender<Frame>,
+    /// Present iff the active source is a web-client cast: the relay the serve() task pushes a
+    /// caster's uploaded frames into. `Some` also signals to serve() that casting is allowed.
+    pub cast_relay: Option<Arc<crate::media::CastRelay>>,
 }
 
 impl StreamState {
@@ -86,6 +106,7 @@ impl StreamState {
             config_json: media.config.to_json(),
             audio_tx: media.audio_tx.clone(),
             video_tx: media.video_tx.clone(),
+            cast_relay: media.cast_relay.clone(),
         }
     }
 }
@@ -142,6 +163,34 @@ pub fn set_trim_msg(ms: i32) -> Vec<u8> {
     m
 }
 
+/// Build a server→client [`MSG_CAST_GRANT`]. On grant, carries the server's encode targets the
+/// caster must use (so all receivers get the operator's quality). Fixed 21-byte layout; on deny,
+/// the param bytes are zero. `relay` supplies the targets when granting.
+fn cast_grant_msg(grant: bool, relay: Option<&crate::media::CastRelay>) -> Vec<u8> {
+    let mut m = Vec::with_capacity(21);
+    m.push(MSG_CAST_GRANT);
+    m.push(grant as u8);
+    match relay {
+        Some(r) if grant => {
+            m.push(r.video_on as u8);
+            m.extend_from_slice(&r.width.to_le_bytes());
+            m.extend_from_slice(&r.height.to_le_bytes());
+            m.push(r.fps);
+            m.extend_from_slice(&r.video_kbps.to_le_bytes());
+            m.extend_from_slice(&r.audio_bps.to_le_bytes());
+            m.extend_from_slice(&r.sample_rate.to_le_bytes());
+            m.push(r.channels);
+        }
+        _ => m.extend_from_slice(&[0u8; 19]), // denied: pad to the fixed length
+    }
+    m
+}
+
+/// Build a [`MSG_CAST_STOP`] frame (operator stops the active cast). Exposed for the GUI.
+pub fn cast_stop_msg() -> Vec<u8> {
+    vec![MSG_CAST_STOP]
+}
+
 /// Build a CALIB_CTRL ROLE frame: assign this client a calibration role + code seeds + TDMA slot.
 /// `role`: 0 = idle/stop, 1 = reference, 2 = follower. Exposed for the GUI's "Calibrate all".
 pub fn calib_role_msg(role: u8, ref_seed: u32, self_seed: u32, slot: u8) -> Vec<u8> {
@@ -180,6 +229,8 @@ struct AppState {
     clients: Arc<AtomicUsize>,
     clients_reg: ClientRegistry,
     next_id: AtomicU64,
+    /// The single active caster's conn_id (web-uplink source), or None. Shared with the GUI.
+    cast: CastState,
 }
 
 /// Run the web server until shutdown. `stream` carries the active capture/stream
@@ -190,6 +241,7 @@ pub async fn run(
     stream: watch::Receiver<Arc<StreamState>>,
     clients: Arc<AtomicUsize>,
     clients_reg: ClientRegistry,
+    cast: CastState,
     addr: SocketAddr,
     use_tls: bool,
 ) -> Result<()> {
@@ -198,6 +250,7 @@ pub async fn run(
         clients,
         clients_reg,
         next_id: AtomicU64::new(1),
+        cast,
     });
 
     let app = Router::new()
@@ -387,6 +440,7 @@ async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
 struct ClientGuard {
     clients: Arc<AtomicUsize>,
     reg: ClientRegistry,
+    cast: CastState,
     conn_id: u64,
 }
 impl Drop for ClientGuard {
@@ -394,6 +448,12 @@ impl Drop for ClientGuard {
         self.clients.fetch_sub(1, Ordering::Relaxed);
         if let Ok(mut reg) = self.reg.lock() {
             reg.remove(&self.conn_id);
+        }
+        // If this was the active caster, free the slot so another client can claim it.
+        if let Ok(mut slot) = self.cast.lock() {
+            if *slot == Some(self.conn_id) {
+                *slot = None;
+            }
         }
     }
 }
@@ -423,6 +483,7 @@ async fn ws_client(socket: WebSocket, state: Arc<AppState>) {
     let _guard = ClientGuard {
         clients: state.clients.clone(),
         reg: state.clients_reg.clone(),
+        cast: state.cast.clone(),
         conn_id,
     };
     serve(socket, &state, conn_id, ctrl_rx).await;
@@ -447,7 +508,6 @@ async fn serve(
     {
         return;
     }
-
     let mut arx = active.audio_tx.subscribe();
     let mut vrx = active.video_tx.subscribe();
 
@@ -516,6 +576,52 @@ async fn serve(
                                     e.stable_id = stable_id;
                                     e.identified = true;
                                 }
+                            }
+                        }
+                    }
+                    // Web cast: a client claims the single caster slot. Granted only when the active
+                    // source is a web uplink (cast_relay present) AND the slot is free (or already ours).
+                    Some(Ok(Message::Binary(b))) if b.first() == Some(&MSG_CAST_REQUEST) => {
+                        let granted = active.cast_relay.is_some()
+                            && state
+                                .cast
+                                .lock()
+                                .map(|mut slot| match *slot {
+                                    None => {
+                                        *slot = Some(conn_id);
+                                        true
+                                    }
+                                    Some(c) => c == conn_id, // re-request is idempotent; else taken
+                                })
+                                .unwrap_or(false);
+                        let msg = cast_grant_msg(granted, active.cast_relay.as_deref());
+                        if sender.send(Message::Binary(msg)).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Web cast: the active caster's uploaded Opus packet → re-stamp + fan out.
+                    Some(Ok(Message::Binary(b))) if b.first() == Some(&MSG_UP_AUDIO) && b.len() > 1 => {
+                        let is_caster = state.cast.lock().map(|s| *s == Some(conn_id)).unwrap_or(false);
+                        if is_caster {
+                            if let Some(relay) = active.cast_relay.as_deref() {
+                                relay.push_audio(&b[1..]);
+                            }
+                        }
+                    }
+                    // Web cast: the active caster's uploaded H.264 access unit → re-stamp + fan out (Phase 2).
+                    Some(Ok(Message::Binary(b))) if b.first() == Some(&MSG_UP_VIDEO) && b.len() > 2 => {
+                        let is_caster = state.cast.lock().map(|s| *s == Some(conn_id)).unwrap_or(false);
+                        if is_caster {
+                            if let Some(relay) = active.cast_relay.as_deref() {
+                                relay.push_video(b[1] != 0, &b[2..]);
+                            }
+                        }
+                    }
+                    // Web cast: client stops casting → free the slot for the next claimant.
+                    Some(Ok(Message::Binary(b))) if b.first() == Some(&MSG_CAST_STOP) => {
+                        if let Ok(mut slot) = state.cast.lock() {
+                            if *slot == Some(conn_id) {
+                                *slot = None;
                             }
                         }
                     }

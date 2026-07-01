@@ -156,6 +156,7 @@
   button#start:focus-visible { outline: none; box-shadow: var(--focus), var(--shadow-glow); }
   #hint { color: var(--dim); max-width: 460px; text-align: center; font-size: 14px; line-height: 1.5; }
 
+
   /* ---- buffering loading bar (centered inside the header strip, top-center) ---- */
   /* Absolutely centered within the position:relative <header>, so it floats in the empty
      middle of the header bar. Out of flow → showing/hiding it never reflows the header or
@@ -332,6 +333,7 @@
         <div class="ctlhint">Drag <b>Sync</b> until devices line up by ear (+ = later, − = earlier), or tap <b>Calibrate</b> to auto-align by mic in the same room.</div>
         <div class="ctlrow actions">
           <button id="calib" class="actionbtn" title="Auto-sync devices in the same room">🎚 Calibrate</button>
+          <button id="castbtn" class="actionbtn" title="Cast this device's screen or audio to everyone">📡 Cast</button>
           <button id="mute" class="actionbtn" title="Mute / unmute">🔊 Sound on</button>
           <button id="stop" class="actionbtn danger" title="Stop playback and disconnect">⏹ Stop</button>
         </div>
@@ -341,6 +343,12 @@
           <button id="calibcancel" class="actionbtn" title="Close">✓ Done</button>
         </div>
         <div id="calibstatus" class="ctlhint" style="display:none"></div>
+        <div id="castroles" class="ctlrow actions" style="display:none">
+          <button id="casttab" class="actionbtn" title="Share a tab or screen and cast its audio to everyone">🔊 Tab / screen audio</button>
+          <button id="castmic" class="actionbtn" title="Cast this device's microphone to everyone">🎤 Microphone</button>
+          <button id="caststop" class="actionbtn danger" title="Stop casting">⏹ Stop cast</button>
+        </div>
+        <div id="caststatus" class="ctlhint" style="display:none"></div>
       </div>
     </div>
     <div id="warn"></div>

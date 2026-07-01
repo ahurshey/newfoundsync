@@ -29,6 +29,11 @@ const MSG_HELLO = 0x21; // client→server: identify with a stable id + friendly
 const MSG_SET_TRIM = 0x23; // server→client: set this device's sync offset, ms (i32 LE)
 const MSG_CLIENT_SYNC = 0x24; // client→server: report this device's ACTUAL effective sync, ms (i32 LE)
 const MSG_CALIB_CTRL = 0x22; // server↔client: calibration orchestration (ROLE / STATUS sub-types)
+const MSG_UP_AUDIO = 0x30; // client→server: a casting client's Opus packet [0x30][opus]
+const MSG_UP_VIDEO = 0x31; // client→server: a casting client's H.264 access unit [0x31][key u8][annexb] (Phase 2)
+const MSG_CAST_REQUEST = 0x32; // client→server: claim the single caster slot
+const MSG_CAST_GRANT = 0x33; // server→client: grant/deny + encode targets the caster must use
+const MSG_CAST_STOP = 0x34; // client↔server: stop casting (caster requests, or operator stops it)
 
 const els = {
   dot: document.getElementById("dot"),
@@ -49,6 +54,12 @@ const els = {
   caliblisten: document.getElementById("caliblisten"),
   calibcancel: document.getElementById("calibcancel"),
   calibstatus: document.getElementById("calibstatus"),
+  castbtn: document.getElementById("castbtn"),
+  castroles: document.getElementById("castroles"),
+  casttab: document.getElementById("casttab"),
+  castmic: document.getElementById("castmic"),
+  caststop: document.getElementById("caststop"),
+  caststatus: document.getElementById("caststatus"),
   vol: document.getElementById("vol"),
   trim: document.getElementById("trim"),
   trimval: document.getElementById("trimval"),
@@ -95,6 +106,19 @@ function showWarn(html) {
 let started = false;
 let stopping = false;
 let pendingSwReload = false; // a new build activated mid-playback → reload once the user stops
+// ---- web-client cast (uplink) state ----
+let casting = false; // this device is the active caster → mute downlink (echo) + capture+encode up
+let castStream = null; // the captured MediaStream (getDisplayMedia / getUserMedia)
+let castEnc = null; // AudioEncoder (Opus) feeding the uplink
+let castReader = null; // MediaStreamTrackProcessor reader (cancelled on stop)
+let castPending = null; // "tab" | "mic" — which source the user picked while awaiting the grant
+let castVidEnc = null; // VideoEncoder (H.264) feeding the video uplink (Phase 2; null when audio-only)
+let castVidReader = null; // video MediaStreamTrackProcessor reader (cancelled on stop)
+let castSrcNode = null; // MediaStreamSource for the cast audio (disconnected on stop — no node leak)
+let castDestNode = null; // MediaStreamDestination feeding the audio encoder (disconnected on stop)
+let castSource = null; // "tab" | "mic" — the active caster's source (kept while casting, for resume)
+let castResumeSource = null; // set on a transport drop mid-cast → re-claim the slot on reconnect
+let castEpoch = 0; // bumped on every stop; startCast re-checks it after the picker await (no orphan stream)
 let everPlayed = false; // reached playback once → don't re-show the buffering bar on re-anchors
 let wired = false; // one-time listeners attached
 let ac = null;
@@ -200,7 +224,8 @@ function volGain(pos) {
 function applyGain() {
   // Effective gain = the device's own volume × the server-controlled remote volume, each on the
   // perceptual taper (so the master/per-client server sliders feel right too — they fold into remoteVol).
-  if (gain) gain.gain.value = muted ? 0 : volGain(volume) * volGain(remoteVol);
+  // While casting, force-mute the downlink so the caster doesn't hear its own stream ~buffer late.
+  if (gain) gain.gain.value = muted || casting ? 0 : volGain(volume) * volGain(remoteVol);
   const off = muted || volume === 0;
   els.mute.textContent = off ? "🔇 Muted" : "🔊 Sound on";
   els.mute.classList.toggle("muted", off);
@@ -321,6 +346,7 @@ if ("serviceWorker" in navigator) {
   });
 }
 
+
 // ---- audio visualizer (the logo, shown for audio-only sources) --------------
 // A circular spectrum drawn around the logo from the AnalyserNode, plus a bass-driven
 // "breathe" on the logo. Toggleable (button under the logo), default on, persisted.
@@ -408,6 +434,7 @@ let maxEvq = 400; // encoded queue cap (recomputed from fps + bufferMs)
 let needDecodeKey = false; // after an encoded-queue overflow, resync decode at a keyframe
 let aFrames = 0;
 let vFrames = 0;
+let noVideoFallbackTimer = null; // video advertised but no frame arrives → fall back to the audio viz
 let vDims = "";
 let f32pool = null; // reused per-channel scratch for audio copyTo
 
@@ -429,9 +456,12 @@ if (!window.isSecureContext) {
       "<b>https://</b> address shown in the server window and accept the one-time certificate warning."
   );
   els.start.disabled = true;
-} else if (!window.AudioDecoder || !window.VideoDecoder || !window.AudioContext) {
+} else if (!window.AudioDecoder || !window.AudioContext) {
+  // Audio is the essential path; VIDEO decode (window.VideoDecoder) is OPTIONAL. A browser with
+  // WebCodecs audio but no video decode (e.g. some Android browsers / older WebViews) can still
+  // listen — video degrades to the audio visualizer downstream. So don't block Start on VideoDecoder.
   showWarn(
-    "⚠ This browser lacks <b>WebCodecs</b>. Use Chrome/Edge, or update to <b>iOS&nbsp;17+</b> (Safari)."
+    "⚠ This browser lacks <b>WebCodecs audio</b>. Use Chrome/Edge, or update to <b>iOS&nbsp;17+</b> (Safari)."
   );
   els.start.disabled = true;
 }
@@ -509,6 +539,57 @@ function codecFromSps(sps) {
   return "avc1." + h(sps[1]) + h(sps[2]) + h(sps[3]);
 }
 
+// Like annexBToAvcc, but DROPS parameter-set + access-unit-delimiter NALs (SPS=7, PPS=8, AUD=9).
+// When the decoder is configured WITH an avcC `description`, the parameter sets live there; strict
+// decoders (iOS Safari / VideoToolbox) reject samples that ALSO carry in-band SPS/PPS. Keep VCL+SEI.
+function annexBToAvccVcl(u8) {
+  const nals = splitNalsAnnexB(u8);
+  const keep = [];
+  for (const nal of nals) {
+    const t = nalType(nal);
+    if (t === 7 || t === 8 || t === 9) continue; // SPS / PPS / AUD — already in the description
+    keep.push(nal);
+  }
+  if (!keep.length) return null; // nothing decodable in this access unit
+  let total = 0;
+  for (const x of keep) total += 4 + x.length;
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const x of keep) {
+    out[o] = (x.length >>> 24) & 255;
+    out[o + 1] = (x.length >>> 16) & 255;
+    out[o + 2] = (x.length >>> 8) & 255;
+    out[o + 3] = x.length & 255;
+    out.set(x, o + 4);
+    o += 4 + x.length;
+  }
+  return out;
+}
+
+// Pick an H.264 Constrained-Baseline codec string whose LEVEL actually covers w×h@fps. A hardcoded
+// L3.1 only reaches 720p, so 1080p+ (incl. the DEFAULT 1080p) would be rejected by isConfigSupported
+// and silently drop the cast to audio-only. Receivers read the true level from the SPS, so picking a
+// level >= the real one here is always safe.
+function avcCodecString(w, h, fps) {
+  const mb = Math.ceil((w || 1280) / 16) * Math.ceil((h || 720) / 16);
+  const mbps = mb * (fps || 30);
+  // [levelByte, MaxFS (MB/frame), MaxMBPS (MB/s)] low→high; first that fits wins.
+  const levels = [
+    [0x1f, 3600, 108000], // 3.1  ≤720p30
+    [0x20, 5120, 216000], // 3.2
+    [0x28, 8192, 245760], // 4.0  ≤1080p30
+    [0x2a, 8704, 522240], // 4.2  ≤1080p60
+    [0x32, 22080, 589824], // 5.0
+    [0x33, 36864, 983040], // 5.1  ≤4K30
+    [0x34, 36864, 2073600], // 5.2  ≤4K60
+  ];
+  let lvl = 0x34;
+  for (const [b, maxfs, maxmbps] of levels) {
+    if (mb <= maxfs && mbps <= maxmbps) { lvl = b; break; }
+  }
+  return "avc1.42E0" + lvl.toString(16).padStart(2, "0");
+}
+
 // =============================================================================
 // Start (user gesture)
 // =============================================================================
@@ -522,6 +603,7 @@ function onStart() {
   videoAccel = "no-preference"; // re-evaluate decoder accel each fresh start (don't stay stuck on software)
   vDecErrStreak = 0;
   vGoodRun = 0;
+  videoAvccMode = false;
 
   // CRITICAL (iOS): the AudioContext must be created + unlocked synchronously inside
   // the gesture. Reuse it across stop/restart (browsers cap how many you can make).
@@ -741,6 +823,15 @@ function connect() {
     startClockSync();
     sendHello(); // identify so the server can list us + restore our volume
     maybePromptName(); // first connect on this device → offer to name it
+    // If a cast was interrupted by this reconnect and the share is still live, re-claim the slot now
+    // (onCastGrant rebuilds the encoders from the preserved stream). Otherwise drop any stale intent.
+    if (castResumeSource && castStream && castStream.getTracks().some((t) => t.readyState === "live")) {
+      castPending = castResumeSource;
+      castResumeSource = null;
+      try { ws.send(new Uint8Array([MSG_CAST_REQUEST])); } catch (e) {}
+    } else {
+      castResumeSource = null;
+    }
   };
   ws.onmessage = onMessage;
   ws.onclose = () => scheduleReconnect();
@@ -768,6 +859,12 @@ function scheduleReconnect() {
 function teardownConnection() {
   // A reconnect resets the clock/anchor, which invalidates an in-flight calibration.
   calibAbort("Connection dropped — calibration cancelled.");
+  // The uplink can't survive the socket; the server frees our caster slot on disconnect. Suspend an
+  // ACTIVE cast ONLY on a live reconnect (keep the share + intent so ws.onopen auto re-claims) — but
+  // NOT on a deliberate Stop (`stopping` is true only in stop()), which must fully release the
+  // capture and clear the resume intent so it never silently re-broadcasts on the next Start.
+  if (!stopping && casting && castStream) suspendCastForReconnect();
+  else if (casting || castPending) stopCast(false);
   clearInterval(keepaliveTimer);
   keepaliveTimer = null;
   clearInterval(statsTimer);
@@ -789,6 +886,8 @@ function teardownConnection() {
   audioDecoder = null;
   videoDecoder = null;
   gotParams = false;
+  videoAvccMode = false; // next stream re-detects HEVC vs H.264 from its codec + first keyframe
+  clearTimeout(noVideoFallbackTimer);
   aPlayhead = null;
   firstPlayoutAc = null;
   offsetNs = null;
@@ -944,6 +1043,30 @@ function onMessage(ev) {
     return;
   }
 
+
+  if (type === MSG_CAST_GRANT) {
+    // Reply to our CAST_REQUEST: [0x33][grant][videoOn][w u16][h u16][fps][vKbps u32][aBps u32][sampleRate u32][channels]
+    if (ev.data.byteLength >= 21) {
+      onCastGrant(dv.getUint8(1) === 1, {
+        videoOn: dv.getUint8(2) === 1,
+        width: dv.getUint16(3, true),
+        height: dv.getUint16(5, true),
+        fps: dv.getUint8(7),
+        videoKbps: dv.getUint32(8, true),
+        audioBps: dv.getUint32(12, true),
+        sampleRate: dv.getUint32(16, true),
+        channels: dv.getUint8(20),
+      });
+    }
+    return;
+  }
+
+  if (type === MSG_CAST_STOP) {
+    // The operator stopped our cast — tear down locally (server already freed the slot).
+    stopCast(false);
+    return;
+  }
+
   if (type === MSG_CALIB_CTRL) {
     // Server-orchestrated calibration (Phase B). Sub-type 1 = ROLE.
     if (dv.getUint8(1) === 1 && ev.data.byteLength >= 12) {
@@ -976,6 +1099,7 @@ function onMessage(ev) {
 
   if (type === MSG_VIDEO) {
     if (offsetNs === null) return;
+    if (casting) return; // caster: don't decode/draw our OWN looped-back screen (hall-of-mirrors + double load)
     if (document.hidden) return; // don't buffer video the (paused) rAF can't drain
     const tsUs = Number(dv.getBigInt64(1, false) / 1000n); // exact micros, < 2^53
     const key = (dv.getUint8(9) & 1) !== 0;
@@ -1034,13 +1158,35 @@ async function setupDecoders(c) {
   audioDecoder.configure(acfg);
 
   // ---- video: coarse support probe only; real configure waits for the keyframe ----
-  if (c.video && window.VideoDecoder.isConfigSupported) {
+  if (c.video && typeof window.VideoDecoder === "undefined") {
+    // WebCodecs audio but no video decode (some Android browsers): play audio, show the visualizer
+    // instead of a dead video box. onVideoChunk also bails, so incoming video frames are ignored.
+    showWarn("⚠ This browser can't decode video — playing audio only. For video, use Chrome/Edge or iOS 17+ Safari.");
+    els.stage.style.display = "none";
+    els.vlogo.style.display = "flex";
+    vizStart();
+    els.fsbtn.style.display = "none";
+  } else if (c.video && window.VideoDecoder.isConfigSupported) {
     const probe = { codec: c.videoCodec || "hev1.1.6.L153.B0", optimizeForLatency: true };
     const r = await VideoDecoder.isConfigSupported(probe).catch(() => null);
     if (r && !r.supported) {
-      showWarn("⚠ This device can't decode the video codec (HEVC/H.265). Audio will still play.");
+      const fam = (c.videoCodec || "").slice(0, 4) === "avc1" ? "H.264" : "HEVC/H.265";
+      showWarn("⚠ This device can't decode the video codec (" + fam + "). Audio will still play.");
     } else {
       els.fsbtn.style.display = "flex";
+      // Video is advertised, but a web-cast source only emits frames once a caster actually shares a
+      // screen (a mic-only cast, or a caster who can't H.264-encode, sends none). Don't strand the
+      // user on a blank stage: if no NEW frame arrives within a few seconds, fall back to the audio
+      // visualizer. videoStep() auto-swaps back to the stage the instant real video shows up.
+      const framesAtSetup = vFrames;
+      clearTimeout(noVideoFallbackTimer);
+      noVideoFallbackTimer = setTimeout(() => {
+        if (vFrames === framesAtSetup && els.vlogo.style.display === "none") {
+          els.stage.style.display = "none";
+          els.vlogo.style.display = "flex";
+          vizStart();
+        }
+      }, 6000);
     }
   } else if (!c.video) {
     // Audio-only source: hide the video box, show the (boxless) logo branding instead.
@@ -1053,6 +1199,7 @@ async function setupDecoders(c) {
 
 let vDecErrStreak = 0;
 let vGoodRun = 0; // consecutive good frames since the last error (gates clearing the streak)
+let videoAvccMode = false; // true when decoding a browser cast's H.264 via AVCC + description (vs in-band Annex-B HEVC)
 function onDecErr(kind, e) {
   console.error(kind + " decode error", e);
   if (kind === "video") {
@@ -1081,34 +1228,88 @@ function onDecErr(kind, e) {
 // decode them just-in-time (so a 10 s buffer stays cheap, not 10 s of surfaces).
 // =============================================================================
 function onVideoChunk(tsUs, key, annexb) {
+  if (typeof VideoDecoder === "undefined") return; // no WebCodecs video on this browser → audio-only
   if (!gotParams) {
-    if (!key) return; // wait for a keyframe (HEVC IRAP carries VPS/SPS/PPS in-band)
-    // HEVC straight from Annex-B: configure WITHOUT a description, so the decoder reads
-    // VPS/SPS/PPS from the in-band keyframe and we can feed raw Annex-B access units.
-    const vcfg = {
-      codec: (cfg && cfg.videoCodec) || "hev1.1.6.L153.B0",
-      optimizeForLatency: true,
-      hardwareAcceleration: videoAccel,
-    };
-    try {
-      if (videoDecoder && videoDecoder.state !== "closed") videoDecoder.close();
-      videoDecoder = new VideoDecoder({ output: onVideoFrame, error: (e) => onDecErr("video", e) });
-      videoDecoder.configure(vcfg);
-      gotParams = true;
-    } catch (e) {
+    if (!key) return; // wait for a keyframe (it carries the parameter sets we configure from)
+    const codecStr = (cfg && cfg.videoCodec) || "hev1.1.6.L153.B0";
+    const isAvc = codecStr.slice(0, 4) === "avc1" || codecStr.slice(0, 4) === "avc3";
+    if (isAvc) {
+      // Browser-cast H.264 (Phase 2): iOS Safari's decoder rejects in-band Annex-B H.264, so build
+      // an avcC (AVCDecoderConfigurationRecord) from this keyframe's SPS/PPS, configure WITH that as
+      // the `description`, and feed AVCC length-prefixed samples (converted below). Desktop Chrome
+      // accepts this path too, so it's used for every avc1/avc3 stream.
+      const nals = splitNalsAnnexB(annexb);
+      let sps = null;
+      let pps = null;
+      for (const nal of nals) {
+        const t = nalType(nal);
+        if (t === 7 && !sps) sps = nal;
+        else if (t === 8 && !pps) pps = nal;
+      }
+      if (!sps || !pps) return; // wait for a keyframe that carries SPS+PPS (caster forces one ~every 2s)
+      const vcfg = {
+        codec: codecFromSps(sps),
+        description: buildAvcC(sps, pps),
+        optimizeForLatency: true,
+        hardwareAcceleration: videoAccel,
+      };
       try {
-        delete vcfg.hardwareAcceleration;
-        videoDecoder = new VideoDecoder({ output: onVideoFrame, error: (e2) => onDecErr("video", e2) });
+        if (videoDecoder && videoDecoder.state !== "closed") videoDecoder.close();
+        videoDecoder = new VideoDecoder({ output: onVideoFrame, error: (e) => onDecErr("video", e) });
         videoDecoder.configure(vcfg);
+        videoAvccMode = true;
         gotParams = true;
-      } catch (e2) {
-        showWarn("⚠ Video decoder couldn't start — this device may not support HEVC/H.265. Audio still plays. (" + e2.message + ")");
-        return;
+      } catch (e) {
+        try {
+          delete vcfg.hardwareAcceleration;
+          videoDecoder = new VideoDecoder({ output: onVideoFrame, error: (e2) => onDecErr("video", e2) });
+          videoDecoder.configure(vcfg);
+          videoAvccMode = true;
+          gotParams = true;
+        } catch (e2) {
+          showWarn("⚠ Video decoder couldn't start for the cast (H.264). Audio still plays. (" + e2.message + ")");
+          return;
+        }
+      }
+    } else {
+      // HEVC straight from Annex-B (native server source): configure WITHOUT a description, so the
+      // decoder reads VPS/SPS/PPS from the in-band keyframe and we feed raw Annex-B access units.
+      const vcfg = {
+        codec: codecStr,
+        optimizeForLatency: true,
+        hardwareAcceleration: videoAccel,
+      };
+      try {
+        if (videoDecoder && videoDecoder.state !== "closed") videoDecoder.close();
+        videoDecoder = new VideoDecoder({ output: onVideoFrame, error: (e) => onDecErr("video", e) });
+        videoDecoder.configure(vcfg);
+        videoAvccMode = false;
+        gotParams = true;
+      } catch (e) {
+        try {
+          delete vcfg.hardwareAcceleration;
+          videoDecoder = new VideoDecoder({ output: onVideoFrame, error: (e2) => onDecErr("video", e2) });
+          videoDecoder.configure(vcfg);
+          videoAvccMode = false;
+          gotParams = true;
+        } catch (e2) {
+          showWarn("⚠ Video decoder couldn't start — this device may not support HEVC/H.265. Audio still plays. (" + e2.message + ")");
+          return;
+        }
       }
     }
   }
-  // Feed Annex-B directly (decoder configured without a description = Annex-B mode).
-  evq.push({ key, tsUs, data: annexb });
+  // In AVCC mode (H.264 cast) convert each Annex-B access unit to length-prefixed AVCC, DROPPING the
+  // in-band SPS/PPS (they live in the decoder's avcC description — iOS rejects samples that repeat
+  // them). HEVC feeds raw Annex-B (decoder configured without a description).
+  let data;
+  if (videoAvccMode) {
+    data = annexBToAvccVcl(annexb);
+    if (!data) return; // an access unit of only parameter sets — nothing to decode, skip
+  } else {
+    data = annexb;
+  }
+  evq.push({ key, tsUs, data });
   // Overflow = we're receiving faster than we can decode/play. Drop the oldest and
   // force the decoder to resync at the next keyframe (don't break the delta chain).
   if (evq.length > maxEvq) {
@@ -1156,36 +1357,63 @@ function onVideoFrame(frame) {
     return;
   }
   vq.push({ frame, targetPerf: serverPtsToPerfMs(frame.timestamp * 1000) });
-  while (vq.length > MAX_DECODED) vq.shift().frame.close();
+  // Overflow guard (rare — pumpVideo already gates on MAX_DECODED). Drop a doomed past-due frame
+  // first, else the farthest-FUTURE one — never the imminent frame, which would be a guaranteed skip.
+  while (vq.length > MAX_DECODED) {
+    const nowMs = performance.now();
+    if (vq[0].targetPerf <= nowMs) vq.shift().frame.close();
+    else vq.pop().frame.close();
+  }
   const dims = frame.displayWidth + "×" + frame.displayHeight;
   if (dims !== vDims) vDims = dims; // avoid per-frame string churn in stats
 }
 
-// One pass: feed the decoder just ahead of playout, then draw whatever is due.
-function videoStep() {
+// Present one frame, paced to the display's vsync. `nowTs` is the rAF callback's DISPLAY timestamp
+// (same clock origin as performance.now()); the paint we issue here becomes visible ~one refresh
+// later, so we target that upcoming refresh. We show the frame nearest it, with half-a-refresh
+// hysteresis and a HOLD rule: a 30fps stream on a 60Hz panel then gets a rock-steady 2-refresh hold
+// instead of a 2/3-tick (3:2-pulldown) beat, and sub-refresh clock jitter can't cause a skip or a
+// double-swap. Falls back to performance.now() when driven by the stall backstop (no rAF timestamp).
+let framePeriodMs = 1000 / 60; // EMA-learned real refresh period (so it works on 120/144Hz too)
+let prevRafTs = 0;
+let lastRafMs = 0; // wall time of the last rAF — the timer backstop only fires when this goes stale
+function videoStep(nowTs) {
   pumpVideo();
-  const now = performance.now();
+  const now = typeof nowTs === "number" ? nowTs : performance.now();
+  if (!vq.length) return; // nothing decoded yet → hold whatever's on the canvas
+  const half = framePeriodMs * 0.5;
+  const nextVsync = now + framePeriodMs; // the paint issued now is composited ~one refresh later
+  if (vq[0].targetPerf > nextVsync + half) return; // head not due at the next refresh → HOLD (no redraw)
+  // Head is due: drain every frame due by the next refresh (catch-up after a stall) and keep only the
+  // newest — it best matches this vsync. The +half hysteresis keeps the choice stable frame-to-frame.
   let due = null;
-  while (vq.length && vq[0].targetPerf <= now) {
+  while (vq.length && vq[0].targetPerf <= nextVsync + half) {
     if (due) due.close();
     due = vq.shift().frame;
   }
-  if (due) {
-    if (els.canvas.width !== due.displayWidth) {
-      els.canvas.width = due.displayWidth;
-      els.canvas.height = due.displayHeight;
-    }
-    if (els.vlogo.style.display !== "none") { els.vlogo.style.display = "none"; vizStop(); } // real video → swap logo for the stage
-    els.stage.style.display = "block";
-    ctx2d.drawImage(due, 0, 0);
-    due.close();
+  if (!due) return;
+  if (els.canvas.width !== due.displayWidth) {
+    els.canvas.width = due.displayWidth;
+    els.canvas.height = due.displayHeight;
   }
+  if (els.vlogo.style.display !== "none") { els.vlogo.style.display = "none"; vizStop(); } // real video → swap logo for the stage
+  els.stage.style.display = "block";
+  ctx2d.drawImage(due, 0, 0);
+  due.close();
 }
 
 let rafPending = false;
-function drawLoop() {
+function drawLoop(ts) {
   rafPending = false;
-  videoStep();
+  lastRafMs = performance.now();
+  // Learn the true refresh period from consecutive rAF display timestamps (clamped to reject
+  // background-throttle gaps), so the vsync pacing is correct on 60/120/144Hz panels alike.
+  if (prevRafTs) {
+    const d = ts - prevRafTs;
+    if (d > 4 && d < 40) framePeriodMs += 0.1 * (d - framePeriodMs);
+  }
+  prevRafTs = ts;
+  videoStep(ts); // pace off the DISPLAY timestamp, not the callback-run time
   scheduleDraw();
 }
 function scheduleDraw() {
@@ -1194,10 +1422,12 @@ function scheduleDraw() {
   requestAnimationFrame(drawLoop);
 }
 scheduleDraw();
-// Backstop: if rAF ever stalls (some embedded/background webviews throttle or never
-// fire it), keep video moving from a timer too. rAF stays the smooth 60 fps path.
+// Backstop: ONLY when rAF has genuinely stalled (background/embedded webviews that throttle or never
+// fire it). Running it alongside a healthy rAF would double-drive presentation off-vsync and inject
+// exactly the out-of-cadence swaps we're removing — so gate it on rAF having gone quiet.
 setInterval(() => {
-  if (!document.hidden && videoDecoder) videoStep();
+  if (document.hidden || !videoDecoder) return;
+  if (performance.now() - lastRafMs > 250) videoStep(); // rAF quiet >~15 refreshes → keep video moving
 }, 120);
 
 // =============================================================================
@@ -1396,7 +1626,8 @@ function updateStats() {
   }
   els.sync.textContent = offsetNs === null ? "…" : "✔ ±" + syncJitterMs().toFixed(1) + "ms";
   const vbuf = cfg && cfg.video ? " · vid enc " + evq.length + "/dec " + vq.length : "";
-  els.buf.textContent = (bufferMs / 1000).toFixed(1) + "s" + vbuf;
+  const arate = ac ? " · " + ac.sampleRate / 1000 + "kHz" : ""; // diag: 48kHz = clean; 44.1kHz = per-buffer resample seams
+  els.buf.textContent = (bufferMs / 1000).toFixed(1) + "s" + arate + vbuf;
   els.ai.textContent = cfg ? aFrames + " frames" : "—";
   els.vi.textContent = vDims ? vDims + " · " + vFrames + " frames" : "—";
 }
@@ -2390,3 +2621,281 @@ els.caliblisten.addEventListener("click", () => {
   startListen();
 });
 els.calibcancel.addEventListener("click", () => { calibAbort(""); els.calibroles.style.display = "none"; setCalibStatus(""); });
+
+// =============================================================================
+// Web-client cast (uplink): capture a tab/screen/mic in the browser and "cast" it
+// UP to the server, which re-broadcasts to ALL clients at the server's quality.
+// Phase 1 is audio-only and requires the server's source = "Web client cast".
+// Browsers can't grab arbitrary-window audio, so the sources are tab/screen audio
+// (via getDisplayMedia — needs a shared surface) or the microphone.
+// =============================================================================
+function setCastStatus(text) {
+  if (!els.caststatus) return;
+  els.caststatus.textContent = text || "";
+  els.caststatus.style.display = text ? "" : "none";
+}
+function castSupported() {
+  return typeof AudioEncoder !== "undefined" && typeof MediaStreamTrackProcessor !== "undefined";
+}
+// Tear down the cast (Stop cast, operator stop, errors, teardown). notifyServer ⇒ send CAST_STOP.
+function stopCast(notifyServer) {
+  const was = casting || castPending;
+  casting = false;
+  castPending = null;
+  castSource = null;
+  castResumeSource = null; // an explicit stop must NOT auto-resume on the next reconnect
+  castEpoch++; // invalidate any in-flight startCast still inside its capture-picker await
+  try { if (castReader) castReader.cancel(); } catch (e) {}
+  castReader = null;
+  try { if (castVidReader) castVidReader.cancel(); } catch (e) {}
+  castVidReader = null;
+  try { if (castEnc && castEnc.state !== "closed") castEnc.close(); } catch (e) {}
+  castEnc = null;
+  try { if (castVidEnc && castVidEnc.state !== "closed") castVidEnc.close(); } catch (e) {}
+  castVidEnc = null;
+  // Disconnect the Web Audio graph so the nodes are collectable (otherwise they leak per cast).
+  try { if (castSrcNode) castSrcNode.disconnect(); } catch (e) {}
+  try { if (castDestNode) castDestNode.disconnect(); } catch (e) {}
+  castSrcNode = null;
+  castDestNode = null;
+  try { if (castStream) castStream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+  castStream = null;
+  if (notifyServer && ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(new Uint8Array([MSG_CAST_STOP])); } catch (e) {}
+  }
+  if (els.castroles) els.castroles.style.display = "none";
+  applyGain(); // un-mute the downlink
+  if (was) setCastStatus("");
+}
+// Transport dropped WHILE casting (network blip, or the operator changed the stream → a StreamState
+// republish reconnects every socket). Tear down the encoders/graph but KEEP the captured stream +
+// the casting intent, so ws.onopen can re-claim the slot and resume without a fresh user gesture —
+// instead of the cast silently dying. Encoders are rebuilt from the preserved stream on the re-grant.
+function suspendCastForReconnect() {
+  castResumeSource = castSource || castPending || "tab";
+  casting = false;
+  castPending = null;
+  try { if (castReader) castReader.cancel(); } catch (e) {}
+  castReader = null;
+  try { if (castVidReader) castVidReader.cancel(); } catch (e) {}
+  castVidReader = null;
+  try { if (castEnc && castEnc.state !== "closed") castEnc.close(); } catch (e) {}
+  castEnc = null;
+  try { if (castVidEnc && castVidEnc.state !== "closed") castVidEnc.close(); } catch (e) {}
+  castVidEnc = null;
+  try { if (castSrcNode) castSrcNode.disconnect(); } catch (e) {}
+  try { if (castDestNode) castDestNode.disconnect(); } catch (e) {}
+  castSrcNode = null;
+  castDestNode = null;
+  // castStream tracks are LEFT RUNNING on purpose so the screen/mic share survives the reconnect.
+  setCastStatus("📡 Reconnecting — your cast will resume automatically…");
+}
+// Capture the chosen source INSIDE the click gesture, then ask the server for the caster slot.
+async function startCast(source) {
+  if (!started || !ws || ws.readyState !== WebSocket.OPEN) { setCastStatus("⚠ Start playback first, then cast."); return; }
+  if (casting || castPending) return; // already casting / awaiting grant (the sync claim below covers the picker await)
+  if (!castSupported()) { setCastStatus("⚠ This browser can't encode a cast (needs WebCodecs). Use desktop Chrome/Edge."); return; }
+  if (!ac || ac.sampleRate !== 48000) { setCastStatus("⚠ Casting needs a 48 kHz audio context on this device."); return; }
+  // Claim the in-flight slot SYNCHRONOUSLY — before the capture-picker await — so a double-tap
+  // during the picker can't open two captures or fire two CAST_REQUESTs. Reset on every failure.
+  // The epoch lets us detect a stop() that happened WHILE the picker was open (see post-await check).
+  castPending = source;
+  const myEpoch = ++castEpoch;
+  setCastStatus("Requesting capture…");
+  try {
+    if (source === "mic") {
+      castStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        video: false,
+      });
+    } else {
+      // Tab/screen capture: the browser's own picker chooses the surface. We always take the audio
+      // track; the video track is ALSO encoded + cast up IF the server's cast source has video
+      // enabled (the CAST_GRANT says so) — otherwise it stays live but unused.
+      castStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      if (!castStream.getAudioTracks().length) {
+        castStream.getTracks().forEach((t) => t.stop());
+        castStream = null;
+        castPending = null;
+        setCastStatus('⚠ No audio was shared. Re-share and tick "Share tab/system audio".');
+        return;
+      }
+    }
+  } catch (e) {
+    castPending = null;
+    setCastStatus("⚠ Capture cancelled or blocked.");
+    return;
+  }
+  // A stop() (Cast/Stop tap, or a disconnect) during the picker await bumped castEpoch and already
+  // cleared state — the stream we just acquired is now an orphan. Stop its tracks and bail, so we
+  // neither leak a live capture nor fire a CAST_REQUEST the client has no state to honor.
+  if (castEpoch !== myEpoch || ws.readyState !== WebSocket.OPEN) {
+    try { castStream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+    castStream = null;
+    return;
+  }
+  // If the user stops the share from the browser UI, end the cast cleanly.
+  const a0 = castStream.getAudioTracks()[0];
+  if (a0) a0.addEventListener("ended", () => stopCast(true));
+  setCastStatus("Claiming the cast slot…");
+  try { ws.send(new Uint8Array([MSG_CAST_REQUEST])); } catch (e) {}
+}
+// Server replied to our CAST_REQUEST. On grant, start encoding the captured audio up.
+function onCastGrant(granted, p) {
+  if (!castPending) return; // not us / stale
+  if (!granted || !castStream) {
+    setCastStatus("⚠ Casting isn't available — the server must pick \"Web client cast\" as its source, and only one device can cast at a time.");
+    stopCast(false);
+    return;
+  }
+  casting = true;
+  castSource = castPending || castSource; // remember the source so a reconnect can auto re-claim it
+  castPending = null;
+  applyGain(); // mute downlink immediately (echo)
+  setCastStatus("📡 Casting audio to everyone — tap Stop cast to end.");
+  // Force 48 kHz stereo regardless of the source via a destination node, then Opus-encode at the
+  // server-dictated bitrate. Receivers decode this verbatim (the server only re-stamps + relays).
+  // Keep refs to both nodes so stopCast can disconnect them (otherwise they leak per cast).
+  castSrcNode = ac.createMediaStreamSource(castStream);
+  castDestNode = ac.createMediaStreamDestination(); // ac.sampleRate (48000), 2ch
+  castSrcNode.connect(castDestNode);
+  const track = castDestNode.stream.getAudioTracks()[0];
+  castEnc = new AudioEncoder({
+    output: (chunk) => sendUpAudio(chunk),
+    error: (e) => { setCastStatus("⚠ Encode error: " + e.message); stopCast(true); },
+  });
+  castEnc.configure({
+    codec: "opus",
+    sampleRate: ac.sampleRate,
+    numberOfChannels: 2,
+    // Opus tops out at 510 kbps; clamp so a large server bitrate can't make configure() throw.
+    bitrate: Math.min(510000, Math.max(32000, p.audioBps || 128000)),
+  });
+  const proc = new MediaStreamTrackProcessor({ track });
+  castReader = proc.readable.getReader();
+  (async () => {
+    try {
+      while (casting) {
+        const { value: data, done } = await castReader.read();
+        if (done) break;
+        if (castEnc && castEnc.state === "configured") castEnc.encode(data);
+        data.close();
+      }
+    } catch (e) { /* reader cancelled on stop — fine */ }
+  })();
+  // Phase 2: if the server's cast source has video enabled, also H.264-encode the shared screen up.
+  if (p.videoOn) startVideoCast(p);
+}
+
+// Encode the captured screen/tab video up to the server as H.264 (Phase 2). Best-effort: if this
+// browser can't VideoEncoder H.264, or no video surface was shared (e.g. mic cast), the cast stays
+// audio-only — never tear down the working audio path for a video problem.
+async function startVideoCast(p) {
+  const vtrack = castStream && castStream.getVideoTracks()[0];
+  if (!vtrack) { setCastStatus("📡 Casting audio to everyone (no screen was shared) — tap Stop cast to end."); return; }
+  if (typeof VideoEncoder === "undefined" || typeof MediaStreamTrackProcessor === "undefined") {
+    setCastStatus("📡 Casting audio (this browser can't encode video) — tap Stop cast to end.");
+    return;
+  }
+  // Constrain the captured surface to the server's resolution/fps so every receiver gets the
+  // operator's chosen quality regardless of the caster's screen size. Best-effort (some surfaces
+  // ignore it); we then configure the encoder to the resolution actually delivered.
+  try { await vtrack.applyConstraints({ width: { max: p.width || 1920 }, height: { max: p.height || 1080 }, frameRate: { max: p.fps || 30 } }); } catch (e) {}
+  if (!casting) return; // stopped during the await
+  const s = (vtrack.getSettings && vtrack.getSettings()) || {};
+  const ew = (s.width | 0) || p.width || 1280;
+  const eh = (s.height | 0) || p.height || 720;
+  const vcfg = {
+    // H.264 Constrained Baseline with a LEVEL that covers this resolution — a fixed L3.1 only
+    // reaches 720p, so 1080p+ (incl. the default) would fail isConfigSupported and drop to audio.
+    codec: avcCodecString(ew, eh, p.fps || 30),
+    width: ew,
+    height: eh,
+    framerate: p.fps || 30,
+    bitrate: Math.max(500000, (p.videoKbps || 4000) * 1000),
+    latencyMode: "realtime",
+    avc: { format: "annexb" }, // in-band SPS/PPS — receivers build an avcC from the keyframe
+  };
+  if (VideoEncoder.isConfigSupported) {
+    const r = await VideoEncoder.isConfigSupported(vcfg).catch(() => null);
+    if (!casting) return;
+    if (r && !r.supported) { setCastStatus("📡 Casting audio (this browser can't H.264-encode video) — tap Stop cast to end."); return; }
+  }
+  try {
+    castVidEnc = new VideoEncoder({
+      output: (chunk) => sendUpVideo(chunk),
+      // A video encode failure must NOT kill the cast — drop video, keep audio flowing.
+      error: (e) => {
+        try { if (castVidEnc && castVidEnc.state !== "closed") castVidEnc.close(); } catch (x) {}
+        castVidEnc = null;
+        setCastStatus("📡 Casting audio (video encode failed: " + e.message + ") — tap Stop cast to end.");
+      },
+    });
+    castVidEnc.configure(vcfg);
+  } catch (e) {
+    castVidEnc = null;
+    setCastStatus("📡 Casting audio (couldn't start video encode: " + e.message + ") — tap Stop cast to end.");
+    return;
+  }
+  let lastKeyMs = 0; // 0 ⇒ the first encoded frame is forced to a keyframe
+  let proc;
+  try {
+    proc = new MediaStreamTrackProcessor({ track: vtrack });
+  } catch (e) {
+    // e.g. the track is momentarily still held by a prior processor after a fast reconnect-resume —
+    // keep audio flowing and drop video rather than throwing an uncaught error.
+    try { if (castVidEnc && castVidEnc.state !== "closed") castVidEnc.close(); } catch (x) {}
+    castVidEnc = null;
+    setCastStatus("📡 Casting audio (couldn't attach video capture: " + e.message + ") — tap Stop cast to end.");
+    return;
+  }
+  setCastStatus("📡 Casting screen + audio to everyone — tap Stop cast to end.");
+  castVidReader = proc.readable.getReader();
+  (async () => {
+    try {
+      while (casting && castVidEnc) {
+        const { value: frame, done } = await castVidReader.read();
+        if (done) break;
+        // Backpressure: if a slow uplink lets the encoder back up, skip frames rather than balloon latency.
+        if (castVidEnc && castVidEnc.state === "configured" && castVidEnc.encodeQueueSize < 4) {
+          // Force a keyframe ~every 2s by WALL-CLOCK (not encoded-frame count) so a late joiner can
+          // build its avcC and start within ~2s regardless of real capture fps / backpressure skips.
+          const now = performance.now();
+          const forceKey = now - lastKeyMs >= 2000;
+          castVidEnc.encode(frame, { keyFrame: forceKey });
+          if (forceKey) lastKeyMs = now;
+        }
+        frame.close();
+      }
+    } catch (e) { /* reader cancelled on stop — fine */ }
+  })();
+}
+function sendUpAudio(chunk) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const body = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(body);
+  const msg = new Uint8Array(1 + body.length);
+  msg[0] = MSG_UP_AUDIO;
+  msg.set(body, 1);
+  try { ws.send(msg); } catch (e) {}
+}
+// Phase 2: send one encoded H.264 access unit (Annex-B) up to the server: [0x31][key u8][annexb].
+function sendUpVideo(chunk) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const body = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(body);
+  const msg = new Uint8Array(2 + body.length);
+  msg[0] = MSG_UP_VIDEO;
+  msg[1] = chunk.type === "key" ? 1 : 0;
+  msg.set(body, 2);
+  try { ws.send(msg); } catch (e) {}
+}
+els.castbtn.addEventListener("click", () => {
+  if (casting || castPending) { stopCast(true); return; } // tapping Cast again stops it
+  const showing = els.castroles.style.display !== "none";
+  els.castroles.style.display = showing ? "none" : "";
+  setCastStatus(showing ? "" : "Cast this device: pick a source — it becomes the source for everyone (one caster at a time).");
+});
+els.casttab.addEventListener("click", () => startCast("tab"));
+els.castmic.addEventListener("click", () => startCast("mic"));
+els.caststop.addEventListener("click", () => stopCast(true));

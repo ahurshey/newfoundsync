@@ -182,3 +182,16 @@ and system-tray minimize.
 This is a **trusted-LAN** tool: the TLS cert exists only to satisfy the browser's
 secure-context requirement (self-signed, accept-once). No accounts, no cloud, no
 internet-facing operation.
+
+## License
+
+Newfoundsync is **free software**, licensed under the **GNU General Public License,
+version 3 or later** — see [LICENSE](LICENSE). You're free to use, study, share, and
+modify it; if you distribute it (modified or not), you must pass those same freedoms on:
+keep it under the GPL and make the corresponding source available.
+
+Copyright © 2026 Alex Hurshman and the Newfoundsync contributors.
+
+> **Codec note.** H.264 and HEVC are patent-encumbered formats. This project's *source*
+> is GPL-licensed, but distributing binaries that encode or decode them may carry separate
+> patent-licensing obligations in some jurisdictions, independent of this software license.

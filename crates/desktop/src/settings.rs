@@ -47,7 +47,12 @@ fn save_key(key: &str, value: &str) -> Result<(), String> {
     let mut map = load_all();
     map.insert(key.to_string(), value.to_string());
     let body: String = map.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-    std::fs::write(&path, body).map_err(|e| e.to_string())
+    // Atomic write: fill a sibling temp file, then rename it over the target. An interrupted write
+    // can then never leave a truncated/corrupt settings.txt — either the old file or the complete
+    // new one is present. (std::fs::rename replaces the destination on Windows via MoveFileEx.)
+    let tmp_path = path.with_extension("txt.tmp");
+    std::fs::write(&tmp_path, body).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp_path, &path).map_err(|e| e.to_string())
 }
 
 /// The saved HTTP port, if a valid one was previously stored. `None` ⇒ caller uses the default.

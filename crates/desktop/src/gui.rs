@@ -178,12 +178,18 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         EncoderBackend::Hardware => 1,
         EncoderBackend::Cpu => 2,
     };
+    // The Codec picker exposes only HEVC/GPU (0) and H.264/CPU (2); "GPU only" (1) has no GUI option
+    // and `is_h264 == (enc_idx == 2)` would render it as HEVC. Fold a `--encoder hardware` launch
+    // into Auto (0) so the GUI state and the encoder never disagree. (Auto and Hardware both resolve
+    // to GPU HEVC, so this changes no encoding behavior — only the picker's consistency.)
+    let enc_idx = if enc_idx == 1 { 0 } else { enc_idx };
 
     let mut app = ServerApp {
         server_name,
         url,
         clients,
         clients_reg,
+        cast: cast.clone(),
         master_vol: 1.0,
         client_vols: HashMap::new(),
         client_trims: HashMap::new(),
@@ -488,6 +494,9 @@ struct ServerApp {
     /// Live per-client registry shared with the web server — render the list and
     /// push per-client volume through each entry's `ctrl_tx`.
     clients_reg: ClientRegistry,
+    /// The single active web-caster's conn_id (shared with the web server). The GUI reads it to
+    /// surface that caster's "Stop cast" control and writes `None` to free the slot when stopped.
+    cast: webserver::CastState,
     /// Server master volume (0..=1): scales every client's effective remote volume.
     master_vol: f32,
     /// Per-client (pre-master) volume, keyed by the client's *stable* id so it
@@ -956,6 +965,9 @@ impl ServerApp {
         let calibrating = self.calibrating;
         let mut do_calibrate = false; // set inside the card closure, acted on after it
         let mut do_stop_calib = false;
+        let mut do_stop_cast: Option<u64> = None; // caster's conn_id when the operator kicks it
+        // The active web-caster (if any) — only its row shows the operator "Stop cast" control.
+        let active_caster: Option<u64> = self.cast.lock().ok().and_then(|s| *s);
 
         // If the client being renamed vanished, don't strand the half-typed buffer: commit it
         // (keyed by stable id) and clear the edit state.
@@ -1130,13 +1142,40 @@ impl ServerApp {
                                         .color(if ok { c_ok() } else { c_dim() }),
                                 );
                             }
+                            if active_caster == Some(*conn_id) {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("📡 casting").size(11.0).color(c_accent()));
+                                    if ui
+                                        .button("⏹ Stop cast")
+                                        .on_hover_text("Kick this device off the cast slot so another client can claim it.")
+                                        .clicked()
+                                    {
+                                        do_stop_cast = Some(*conn_id);
+                                    }
+                                });
+                            }
                             ui.add_space(6.0);
                         });
                     }
                 });
         });
-        // Deliver any changed volume / sync, then act on the deferred calibrate flags.
+        // Deliver any changed volume / sync, then act on the deferred cast/calibrate flags.
         self.push_client_state();
+        if let Some(cid) = do_stop_cast {
+            // Operator kicked the caster. The server is the SOLE authority on the slot and the
+            // caster's own stopCast doesn't notify it — so free the slot IMMEDIATELY (letting another
+            // client claim it) AND tell the caster's browser to tear down its uplink. No ack wait.
+            if let Ok(mut s) = self.cast.lock() {
+                if *s == Some(cid) {
+                    *s = None;
+                }
+            }
+            if let Ok(reg) = self.clients_reg.lock() {
+                if let Some(e) = reg.get(&cid) {
+                    let _ = e.ctrl_tx.send(webserver::cast_stop_msg());
+                }
+            }
+        }
         if do_calibrate {
             if !self.start_calibrate_all() {
                 *self.status.lock().unwrap() = "Need at least two connected devices to calibrate.".into();

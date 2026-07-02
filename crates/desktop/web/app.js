@@ -346,7 +346,6 @@ if ("serviceWorker" in navigator) {
   });
 }
 
-
 // ---- audio visualizer (the logo, shown for audio-only sources) --------------
 // A circular spectrum drawn around the logo from the AnalyserNode, plus a bass-driven
 // "breathe" on the logo. Toggleable (button under the logo), default on, persisted.
@@ -2828,6 +2827,10 @@ async function startVideoCast(p) {
       error: (e) => {
         try { if (castVidEnc && castVidEnc.state !== "closed") castVidEnc.close(); } catch (x) {}
         castVidEnc = null;
+        // Release the capture reader too, so the MediaStreamTrackProcessor stops pulling the video
+        // track immediately (audio-only fallback) rather than holding it until stopCast().
+        try { if (castVidReader) castVidReader.cancel(); } catch (x) {}
+        castVidReader = null;
         setCastStatus("📡 Casting audio (video encode failed: " + e.message + ") — tap Stop cast to end.");
       },
     });

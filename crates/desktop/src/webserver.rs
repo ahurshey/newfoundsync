@@ -613,7 +613,7 @@ async fn serve(
                         let is_caster = state.cast.lock().map(|s| *s == Some(conn_id)).unwrap_or(false);
                         if is_caster {
                             if let Some(relay) = active.cast_relay.as_deref() {
-                                relay.push_video(b[1] != 0, &b[2..]);
+                                relay.push_video(&b[2..]); // key flag re-derived server-side, not trusted from b[1]
                             }
                         }
                     }

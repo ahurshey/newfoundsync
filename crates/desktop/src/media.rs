@@ -131,8 +131,12 @@ impl CastRelay {
         let _ = self.audio_tx.send(Arc::new(msg)); // Err only if no clients
     }
 
-    /// Wrap+fan-out one H.264 access unit (Annex-B) uploaded by the caster (Phase 2).
-    pub fn push_video(&self, key: bool, h264: &[u8]) {
+    /// Wrap+fan-out one H.264 access unit (Annex-B) uploaded by the caster (Phase 2). The keyframe
+    /// flag is RE-DERIVED from the bitstream (never trusted from the caster's wire byte) so a buggy
+    /// or hostile caster can't mislabel frames and strand receivers on a black frame — matching the
+    /// local capture path (which also scans via `is_keyframe`). Web casts are always H.264 (avc1).
+    pub fn push_video(&self, h264: &[u8]) {
+        let key = crate::video::codec::annexb_has_h264_idr(h264);
         let pts = mono_now() + self.lead_ns;
         let mut msg = Vec::with_capacity(10 + h264.len());
         msg.push(MSG_VIDEO);

@@ -161,7 +161,9 @@ impl VideoEncoder {
 }
 
 /// H.264: 1-byte NAL header; nal_type = byte & 0x1f; IDR slice = 5. Scans Annex-B start codes.
-fn annexb_has_h264_idr(au: &[u8]) -> bool {
+/// `pub` so the web-cast relay can re-derive the keyframe flag from an uploaded AU (never trust the
+/// caster's wire byte) — matching the local capture path.
+pub fn annexb_has_h264_idr(au: &[u8]) -> bool {
     let mut i = 0usize;
     while i + 3 < au.len() {
         if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {

@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Newfoundsync — LAN audio & screen, clock-synced to every browser</title>
+<meta name="description" content="Newfoundsync streams a Windows PC's audio (and optional screen) to every browser on your LAN with tight, Sonos-like multi-room sync. No client install — just open a URL. Free software, GPL-3.0." />
+<meta name="theme-color" content="#0b0f15" />
+<meta name="color-scheme" content="dark" />
+<link rel="icon" type="image/png" href="branding/icon-32.png" />
+<link rel="apple-touch-icon" href="branding/icon-256.png" />
+<!-- Open Graph / link preview -->
+<meta property="og:type" content="website" />
+<meta property="og:title" content="Newfoundsync — LAN audio & screen, clock-synced to every browser" />
+<meta property="og:description" content="Stream a Windows PC's sound (and optional screen) to every browser on your LAN, all playing in lock-step. No install. Free software, GPL-3.0." />
+<meta property="og:url" content="https://ahurshey.github.io/newfoundsync/" />
+<meta property="og:image" content="https://ahurshey.github.io/newfoundsync/branding/icon-512.png" />
+<meta name="twitter:card" content="summary" />
+<style>
+  /* ---- Harbour Glass design tokens (matched to the web client) ------------- */
+  :root {
+    --bg: #0b0f15;
+    --surface: #161c26;
+    --surface-alt: #1d2531;
+    --border: #2a3340;
+    --text: #e8eef5;
+    --dim: #94a1b2;
+    --accent: #3b8eff;
+    --accent-hi: #5aa2ff;
+    --accent-text: #fff;
+    --ok: #3fb950;
+    --warn: #d8a531;
+    --err: #f85149;
+    --hover: #243044;
+    --hover-bd: #34404f;
+    --glass-bar: rgba(13, 18, 26, .72);
+    --glass-card: rgba(22, 28, 38, .55);
+    --shadow-glow: 0 8px 30px rgba(59, 142, 255, .35);
+    --r-card: 16px;
+    --r-ico: 11px;
+    --maxw: 1080px;
+    --steel: #9fb0c3;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; background: var(--bg); }
+  body {
+    margin: 0;
+    color: var(--text);
+    background:
+      radial-gradient(1200px 680px at 82% -12%, rgba(59,142,255,.18), transparent 60%),
+      radial-gradient(760px 520px at 2% 2%, rgba(59,142,255,.07), transparent 55%),
+      var(--bg);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow-x: hidden;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-hi); }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; }
+  .mono { font-family: ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace; }
+
+  /* ---- Nav ---------------------------------------------------------------- */
+  header.nav {
+    position: sticky; top: 0; z-index: 30;
+    background: var(--glass-bar);
+    backdrop-filter: blur(14px) saturate(120%);
+    -webkit-backdrop-filter: blur(14px) saturate(120%);
+    border-bottom: 1px solid var(--border);
+  }
+  .nav-inner { display: flex; align-items: center; gap: 16px; height: 64px; }
+  .brand { display: flex; align-items: center; gap: 11px; font-weight: 700; letter-spacing: -.01em; color: var(--text); font-size: 17px; }
+  .brand img { width: 30px; height: 30px; display: block; filter: drop-shadow(0 2px 6px rgba(0,0,0,.5)); }
+  .nav-links { margin-left: auto; display: flex; gap: 22px; align-items: center; }
+  .nav-links a { color: var(--dim); font-size: 14.5px; font-weight: 500; }
+  .nav-links a:hover { color: var(--text); }
+  .nav-cta {
+    border: 1px solid var(--border); background: var(--surface-alt);
+    padding: 8px 15px; border-radius: 10px; color: var(--text) !important;
+    transition: background .14s, border-color .14s;
+  }
+  .nav-cta:hover { border-color: var(--accent); background: var(--hover); }
+  @media (max-width: 640px) { .nav-links a.hide-sm { display: none; } }
+
+  /* ---- Hero --------------------------------------------------------------- */
+  .hero { padding: 72px 0 44px; }
+  .hero-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 40px; align-items: center; }
+  @media (max-width: 840px) { .hero-grid { grid-template-columns: 1fr; gap: 24px; text-align: center; } }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 13px; font-weight: 600; color: var(--accent-hi);
+    background: rgba(59,142,255,.09); border: 1px solid rgba(59,142,255,.28);
+    padding: 6px 13px; border-radius: 999px; margin-bottom: 22px;
+  }
+  .badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px rgba(63,185,80,.2); }
+  h1 {
+    font-size: clamp(33px, 5.6vw, 56px); line-height: 1.05; letter-spacing: -.025em;
+    margin: 0 0 20px; font-weight: 800;
+    background: linear-gradient(180deg, #fff, #aebfd4);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .lede { font-size: clamp(16.5px, 2.2vw, 19px); color: var(--dim); max-width: 620px; margin: 0 0 30px; }
+  @media (max-width: 840px) { .lede { margin-left: auto; margin-right: auto; } }
+  .lede b { color: var(--text); font-weight: 600; }
+  .cta-row { display: flex; flex-wrap: wrap; gap: 14px; }
+  @media (max-width: 840px) { .cta-row { justify-content: center; } }
+  .btn {
+    display: inline-flex; align-items: center; gap: 9px;
+    padding: 13px 22px; border-radius: 12px; font-weight: 650; font-size: 15.5px;
+    border: 1px solid transparent; cursor: pointer; transition: filter .14s, box-shadow .14s, background .14s, border-color .14s, transform .09s;
+  }
+  .btn-primary { background: var(--accent); color: var(--accent-text); box-shadow: var(--shadow-glow); }
+  .btn-primary:hover { background: var(--accent-hi); box-shadow: 0 10px 28px rgba(59,142,255,.45); color: #fff; }
+  .btn-primary:active { transform: translateY(1px); }
+  .btn-ghost { background: var(--surface-alt); border-color: var(--border); color: var(--text); }
+  .btn-ghost:hover { border-color: var(--accent); background: var(--hover); color: var(--text); }
+
+  /* ---- Hero badge + sonar rings (echoes the medallion + clock-sync) ------- */
+  .badge-stage { position: relative; display: grid; place-items: center; min-height: 300px; }
+  .badge-stage img.medallion {
+    width: min(300px, 74vw); height: auto; position: relative; z-index: 2;
+    filter: drop-shadow(0 18px 46px rgba(0,0,0,.6)) drop-shadow(0 0 40px rgba(59,142,255,.28));
+  }
+  .ring {
+    position: absolute; top: 50%; left: 50%; width: 300px; height: 300px;
+    margin: -150px 0 0 -150px; border-radius: 50%;
+    border: 1.5px solid rgba(59,142,255,.5); z-index: 1;
+    animation: sonar 3.6s ease-out infinite; opacity: 0;
+  }
+  .ring:nth-child(2) { animation-delay: 1.2s; }
+  .ring:nth-child(3) { animation-delay: 2.4s; }
+  @keyframes sonar {
+    0%   { transform: scale(.55); opacity: .55; }
+    70%  { opacity: .12; }
+    100% { transform: scale(1.35); opacity: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) { .ring { animation: none; display: none; } }
+
+  /* ---- Architecture card -------------------------------------------------- */
+  .diagram { margin-top: 54px; }
+  .arch {
+    display: grid; grid-template-columns: 1fr auto 1fr; align-items: stretch;
+    border: 1px solid var(--border); border-radius: var(--r-card); overflow: hidden;
+    background: var(--glass-card); backdrop-filter: blur(14px) saturate(120%); -webkit-backdrop-filter: blur(14px) saturate(120%);
+  }
+  .arch .node { padding: 24px 26px; }
+  .arch .node h3 { margin: 0 0 6px; font-size: 12.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent-hi); }
+  .arch .node p { margin: 0; color: var(--dim); font-size: 14px; }
+  .arch .node .mono { color: var(--text); font-size: 12.5px; }
+  .arch .arrow {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 0 22px; border-left: 1px solid var(--border); border-right: 1px solid var(--border);
+    background: rgba(59,142,255,.06); color: var(--accent); min-width: 118px;
+  }
+  .arch .arrow .lbl { font-size: 11px; letter-spacing: .14em; color: var(--dim); margin-bottom: 4px; }
+  .arch .arrow .big { font-size: 26px; line-height: 1; }
+  .arch .arrow .sub { font-size: 11px; color: var(--dim); margin-top: 6px; text-align: center; }
+  @media (max-width: 720px) {
+    .arch { grid-template-columns: 1fr; }
+    .arch .arrow { flex-direction: row; gap: 10px; border-left: none; border-right: none; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 12px; min-width: 0; }
+    .arch .arrow .big { transform: rotate(90deg); }
+  }
+
+  /* ---- Sections ----------------------------------------------------------- */
+  section { padding: 60px 0; }
+  .section-head { max-width: 640px; margin-bottom: 38px; }
+  .section-head .k { color: var(--accent); font-weight: 700; font-size: 13px; letter-spacing: .1em; text-transform: uppercase; }
+  .section-head h2 { font-size: clamp(25px, 3.8vw, 34px); letter-spacing: -.02em; margin: 10px 0 12px; }
+  .section-head p { color: var(--dim); margin: 0; font-size: 16px; }
+
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  @media (max-width: 860px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  .feat {
+    background: var(--glass-card); backdrop-filter: blur(10px) saturate(120%); -webkit-backdrop-filter: blur(10px) saturate(120%);
+    border: 1px solid var(--border); border-radius: var(--r-card); padding: 24px;
+    transition: border-color .16s, transform .16s, box-shadow .16s;
+  }
+  .feat:hover { border-color: rgba(59,142,255,.55); transform: translateY(-3px); box-shadow: 0 14px 34px rgba(0,0,0,.35); }
+  .feat .ic {
+    width: 42px; height: 42px; border-radius: var(--r-ico); display: grid; place-items: center; font-size: 20px;
+    background: rgba(59,142,255,.12); border: 1px solid rgba(59,142,255,.28); margin-bottom: 15px;
+  }
+  .feat h3 { margin: 0 0 8px; font-size: 17px; letter-spacing: -.01em; }
+  .feat p { margin: 0; color: var(--dim); font-size: 14.5px; }
+  .feat code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; color: var(--accent-hi); background: rgba(59,142,255,.08); padding: 1px 5px; border-radius: 5px; }
+
+  /* ---- Steps -------------------------------------------------------------- */
+  .band { background: linear-gradient(180deg, transparent, rgba(59,142,255,.045), transparent); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+  .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  @media (max-width: 720px) { .steps { grid-template-columns: 1fr; } }
+  .step { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-card); padding: 24px; }
+  .step .n { font-size: 13px; font-weight: 800; color: var(--accent-text); background: var(--accent); width: 28px; height: 28px; border-radius: 9px; display: grid; place-items: center; margin-bottom: 14px; box-shadow: var(--shadow-glow); }
+  .step h3 { margin: 0 0 7px; font-size: 16.5px; }
+  .step p { margin: 0; color: var(--dim); font-size: 14.5px; }
+  .step code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; color: var(--accent-hi); }
+
+  /* ---- Get it ------------------------------------------------------------- */
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; align-items: center; }
+  @media (max-width: 820px) { .two { grid-template-columns: 1fr; gap: 28px; } }
+  .two ul { margin: 0; padding-left: 20px; color: var(--dim); }
+  .two li { margin: 9px 0; }
+  .two li b { color: var(--text); font-weight: 600; }
+  .two li code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; color: var(--accent-hi); }
+  .code {
+    background: #070a0f; border: 1px solid var(--border); border-radius: var(--r-card);
+    padding: 20px 22px; overflow-x: auto;
+    font-family: ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13.5px; line-height: 1.85; color: #cdd9ea;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.03), 0 12px 30px rgba(0,0,0,.35);
+  }
+  .code .c { color: #5b6b80; }
+  .code .f { color: var(--accent-hi); }
+  .code .p { color: var(--ok); }
+
+  /* ---- Footer ------------------------------------------------------------- */
+  footer { border-top: 1px solid var(--border); padding: 42px 0 60px; margin-top: 30px; color: var(--dim); }
+  .foot-grid { display: flex; flex-wrap: wrap; gap: 20px; justify-content: space-between; align-items: center; }
+  .foot-links { display: flex; gap: 22px; flex-wrap: wrap; }
+  .foot-links a { color: var(--dim); font-size: 14.5px; }
+  .foot-links a:hover { color: var(--text); }
+  .lic { font-size: 13px; color: #6f7c8d; margin-top: 18px; max-width: 760px; line-height: 1.6; }
+  .pill { display: inline-block; border: 1px solid rgba(59,142,255,.3); border-radius: 999px; padding: 3px 11px; font-size: 12.5px; color: var(--accent-hi); background: rgba(59,142,255,.08); }
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <span class="brand"><img src="branding/icon-64.png" alt="Newfoundsync badge" width="30" height="30" /> Newfoundsync</span>
+    <nav class="nav-links">
+      <a href="#features" class="hide-sm">Features</a>
+      <a href="#how" class="hide-sm">How it works</a>
+      <a href="#get">Get it</a>
+      <a class="nav-cta" href="https://github.com/ahurshey/newfoundsync">GitHub ↗</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <span class="badge"><span class="dot"></span> Free software · GPL-3.0 · no cloud, no accounts</span>
+      <h1>Your PC's sound, on every screen in the house — in perfect sync.</h1>
+      <p class="lede">
+        Newfoundsync turns one Windows PC into a <b>server</b> that streams its audio — and
+        optionally its screen — to every phone, tablet, laptop, or TV browser on your LAN.
+        No app to install: devices just <b>open a URL</b>, buffer a couple of seconds,
+        clock-sync, and play back in lock-step. <b>Sonos-like multi-room sync</b>, built in Rust.
+      </p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="https://github.com/ahurshey/newfoundsync">
+          <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          View on GitHub
+        </a>
+        <a class="btn btn-ghost" href="#how">See how it works ↓</a>
+      </div>
+    </div>
+    <div class="badge-stage" aria-hidden="true">
+      <span class="ring"></span><span class="ring"></span><span class="ring"></span>
+      <img class="medallion" src="branding/icon-512.png" alt="Newfoundsync — the Newfoundland badge" />
+    </div>
+  </div>
+
+  <div class="wrap diagram">
+    <div class="arch">
+      <div class="node">
+        <h3>Server · one Windows PC</h3>
+        <p>WASAPI captures your sound → Opus (48 kHz), PTS-stamped on a single monotonic
+        master clock → served over <span class="mono">HTTPS + WebSocket</span>, with optional
+        hardware <span class="mono">HEVC</span> screen video.</p>
+      </div>
+      <div class="arrow">
+        <span class="lbl">WSS</span>
+        <span class="big">→</span>
+        <span class="sub">one shared clock,<br>N devices</span>
+      </div>
+      <div class="node">
+        <h3>Every browser client</h3>
+        <p>Clock-syncs (NTP-style), buffers against jitter, decodes with
+        <span class="mono">WebCodecs</span>, and schedules each frame to a deadline so every
+        speaker emits the same sample at the same instant.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="k">Why it's nice</div>
+      <h2>Whole-home audio without the hardware.</h2>
+      <p>No proprietary speakers, no subscription, no telemetry — just your own machines on
+      your own network, kept in sync to the sample.</p>
+    </div>
+    <div class="grid">
+      <div class="feat">
+        <div class="ic">🌐</div>
+        <h3>No client install</h3>
+        <p>The "client" is a web page. Open <code>https://&lt;server&gt;:47000</code> on anything with a browser and it plays. A QR code in the server UI makes it scan-and-go.</p>
+      </div>
+      <div class="feat">
+        <div class="ic">🎯</div>
+        <h3>Tight, drift-corrected sync</h3>
+        <p>Every client schedules each frame against one shared clock — sub-millisecond offset on a LAN. A gentle drift nudge bounds long-run clock skew so rooms never wander apart.</p>
+      </div>
+      <div class="feat">
+        <div class="ic">🛡️</div>
+        <h3>Resilient over Wi-Fi</h3>
+        <p>A few-second jitter buffer over a reliable WebSocket rides out Wi-Fi stalls without gaps — trading a little startup latency for whole-home robustness.</p>
+      </div>
+      <div class="feat">
+        <div class="ic">🎚️</div>
+        <h3>Per-room tuning</h3>
+        <p>Master + per-device volume, plus a per-device sync trim (ms) to compensate for Bluetooth / HDMI / soundcard latency — by ear, or auto-calibrated by mic.</p>
+      </div>
+      <div class="feat">
+        <div class="ic">🎤</div>
+        <h3>Mic auto-calibration</h3>
+        <p>A device emits a coded spread-spectrum signal and listens on its own mic to measure and correct its real speaker→ear offset. "Calibrate all" aligns several devices at once.</p>
+      </div>
+      <div class="feat">
+        <div class="ic">🖥️</div>
+        <h3>Optional screen video</h3>
+        <p>Share the screen alongside audio: hardware <b>HEVC</b> (GPU) with an <b>H.264</b> software fallback, decoded via WebCodecs and kept aligned to the same master clock.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how" class="band">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="k">How it works</div>
+      <h2>Three steps to a synced room.</h2>
+    </div>
+    <div class="steps">
+      <div class="step">
+        <div class="n">1</div>
+        <h3>Run the server</h3>
+        <p>Launch <code>newfoundsync</code> on a Windows PC. Pick a source — all apps, one window, or full system output — and optionally enable screen video. It captures, encodes, and serves a tiny web app.</p>
+      </div>
+      <div class="step">
+        <div class="n">2</div>
+        <h3>Open the URL</h3>
+        <p>On any device, browse to the server's address (or scan its QR). Accept the one-time self-signed certificate — browsers only expose WebCodecs in a secure context, even on a LAN.</p>
+      </div>
+      <div class="step">
+        <div class="n">3</div>
+        <h3>Tap Start</h3>
+        <p>The client clock-syncs, fills its buffer, and joins. Add more devices and they all land the same sample together. Tune volume and sync per room from the server's mixer.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="get">
+  <div class="wrap">
+    <div class="two">
+      <div>
+        <div class="section-head" style="margin-bottom:22px">
+          <div class="k">Get it</div>
+          <h2>Build from source.</h2>
+          <p>Newfoundsync is a Rust Cargo workspace. The web client is embedded into the
+          binary, so there's no separate front-end build.</p>
+        </div>
+        <ul>
+          <li>Needs <b>Rust</b> (stable) and, for the Opus codec, a <b>C toolchain + CMake</b> (vendored libopus builds at compile time).</li>
+          <li><b>Capture is Windows-only today</b> (WASAPI loopback + Media Foundation video). The browser client works everywhere; a Linux server is a planned port.</li>
+          <li>Binary lands at <code>target/release/newfoundsync.exe</code>.</li>
+        </ul>
+        <p style="margin-top:22px"><a class="btn btn-primary" href="https://github.com/ahurshey/newfoundsync">Full README &amp; source ↗</a></p>
+      </div>
+      <div>
+        <div class="code"><span class="c"># clone &amp; build</span>
+git clone https://github.com/ahurshey/newfoundsync
+cd newfoundsync
+cargo build <span class="f">--release</span>
+
+<span class="c"># run the GUI server…</span>
+newfoundsync
+
+<span class="c"># …or headless from flags</span>
+newfoundsync <span class="f">--headless</span> <span class="f">--video</span> <span class="f">--fps</span> <span class="p">60</span>
+</div>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-grid">
+      <span class="brand" style="font-size:15px"><img src="branding/icon-64.png" alt="" width="26" height="26" /> Newfoundsync</span>
+      <div class="foot-links">
+        <a href="https://github.com/ahurshey/newfoundsync">GitHub</a>
+        <a href="https://github.com/ahurshey/newfoundsync/blob/main/README.md">README</a>
+        <a href="https://github.com/ahurshey/newfoundsync/blob/main/LICENSE">License</a>
+        <a href="#features">Features</a>
+      </div>
+    </div>
+    <p class="lic">
+      <span class="pill">GPL-3.0-or-later</span>
+      &nbsp;Newfoundsync is free software licensed under the GNU General Public License,
+      version 3 or later. Copyright © 2026 Alex Hurshman and the Newfoundsync contributors.
+      A trusted-LAN tool — no accounts, no cloud, no internet-facing operation.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>

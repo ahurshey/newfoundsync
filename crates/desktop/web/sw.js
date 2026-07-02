@@ -9,7 +9,7 @@
 // The audio/video stream and clock-sync travel over the WebSocket (/ws), which service
 // workers never intercept — so streaming is completely unaffected by this file.
 
-const CACHE = "nfs-shell-v3"; // bump on any shell change → activate() purges the stale precache
+const CACHE = "nfs-shell-v4"; // bump on any shell change → activate() purges the stale precache
 const SHELL = ["/", "/app.js", "/manifest.webmanifest", "/icon-128.png", "/icon-256.png", "/icon-512.png", "/icon-512-maskable.png", "/favicon.png"];
 
 self.addEventListener("install", (e) => {

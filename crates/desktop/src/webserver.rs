@@ -33,6 +33,34 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const SERVICE_WORKER: &str = include_str!("../web/sw.js");
 const MANIFEST: &str = include_str!("../web/manifest.webmanifest");
+
+/// A content build tag — FNV-1a hash of the served shell (app.js + index.html). It changes whenever
+/// either file changes, so a browser running a STALE (service-worker-cached) shell can detect the
+/// mismatch against `/version` and self-heal (drop the SW + caches, reload to fresh code). This is
+/// what stops a plain refresh from stranding a client on a mismatched build. Computed once.
+fn build_tag() -> &'static str {
+    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TAG.get_or_init(|| {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+        for &b in APP_JS.as_bytes().iter().chain(INDEX_HTML.as_bytes()) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a prime
+        }
+        format!("{h:016x}")
+    })
+    .as_str()
+}
+
+/// The shell files with the `__NFS_BUILD__` placeholder stamped with the current build tag, so each
+/// carries the version its client-side self-heal check compares against. Substituted once at startup.
+fn index_body() -> &'static str {
+    static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    S.get_or_init(|| INDEX_HTML.replace("__NFS_BUILD__", build_tag())).as_str()
+}
+fn app_js_body() -> &'static str {
+    static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    S.get_or_init(|| APP_JS.replace("__NFS_BUILD__", build_tag())).as_str()
+}
 // Branding (the Newfoundland badge) — shared with the exe/GUI icon.
 const FAVICON_PNG: &[u8] = include_bytes!("../../../branding/icon-32.png");
 const ICON_128_PNG: &[u8] = include_bytes!("../../../branding/icon-128.png");
@@ -257,6 +285,7 @@ pub async fn run(
         .route("/", get(index))
         .route("/status", get(status)) // headless-friendly live view of connected clients
         .route("/app.js", get(app_js))
+        .route("/version", get(version)) // content build tag — the client self-heals a stale cached shell
         .route("/sw.js", get(service_worker))
         .route("/manifest.webmanifest", get(manifest))
         .route("/favicon.png", get(favicon_png))
@@ -306,7 +335,7 @@ async fn index() -> impl IntoResponse {
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        INDEX_HTML,
+        index_body(),
     )
 }
 
@@ -316,7 +345,19 @@ async fn app_js() -> impl IntoResponse {
             (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        APP_JS,
+        app_js_body(),
+    )
+}
+
+/// The current content build tag (plain text). The client fetches this on load and, if it differs
+/// from the tag stamped into the running app.js/index.html, drops the SW + caches and reloads.
+async fn version() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        build_tag(),
     )
 }
 

@@ -329,6 +329,35 @@ if (location.search.toLowerCase().includes("reset")) {
   })();
 }
 
+// ---- Stale-shell self-heal (build handshake) --------------------------------
+// The server stamps a content build tag into app.js (NFS_BUILD, below) and into index.html
+// (window.__NFS_BUILD), and serves the CURRENT tag at /version. If a service worker handed us a
+// stale cached shell, our stamped tag won't match /version → drop the SW + caches and reload to
+// fresh code. THIS is why a plain refresh could previously strand the client on a mismatched build.
+// Runs early + async, so it still fires even if the (stale) rest of init throws before finishing.
+const NFS_BUILD = "__NFS_BUILD__"; // replaced with the build tag by the server at serve time
+(function verifyBuild() {
+  fetch("/version", { cache: "no-store" })
+    .then((r) => (r.ok ? r.text() : null))
+    .then((v) => {
+      if (v == null) return;
+      v = v.trim();
+      if (!v) return;
+      const idxTag = typeof window.__NFS_BUILD === "string" ? window.__NFS_BUILD : v;
+      if (v === NFS_BUILD && v === idxTag) return; // fresh: both app.js AND index.html match the server
+      // Stale shell → self-heal, but throttle so a persistent mismatch can't loop-reload forever.
+      const last = +(sessionStorage.getItem("nfs_healed_at") || 0);
+      if (Date.now() - last < 15000) { console.warn("stale shell but recently self-healed — not looping"); return; }
+      try { sessionStorage.setItem("nfs_healed_at", String(Date.now())); } catch (e) {}
+      (async () => {
+        try { if (navigator.serviceWorker) { for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister(); } } catch (e) {}
+        try { if (window.caches) { for (const k of await caches.keys()) await caches.delete(k); } } catch (e) {}
+        location.reload(); // fresh app.js/index.html; keeps localStorage (settings/volume)
+      })();
+    })
+    .catch(() => {}); // offline / older server without /version → leave the client as-is
+})();
+
 // Register the SW (network-first — see sw.js — so it never serves stale code while the server is
 // reachable) and auto-heal: if a NEW build activates while this page is open, reload to pick it up.
 // Guarded so it never loops, never fires on first install, and never interrupts active playback.

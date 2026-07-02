@@ -14,6 +14,7 @@
 <link rel="apple-touch-icon" href="/icon-256.png" />
 <title>Newfoundsync</title>
 <script>/* apply the saved theme before first paint so there's no flash of the wrong theme */try{if(localStorage.getItem("nfs_theme")==="light")document.documentElement.classList.add("light");}catch(e){}</script>
+<script>/* build tag the server stamps in; app.js compares it + its own to /version and self-heals a stale service-worker shell */window.__NFS_BUILD="__NFS_BUILD__";</script>
 <style>
   /* ---- Harbour Glass design tokens ---------------------------------------- */
   :root {

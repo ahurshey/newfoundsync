@@ -1403,20 +1403,14 @@ impl ServerApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Codec:").on_hover_text(
-                            "AV1 = royalty-free (SVT-AV1 on the CPU, or your GPU's AV1 encoder if it \
-                             has one) — the clean-to-distribute default. HEVC (H.265) = GPU hardware \
-                             encode, best quality-per-bit and lightest on the CPU, but patent-encumbered \
-                             and not every browser decodes it (Firefox can't).",
+                            "AV1 — royalty-free (SVT-AV1 on the CPU, or your GPU's AV1 encoder if it \
+                             has one). The only video codec the server encodes; HEVC and H.264 were \
+                             removed so the distributed binary carries no patent-encumbered codec.",
                         );
-                        // Codec ⟺ backend here: HEVC = GPU HEVC (enc_idx 0 = "auto"); AV1 = enc_idx 2 =
-                        // "av1" (GPU AV1 where the hardware supports it, else CPU SVT-AV1).
-                        let is_av1 = self.enc_idx == 2;
-                        egui::ComboBox::from_id_salt("codec")
-                            .selected_text(if is_av1 { "AV1 · royalty-free" } else { "HEVC (H.265) · GPU" })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.enc_idx, 0, "HEVC (H.265) · GPU");
-                                ui.selectable_value(&mut self.enc_idx, 2, "AV1 · royalty-free");
-                            });
+                        // AV1 is the only server video codec now. Keep enc_idx on the AV1 slot so the
+                        // rest of the wiring (which still carries an EncoderBackend) stays consistent.
+                        self.enc_idx = 2;
+                        ui.label("AV1 · royalty-free");
                     });
                     ui.horizontal(|ui| {
                         ui.label("Quality:");

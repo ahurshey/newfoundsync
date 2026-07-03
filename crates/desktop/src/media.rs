@@ -273,18 +273,12 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         frame_rate: fps,
         buffer_ms: opts.buffer_ms,
         // Codec advertised to clients (they pick the matching WebCodecs decoder). A *web-uplink*
-        // caster always sends H.264 ("avc1"; browsers H.264-encode far more reliably). Otherwise it
-        // follows the server encoder: AV1 ("av01", self-describing OBUs) for the royalty-free path,
-        // else Main-profile HEVC ("hev1" =
-        // params in-band, level 5.1 covers up to 4K; decoder reads params from the in-band VPS/SPS/PPS).
-        video_codec: if !video_on {
-            "hev1.1.6.L153.B0"
-        } else if web_uplink {
+        // caster sends H.264 ("avc1"; browsers H.264-encode far more reliably); every native
+        // server source is AV1 ("av01", self-describing OBUs) — the royalty-free codec.
+        video_codec: if web_uplink {
             "avc1.42E01F"
-        } else if matches!(opts.encoder, EncoderBackend::Av1) {
-            "av01.0.04M.08"
         } else {
-            "hev1.1.6.L153.B0"
+            "av01.0.04M.08"
         },
     };
 
@@ -379,7 +373,7 @@ impl VideoProducer {
         lead_ns: i64,
         tx: broadcast::Sender<Frame>,
     ) -> Result<VideoProducer> {
-        use crate::video::capture::{CapturedFrame, GpuParams, ScreenCapture};
+        use crate::video::capture::{CapturedFrame, ScreenCapture};
         use crate::video::codec::VideoEncoder;
         use rayon::prelude::*;
 
@@ -389,23 +383,14 @@ impl VideoProducer {
         let fps = cfg.fps.value();
         let bitrate = cfg.suggested_bitrate_kbps();
 
-        // Try the GPU zero-copy fast-lane unless AV1 is selected (AV1 uses the system-memory MF/SVT path). It's built inside the
-        // capture callback (the only place the WGC device/context are valid); if it can't init
-        // there it silently degrades to the CPU slot path below — which is why we still spawn
-        // the producer thread and create its system-memory encoder LAZILY (only if a frame ever
-        // reaches the slot, i.e. only when the GPU lane is NOT handling frames).
-        let gpu = if encoder_backend == EncoderBackend::Av1 {
-            None
-        } else {
-            Some(GpuParams { tx: tx.clone(), lead_ns, dw, dh, fps, bitrate_kbps: bitrate })
-        };
-
+        // All video now encodes from system-memory BGRA (AV1 via SVT-AV1, or the GPU's AV1 MFT
+        // internally). The HEVC-only GPU zero-copy fast-lane was removed with HEVC.
         let capture = match target {
             VideoTarget::PrimaryMonitor => {
-                ScreenCapture::start_primary(gpu).context("start screen capture")?
+                ScreenCapture::start_primary().context("start screen capture")?
             }
             VideoTarget::Window { hwnd } => {
-                ScreenCapture::start_window(hwnd, gpu).context("start window capture")?
+                ScreenCapture::start_window(hwnd).context("start window capture")?
             }
         };
         let slot = capture.slot.clone();

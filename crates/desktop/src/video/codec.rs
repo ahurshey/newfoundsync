@@ -157,14 +157,12 @@ pub enum VideoEncoder {
     Av1Cpu(Av1Encoder),
     #[cfg(target_os = "windows")]
     Av1Gpu(crate::video::mf_encoder::MfEncoder),
-    #[cfg(target_os = "windows")]
-    Hardware(crate::video::mf_encoder::MfEncoder),
 }
 
 impl VideoEncoder {
-    /// Build the video encoder from the selected backend:
-    /// - `Av1` → hardware AV1 (Media Foundation) where the GPU has an AV1 encoder, else software SVT-AV1.
-    /// - `Auto` / `Hardware` → GPU HEVC (Media Foundation, Windows-only; HEVC has no software encoder).
+    /// Build the video encoder: hardware AV1 (Media Foundation) where the GPU has an AV1
+    /// encoder, otherwise software SVT-AV1. `backend` is retained for CLI/GUI wiring; AV1 is the
+    /// only video codec the server encodes natively now (HEVC/H.264 were removed).
     pub fn new(
         backend: EncoderBackend,
         width: u32,
@@ -172,37 +170,23 @@ impl VideoEncoder {
         fps: u32,
         bitrate_kbps: u32,
     ) -> Result<VideoEncoder> {
-        if backend == EncoderBackend::Av1 {
-            // AV1 (royalty-free). Prefer a hardware AV1 encoder (Media Foundation) where the GPU
-            // has one; otherwise fall back to software SVT-AV1. Same "av01" stream either way.
-            #[cfg(target_os = "windows")]
-            {
-                match crate::video::mf_encoder::MfEncoder::new_av1(width, height, fps, bitrate_kbps) {
-                    Ok(hw) => {
-                        tracing::info!("video: GPU AV1 (Media Foundation) encoder active");
-                        return Ok(VideoEncoder::Av1Gpu(hw));
-                    }
-                    Err(e) => tracing::info!("video: no GPU AV1 encoder ({e:#}); using software SVT-AV1"),
-                }
-            }
-            let e = Av1Encoder::new(width, height, fps, bitrate_kbps)
-                .context("software AV1 (SVT-AV1) encoder")?;
-            tracing::info!("video: CPU AV1 (SVT-AV1) encoder active");
-            return Ok(VideoEncoder::Av1Cpu(e));
-        }
-        // Auto / Hardware → GPU HEVC.
+        let _ = backend;
+        // AV1 (royalty-free). Prefer a hardware AV1 encoder (Media Foundation) where the GPU has
+        // one; otherwise fall back to software SVT-AV1. Same "av01" stream either way.
         #[cfg(target_os = "windows")]
         {
-            let hw = crate::video::mf_encoder::MfEncoder::new(width, height, fps, bitrate_kbps)
-                .context("GPU (Media Foundation) HEVC encoder — HEVC has no software encoder; pick the AV1 codec for software (CPU) encode")?;
-            tracing::info!("video: GPU HEVC encoder active");
-            Ok(VideoEncoder::Hardware(hw))
+            match crate::video::mf_encoder::MfEncoder::new_av1(width, height, fps, bitrate_kbps) {
+                Ok(hw) => {
+                    tracing::info!("video: GPU AV1 (Media Foundation) encoder active");
+                    return Ok(VideoEncoder::Av1Gpu(hw));
+                }
+                Err(e) => tracing::info!("video: no GPU AV1 encoder ({e:#}); using software SVT-AV1"),
+            }
         }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = (width, height, fps, bitrate_kbps);
-            anyhow::bail!("HEVC video requires Windows (Media Foundation); select the AV1 codec for software encode")
-        }
+        let e = Av1Encoder::new(width, height, fps, bitrate_kbps)
+            .context("software AV1 (SVT-AV1) encoder")?;
+        tracing::info!("video: CPU AV1 (SVT-AV1) encoder active");
+        Ok(VideoEncoder::Av1Cpu(e))
     }
 
     pub fn encode_bgra(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
@@ -210,8 +194,6 @@ impl VideoEncoder {
             VideoEncoder::Av1Cpu(e) => e.encode_bgra(bgra),
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(e) => e.encode_bgra(bgra),
-            #[cfg(target_os = "windows")]
-            VideoEncoder::Hardware(e) => e.encode_bgra(bgra),
         }
     }
 
@@ -220,23 +202,17 @@ impl VideoEncoder {
             VideoEncoder::Av1Cpu(e) => e.force_keyframe(),
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(e) => e.force_keyframe(),
-            #[cfg(target_os = "windows")]
-            VideoEncoder::Hardware(e) => e.force_keyframe(),
         }
     }
 
     /// True if this emitted access unit is a keyframe the browser can start/recover decoding
-    /// from. Codec-aware: HEVC (IRAP = NAL types 16..=23, 2-byte header) and AV1 (a Sequence
-    /// Header OBU — type 1 — rides with each keyframe temporal unit). One scan across codecs
-    /// would misdetect and leave the client stuck. (H.264 IDR detection for the web-cast relay
-    /// lives in `annexb_has_h264_idr`.)
+    /// from — for AV1, a Sequence Header OBU (type 1) rides with each keyframe temporal unit.
+    /// (H.264 IDR detection for the web-cast relay lives in `annexb_has_h264_idr`.)
     pub fn is_keyframe(&self, au: &[u8]) -> bool {
         match self {
             VideoEncoder::Av1Cpu(_) => obu_has_av1_keyframe(au),
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(_) => obu_has_av1_keyframe(au),
-            #[cfg(target_os = "windows")]
-            VideoEncoder::Hardware(_) => annexb_has_hevc_irap(au),
         }
     }
 
@@ -246,8 +222,6 @@ impl VideoEncoder {
             VideoEncoder::Av1Cpu(_) => "CPU (SVT-AV1)",
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(_) => "GPU AV1 (Media Foundation)",
-            #[cfg(target_os = "windows")]
-            VideoEncoder::Hardware(_) => "GPU HEVC (Media Foundation)",
         }
     }
 }
@@ -261,24 +235,6 @@ pub fn annexb_has_h264_idr(au: &[u8]) -> bool {
     while i + 3 < au.len() {
         if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
             if au[i + 3] & 0x1f == 5 {
-                return true;
-            }
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    false
-}
-
-/// HEVC: 2-byte NAL header; nal_type = (byte0 >> 1) & 0x3f; IRAP (BLA/IDR/CRA) = 16..=23.
-#[cfg(target_os = "windows")]
-fn annexb_has_hevc_irap(au: &[u8]) -> bool {
-    let mut i = 0usize;
-    while i + 3 < au.len() {
-        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
-            let t = (au[i + 3] >> 1) & 0x3f;
-            if (16..=23).contains(&t) {
                 return true;
             }
             i += 3;

@@ -114,17 +114,22 @@ pub enum EncoderBackend {
     Hardware,
     /// CPU/software encode (openh264). Works everywhere.
     Cpu,
+    /// AV1 encode (royalty-free): GPU via Media Foundation where the hardware
+    /// supports it (Intel Arc/Xe, NVIDIA RTX 40+, AMD RX 7000+), else CPU
+    /// (SVT-AV1). The intended distribution default.
+    Av1,
 }
 
 impl EncoderBackend {
-    pub const ALL: [EncoderBackend; 3] =
-        [EncoderBackend::Auto, EncoderBackend::Hardware, EncoderBackend::Cpu];
+    pub const ALL: [EncoderBackend; 4] =
+        [EncoderBackend::Auto, EncoderBackend::Hardware, EncoderBackend::Cpu, EncoderBackend::Av1];
 
     pub fn label(self) -> &'static str {
         match self {
             EncoderBackend::Auto => "Auto",
             EncoderBackend::Hardware => "Hardware (GPU)",
             EncoderBackend::Cpu => "CPU (software)",
+            EncoderBackend::Av1 => "AV1 (GPU/CPU)",
         }
     }
 
@@ -133,6 +138,7 @@ impl EncoderBackend {
             EncoderBackend::Auto => "auto",
             EncoderBackend::Hardware => "hardware",
             EncoderBackend::Cpu => "cpu",
+            EncoderBackend::Av1 => "av1",
         }
     }
 
@@ -141,6 +147,7 @@ impl EncoderBackend {
             "auto" => Some(EncoderBackend::Auto),
             "hardware" | "hw" | "gpu" => Some(EncoderBackend::Hardware),
             "cpu" | "software" | "sw" => Some(EncoderBackend::Cpu),
+            "av1" | "svt-av1" | "svtav1" => Some(EncoderBackend::Av1),
             _ => None,
         }
     }

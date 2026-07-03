@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
 
-//! GPU hardware HEVC (H.265) encoder via Windows Media Foundation.
+//! GPU hardware video encoder via Windows Media Foundation — HEVC (H.265) or AV1.
 //!
-//! Enumerates the system's hardware HEVC encoder MFT (AMD AMF / NVIDIA NVENC /
-//! Intel QuickSync — whatever the GPU exposes), drives it as an async MFT, and
-//! exposes the same `encode_bgra`/`force_keyframe` API as the software encoder.
-//! Input is system-memory NV12 (converted from the captured BGRA); output is an
-//! Annex-B HEVC elementary stream the browser's WebCodecs decoder reads.
+//! Enumerates the system's hardware encoder MFT for the requested codec (AMD AMF /
+//! NVIDIA NVENC / Intel QuickSync — whatever the GPU exposes), drives it as an async
+//! MFT, and exposes the same `encode_bgra`/`force_keyframe` API as the software
+//! encoders. Input is system-memory NV12 (converted from the captured BGRA); output
+//! is the codec's elementary stream the browser's WebCodecs decoder reads (HEVC
+//! Annex-B, or AV1 low-overhead OBU). AV1 MFTs exist only on newer GPUs (Intel
+//! Arc/Xe, NVIDIA RTX 40+, AMD RX 7000+); `new_av1` errors otherwise so the caller
+//! falls back to the software SVT-AV1 encoder.
 //!
 //! The encoder is created and used entirely on the video-encode thread, so the
 //! COM objects never cross threads.
@@ -23,7 +26,7 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::VARIANT;
 
-pub struct MfHevcEncoder {
+pub struct MfEncoder {
     transform: IMFTransform,
     events: IMFMediaEventGenerator,
     width: u32,
@@ -36,13 +39,13 @@ pub struct MfHevcEncoder {
     _dxgi_manager: Option<IMFDXGIDeviceManager>,
 }
 
-impl MfHevcEncoder {
-    /// System-memory encoder (CPU NV12 → encode_bgra). The fallback path.
+impl MfEncoder {
+    /// System-memory HEVC encoder (CPU NV12 → encode_bgra). The fallback path.
     pub fn new(width: u32, height: u32, fps: u32, bitrate_kbps: u32) -> Result<Self> {
-        Self::build(width, height, fps, bitrate_kbps, None)
+        Self::build(width, height, fps, bitrate_kbps, None, MFVideoFormat_HEVC, true)
     }
 
-    /// D3D11-aware encoder bound to `device`: feed GPU NV12 textures via encode_texture (zero-copy).
+    /// D3D11-aware HEVC encoder bound to `device`: feed GPU NV12 textures via encode_texture (zero-copy).
     pub fn new_d3d(
         width: u32,
         height: u32,
@@ -50,7 +53,14 @@ impl MfHevcEncoder {
         bitrate_kbps: u32,
         device: &ID3D11Device,
     ) -> Result<Self> {
-        Self::build(width, height, fps, bitrate_kbps, Some(device))
+        Self::build(width, height, fps, bitrate_kbps, Some(device), MFVideoFormat_HEVC, true)
+    }
+
+    /// System-memory **AV1** encoder — uses the GPU's hardware AV1 encoder MFT where the
+    /// machine has one (Intel Arc/Xe, NVIDIA RTX 40+, AMD RX 7000+). Errors if no AV1
+    /// encoder MFT is present, so the caller can fall back to software (SVT-AV1).
+    pub fn new_av1(width: u32, height: u32, fps: u32, bitrate_kbps: u32) -> Result<Self> {
+        Self::build(width, height, fps, bitrate_kbps, None, MFVideoFormat_AV1, false)
     }
 
     fn build(
@@ -59,6 +69,8 @@ impl MfHevcEncoder {
         fps: u32,
         bitrate_kbps: u32,
         d3d: Option<&ID3D11Device>,
+        subtype: windows::core::GUID,
+        hevc_profile: bool,
     ) -> Result<Self> {
         // HEVC wants even dimensions; our presets already are.
         if width % 2 != 0 || height % 2 != 0 {
@@ -71,7 +83,7 @@ impl MfHevcEncoder {
             // Find a HARDWARE HEVC (H.265) encoder MFT.
             let out_info = MFT_REGISTER_TYPE_INFO {
                 guidMajorType: MFMediaType_Video,
-                guidSubtype: MFVideoFormat_HEVC,
+                guidSubtype: subtype,
             };
             let flags = MFT_ENUM_FLAG(
                 MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0,
@@ -88,7 +100,7 @@ impl MfHevcEncoder {
             )
             .context("MFTEnumEx")?;
             if count == 0 || activates.is_null() {
-                bail!("no hardware HEVC encoder MFT on this system (GPU may not support HEVC encode)");
+                bail!("no hardware video encoder MFT for the requested codec on this system (the GPU may not support encoding it)");
             }
             let slice = std::slice::from_raw_parts(activates, count as usize);
             let transform: IMFTransform = match slice[0].as_ref() {
@@ -141,13 +153,16 @@ impl MfHevcEncoder {
             // Output type FIRST (required for encoders).
             let out = MFCreateMediaType().context("MFCreateMediaType(out)")?;
             out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_HEVC)?;
+            out.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
             out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_kbps.saturating_mul(1000))?;
             out.SetUINT64(&MF_MT_FRAME_SIZE, frame_size)?;
             out.SetUINT64(&MF_MT_FRAME_RATE, frame_rate)?;
             out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-            // HEVC Main profile, 8-bit 4:2:0 (matches the NV12 input).
-            out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)?;
+            // HEVC Main profile, 8-bit 4:2:0 (matches the NV12 input). AV1 defaults to
+            // Main profile (av01.0…), so we skip the profile attribute for it.
+            if hevc_profile {
+                out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)?;
+            }
             out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, par)?;
             // ~2-second GOP so late joiners / frame-droppers recover without a
             // back-channel (matches the server's periodic-keyframe cadence).
@@ -188,7 +203,7 @@ impl MfHevcEncoder {
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
 
-            Ok(MfHevcEncoder {
+            Ok(MfEncoder {
                 transform,
                 events,
                 width,
@@ -369,7 +384,7 @@ impl MfHevcEncoder {
     }
 }
 
-impl Drop for MfHevcEncoder {
+impl Drop for MfEncoder {
     fn drop(&mut self) {
         unsafe {
             let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
@@ -392,7 +407,7 @@ mod tests {
     #[ignore = "needs a GPU H.264 encoder; run alone"]
     fn mf_encode_openh264_decode_roundtrip() {
         let (w, h) = (640u32, 480u32);
-        let mut enc = match MfHevcEncoder::new(w, h, 30, 4000) {
+        let mut enc = match MfEncoder::new(w, h, 30, 4000) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("skipping: no hardware encoder ({e:#})");

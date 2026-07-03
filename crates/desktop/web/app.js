@@ -1201,7 +1201,8 @@ async function setupDecoders(c) {
     const probe = { codec: c.videoCodec || "hev1.1.6.L153.B0", optimizeForLatency: true };
     const r = await VideoDecoder.isConfigSupported(probe).catch(() => null);
     if (r && !r.supported) {
-      const fam = (c.videoCodec || "").slice(0, 4) === "avc1" ? "H.264" : "HEVC/H.265";
+      const cc4 = (c.videoCodec || "").slice(0, 4);
+      const fam = cc4 === "avc1" ? "H.264" : cc4 === "av01" ? "AV1" : "HEVC/H.265";
       showWarn("⚠ This device can't decode the video codec (" + fam + "). Audio will still play.");
     } else {
       els.fsbtn.style.display = "flex";
@@ -1230,7 +1231,7 @@ async function setupDecoders(c) {
 
 let vDecErrStreak = 0;
 let vGoodRun = 0; // consecutive good frames since the last error (gates clearing the streak)
-let videoAvccMode = false; // true when decoding a browser cast's H.264 via AVCC + description (vs in-band Annex-B HEVC)
+let videoAvccMode = false; // true when decoding a browser cast's H.264 via AVCC + description (vs raw in-band HEVC Annex-B / AV1 OBU)
 function onDecErr(kind, e) {
   console.error(kind + " decode error", e);
   if (kind === "video") {
@@ -1303,8 +1304,9 @@ function onVideoChunk(tsUs, key, annexb) {
         }
       }
     } else {
-      // HEVC straight from Annex-B (native server source): configure WITHOUT a description, so the
-      // decoder reads VPS/SPS/PPS from the in-band keyframe and we feed raw Annex-B access units.
+      // HEVC (Annex-B, in-band VPS/SPS/PPS) or AV1 (self-describing low-overhead OBUs) from a native
+      // server source: configure WITHOUT a `description` and feed the raw access units as-is. Both
+      // codecs carry everything the decoder needs in the bitstream, so no avcC/hvcC blob is built.
       const vcfg = {
         codec: codecStr,
         optimizeForLatency: true,
@@ -1324,7 +1326,8 @@ function onVideoChunk(tsUs, key, annexb) {
           videoAvccMode = false;
           gotParams = true;
         } catch (e2) {
-          showWarn("⚠ Video decoder couldn't start — this device may not support HEVC/H.265. Audio still plays. (" + e2.message + ")");
+          const famLabel = codecStr.slice(0, 4) === "av01" ? "AV1" : "HEVC/H.265";
+          showWarn("⚠ Video decoder couldn't start — this device may not support " + famLabel + ". Audio still plays. (" + e2.message + ")");
           return;
         }
       }

@@ -272,12 +272,18 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         video: video_on,
         frame_rate: fps,
         buffer_ms: opts.buffer_ms,
-        // Native GPU MF capture emits Main-profile HEVC ("hev1" = params in-band, level 5.1 covers
-        // up to 4K; decoder reads exact params from the in-band VPS/SPS/PPS). We advertise H.264
-        // ("avc1"; clients switch to the AVCC decode path) in two cases: a *web-uplink* caster
-        // (browsers H.264-encode far more reliably than HEVC), and a native source whose operator
-        // picked the H.264 codec (software openh264 = EncoderBackend::Cpu).
-        video_codec: if video_on && (web_uplink || matches!(opts.encoder, EncoderBackend::Cpu)) {
+        // Codec advertised to clients (they pick the matching WebCodecs decoder). A *web-uplink*
+        // caster always sends H.264 ("avc1"; browsers H.264-encode far more reliably). Otherwise it
+        // follows the server encoder: AV1 ("av01", self-describing OBUs) for the royalty-free path,
+        // H.264 ("avc1", AVCC decode path) for software openh264, else Main-profile HEVC ("hev1" =
+        // params in-band, level 5.1 covers up to 4K; decoder reads params from the in-band VPS/SPS/PPS).
+        video_codec: if !video_on {
+            "hev1.1.6.L153.B0"
+        } else if web_uplink {
+            "avc1.42E01F"
+        } else if matches!(opts.encoder, EncoderBackend::Av1) {
+            "av01.0.04M.08"
+        } else if matches!(opts.encoder, EncoderBackend::Cpu) {
             "avc1.42E01F"
         } else {
             "hev1.1.6.L153.B0"

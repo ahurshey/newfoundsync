@@ -4,7 +4,7 @@
 //! Newfoundsync server (web client edition).
 //!
 //! Captures this PC's audio (and optionally the screen), encodes it (Opus +
-//! H.264 / GPU), and serves a web client over HTTP. Browsers on the LAN open
+//! AV1/VP9), and serves a web client over HTTP. Browsers on the LAN open
 //! `http://<this-pc>:47000`, buffer a few seconds, clock-sync, and play in
 //! lock-step. The browser is the client; this app is the source picker + server.
 //!

@@ -15,7 +15,7 @@ port); the client is any modern browser.
 ┌──────────────── server (this PC) ────────────────┐        ┌──────── browser client ────────┐
 │ WASAPI capture → Opus 48k/20ms, PTS-stamped on a  │  WSS   │ clock-sync → jitter buffer →    │
 │ monotonic master clock → axum HTTPS + WebSocket   │ ─────▶ │ WebCodecs decode → Web Audio    │  ×N, all
-│ fan-out  (+ optional HEVC screen video)           │        │ deadline-scheduled playout      │  in sync
+│ fan-out  (+ optional AV1/VP9 screen video)        │        │ deadline-scheduled playout      │  in sync
 └───────────────────────────────────────────────────┘        └─────────────────────────────────┘
 ```
 
@@ -59,9 +59,9 @@ port); the client is any modern browser.
   offset. **Calibrate all** orchestrates several devices at once (distinct codes + TDMA
   slots so their self-tests don't collide). Each client reports its measured sync back to
   the server so the mixer shows every device's *actual* offset.
-- **Optional screen video.** Share the screen alongside audio: hardware **HEVC** (Media
-  Foundation, GPU) with an **H.264** (openh264) CPU fallback, decoded via WebCodecs and
-  kept aligned to the same master clock.
+- **Optional screen video.** Share the screen alongside audio: royalty-free **AV1** (GPU
+  via Media Foundation where the hardware supports it, else CPU SVT-AV1) with a **VP9**
+  (libvpx, CPU) fallback, decoded via WebCodecs and kept aligned to the same master clock.
 
 ## The server app
 
@@ -70,7 +70,7 @@ Run with **no flags** for the GUI; `--headless` runs server-only from the flags.
 **GUI**
 - **Connect strip** — the `https://…:47000` URL, a **Copy/Open** button, and a scannable **QR**.
 - **Audio / Video / Buffer** — pick the source, optional screen video (resolution, fps,
-  quality, GPU/CPU encoder), and the buffer depth (**Snappy 1 s / Balanced 3 s / Rock-solid
+  quality, **AV1 / VP9** encoder), and the buffer depth (**Snappy 1 s / Balanced 3 s / Rock-solid
   6 s**, slider up to 15 s). Hit **Apply** to switch the live stream.
 - **Connected Clients mixer** — **master** volume + per-client **volume**, **sync**,
   **mute**, double-click **rename** (remembered across reconnects), each device's
@@ -103,8 +103,9 @@ automatically. On Linux you need `cmake`, a C compiler, and ALSA dev headers
 
 ### Video codecs (AV1 default, VP9 fallback)
 
-Video is **AV1** by default — the SVT-AV1 encoder ships as a prebuilt library (no extra
-setup) and uses your GPU's hardware AV1 encoder when it has one. The **VP9** fallback links
+Video is **AV1** by default. Where your GPU has a hardware AV1 encoder, the server uses it via
+Media Foundation; otherwise it falls back to the CPU **SVT-AV1** encoder, which ships as a
+prebuilt static library (no extra setup). The **VP9** fallback links
 **libvpx**, which you supply via [vcpkg](https://github.com/microsoft/vcpkg). It's pinned to
 1.13.1 in `vcpkg.json` (to match the Rust bindings), so a one-time setup builds it:
 
@@ -154,7 +155,7 @@ newfoundsync --headless --video --resolution 1440p --fps 60
 | `--codec` | `opus` | `opus` or `pcm` |
 | `--bitrate` | `510000` | Opus bits/sec (ignored for PCM) |
 | `--buffer-ms` | `3000` | Client buffer = end-to-end latency **and** dropout cushion (≤ 15000) |
-| `--capture` | `allapps` | `allapps` (all but us, survives mute) · `system` (endpoint) · `app` |
+| `--capture` | `allapps` | `allapps` (all but us, survives mute) · `system` (endpoint) · `app` · `web` (a web client casts audio/video up to this server) |
 | `--app-pid` | — | Target PID when `--capture app` |
 | `--video` | off | Also share the screen |
 | `--resolution` | `1080p` | `720p` · `1080p` · `1440p` · `2160p` |
@@ -183,7 +184,7 @@ A Cargo workspace:
 - **`crates/core`** — the platform-neutral engine: wire protocol, NTP-style clock sync,
   codec (Opus/PCM), jitter buffer + deadline scheduler, the monotonic clock, and shared config.
 - **`crates/desktop`** — the Windows server binary (`newfoundsync`): WASAPI capture, Opus +
-  HEVC/H.264 encode, the axum **HTTPS + WebSocket** server, the **embedded web client**, the
+  AV1/VP9 encode, the axum **HTTPS + WebSocket** server, the **embedded web client**, the
   **egui** GUI, and the CLI.
 - **`crates/desktop/web`** — the browser client (`index.html`, `app.js`, `sw.js`): WSS
   transport, clock sync, jitter buffer, WebCodecs decode, Web Audio playout, per-device
@@ -196,7 +197,7 @@ A Cargo workspace:
 **Works today:** WASAPI capture (all-apps / per-app / system), Opus/PCM, HTTPS+WebSocket
 streaming to browser clients, NTP clock sync, jitter-buffered deadline-scheduled playout,
 drift nudging, per-device + master volume, per-device sync trim, mic auto-calibration
-(single + "Calibrate all"), client-reported sync, optional HEVC/H.264 screen video, an egui
+(single + "Calibrate all"), client-reported sync, optional AV1/VP9 screen video, an egui
 server GUI with a live client mixer, a `/status` page, light/dark themes, and a headless CLI.
 The sync core is covered by the workspace test suite, including a hardware-free end-to-end
 loopback test.
@@ -217,6 +218,8 @@ keep it under the GPL and make the corresponding source available.
 
 Copyright © 2026 Alex Hurshman and the Newfoundsync contributors.
 
-> **Codec note.** H.264 and HEVC are patent-encumbered formats. This project's *source*
-> is GPL-licensed, but distributing binaries that encode or decode them may carry separate
-> patent-licensing obligations in some jurisdictions, independent of this software license.
+> **Codec note.** Newfoundsync encodes screen video with **AV1** or **VP9** — both
+> royalty-free (AOMedia / Google), so distributing the binaries carries no video-codec
+> patent-licensing obligation. The app ships **no H.264/HEVC encoder**; the web-client
+> *cast* path merely relays the browser's own H.264, which the browser is already licensed
+> for. (Not legal advice — consult a lawyer before *marketing* the project as royalty-free.)

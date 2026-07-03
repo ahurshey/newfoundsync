@@ -1,6 +1,6 @@
 [package]
 name = "newfoundsync"
-version = "0.2.0"
+version = "0.0.1"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Lightweight LAN audio sharing with tight multiroom sync (desktop)"
@@ -23,13 +23,13 @@ cpal = "0.18.1"
 # requires rustc >= 1.88 (run `rustup update` if the build complains).
 shiguredo_svt_av1 = "2026.1.0"
 # Software VP9 encode (royalty-free fallback to AV1) via libvpx. env-libvpx-sys ships
-# PRE-GENERATED bindings up to libvpx 1.13.0, so the repo pins libvpx to 1.13.0 (see vcpkg.json)
-# to match — newer libvpx has a different encoder ABI. Build supplies libvpx via vcpkg manifest
+# PRE-GENERATED bindings for libvpx 1.13.0, so the repo pins libvpx to 1.13.1 (see vcpkg.json —
+# closest vcpkg has; same 1.13.x encoder ABI). Build supplies libvpx via vcpkg manifest
 # mode (`vcpkg install --triplet x64-windows-static` in the repo) + env: VPX_LIB_DIR /
 # VPX_INCLUDE_DIR (→ vcpkg_installed/x64-windows-static) / VPX_VERSION=1.13.0 / VPX_STATIC=1.
-# Static libvpx needs a matching CRT (RUSTFLAGS=-Ctarget-feature=+crt-static). See README build notes.
+# Static libvpx may need +crt-static (RUSTFLAGS=-Ctarget-feature=+crt-static) only on a CRT conflict (LNK4098); it linked fine without here. See README build notes.
 env-libvpx-sys = "5.1.3"
-# Data-parallel pixel conversions (BGRA→NV12 / BGRA→RGB / scaling) across cores.
+# Data-parallel pixel conversions (BGRA→I420 for SVT-AV1/VP9, BGRA→NV12 for the MF GPU encoder) and frame scaling across cores.
 rayon = "1"
 # Web server: serves the embedded web client + a WebSocket that clock-syncs and
 # streams audio/video to browsers. Sync capture/encode threads bridge in via a
@@ -49,7 +49,7 @@ rustls = { version = "0.23.40", features = ["ring"] }
 # Linux capture (PipeWire) is a follow-up.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-capture = "2.0.0"
-# Media Foundation (GPU H.264 encode) + WASAPI process-loopback capture.
+# Media Foundation (GPU AV1 encode) + WASAPI process-loopback capture.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Com",
@@ -57,17 +57,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Variant",
     "Win32_System_Threading",
     "Win32_Media_MediaFoundation",
-    "Win32_Media_KernelStreaming",
     "Win32_Media_Audio",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Dwm",
-    # GPU zero-copy video path: D3D11 VideoProcessor (BGRA→NV12) + DXGI surfaces fed to
-    # the Media Foundation encoder. The VideoProcessor/CreateTexture2D/ColorSpace1 symbols
-    # are gated behind Dxgi_Common — without these features they don't exist.
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
 ] }
 # `#[implement]` (COM callback for ActivateAudioInterfaceAsync) emits windows_core paths.
 windows-core = "0.62"

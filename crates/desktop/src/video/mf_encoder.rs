@@ -32,6 +32,7 @@ pub struct MfEncoder {
     nv12: Vec<u8>,
     frame_idx: i64,
     sample_dur: i64, // 100-ns units per frame
+    last_key: bool,  // did the most recent encode_bgra drain an MFT clean-point (keyframe) sample?
 }
 
 impl MfEncoder {
@@ -71,6 +72,11 @@ impl MfEncoder {
             let transform: IMFTransform = match slice[0].as_ref() {
                 Some(act) => act.ActivateObject().context("ActivateObject")?,
                 None => {
+                    // Release every enumerated activate before freeing the array (mirror the
+                    // success path) so the trailing IMFActivate COM refs don't leak.
+                    for i in 0..count as usize {
+                        let _ = std::ptr::read(activates.add(i));
+                    }
                     CoTaskMemFree(Some(activates as *const c_void));
                     bail!("null encoder activate");
                 }
@@ -140,6 +146,7 @@ impl MfEncoder {
                 nv12: vec![0u8; (width as usize * height as usize * 3) / 2],
                 frame_idx: 0,
                 sample_dur: 10_000_000 / fps.max(1) as i64,
+                last_key: false,
             })
         }
     }
@@ -149,6 +156,7 @@ impl MfEncoder {
         if bgra.len() < expected {
             bail!("short BGRA frame: {} < {expected}", bgra.len());
         }
+        self.last_key = false; // set by drain_output if the MFT marks this output a clean point
         self.bgra_to_nv12(bgra);
         let out = unsafe {
             let sample = self.make_input_sample()?;
@@ -186,6 +194,14 @@ impl MfEncoder {
     /// ~2 s), which already gives joiners a fresh keyframe without a back-channel.
     pub fn force_keyframe(&mut self) {}
 
+    /// Whether the most recent `encode_bgra` drained a sample the MFT flagged as a clean point
+    /// (keyframe). The server ORs this with the OBU scan so the GPU path still detects keyframes
+    /// if a given MFT ever emits the sequence header out-of-band. Best-effort: false when the
+    /// attribute is absent.
+    pub fn last_was_keyframe(&self) -> bool {
+        self.last_key
+    }
+
     // --- internals ---
 
     unsafe fn drain_output(&mut self, out: &mut Vec<u8>) -> Result<()> {
@@ -210,6 +226,9 @@ impl MfEncoder {
         match hr {
             Ok(()) => {
                 if let Some(sample) = sample_opt {
+                    if sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) == 1 {
+                        self.last_key = true; // MFT-marked keyframe (sync point)
+                    }
                     let media_buf = sample.ConvertToContiguousBuffer()?;
                     let mut ptr: *mut u8 = std::ptr::null_mut();
                     let mut len: u32 = 0;

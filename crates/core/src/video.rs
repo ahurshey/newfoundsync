@@ -181,12 +181,62 @@ impl VideoConfig {
         let px = w as u64 * h as u64;
         let fps = self.fps.value() as u64;
         // ~0.07 bits per pixel per frame for screen content (baseline), then scaled by the
-        // user's quality setting (100 = baseline). HEVC squeezes more out of every bit, so
-        // even the low end stays sharp.
+        // user's quality setting (100 = baseline). AV1's screen-content tools keep even the
+        // low end sharp.
         let base = px * fps * 7 / 100;
         let scaled = base * self.quality_pct.max(1) as u64 / 100;
         ((scaled / 1000) as u32).clamp(1_000, 80_000)
     }
+}
+
+/// AV1 codec string (`av01.P.LLT.DD`) advertised to WebCodecs clients, with a `seq_level_idx`
+/// that *covers* this resolution+fps. A spec-conformant decoder requires the declared level to
+/// be ≥ the encoded level, so this must never understate the stream. Profile 0 (Main), Main tier
+/// (`M`), 8-bit — SVT-AV1 / the MF AV1 encoder write the matching (minimal) level.
+pub fn av1_codec_string(res: Resolution, fps: u32) -> String {
+    let (w, h) = res.dims();
+    let samples = w as u64 * h as u64;
+    let rate = samples * fps.max(1) as u64;
+    // AV1 spec Annex A: (seq_level_idx, MaxPicSize, MaxDisplayRate), low→high.
+    const LEVELS: &[(u8, u64, u64)] = &[
+        (4, 665_856, 19_975_680),       // 3.0
+        (5, 1_065_024, 31_950_720),     // 3.1
+        (8, 2_359_296, 70_778_880),     // 4.0
+        (9, 2_359_296, 141_557_760),    // 4.1
+        (12, 8_912_896, 267_386_880),   // 5.0
+        (13, 8_912_896, 534_773_760),   // 5.1
+        (14, 8_912_896, 1_069_547_520), // 5.2
+    ];
+    let idx = LEVELS
+        .iter()
+        .find(|&&(_, max_pic, max_rate)| samples <= max_pic && rate <= max_rate)
+        .map(|&(i, _, _)| i)
+        .unwrap_or(15); // 5.3 — a safe ceiling beyond every preset
+    format!("av01.0.{idx:02}M.08")
+}
+
+/// VP9 codec string (`vp09.PP.LL.DD`) advertised to WebCodecs clients, with a level that covers
+/// this resolution+fps (same "declared ≥ encoded" rule as AV1). Profile 0, 8-bit.
+pub fn vp9_codec_string(res: Resolution, fps: u32) -> String {
+    let (w, h) = res.dims();
+    let samples = w as u64 * h as u64;
+    let rate = samples * fps.max(1) as u64;
+    // VP9 spec Annex A: (level×10, MaxLumaSampleRate, MaxPicSize), low→high.
+    const LEVELS: &[(u8, u64, u64)] = &[
+        (30, 20_736_000, 552_960),      // 3.0
+        (31, 36_864_000, 983_040),      // 3.1
+        (40, 83_558_400, 2_228_224),    // 4.0
+        (41, 160_432_128, 2_228_224),   // 4.1
+        (50, 311_951_360, 8_912_896),   // 5.0
+        (51, 588_251_136, 8_912_896),   // 5.1
+        (52, 1_176_502_272, 8_912_896), // 5.2
+    ];
+    let lvl = LEVELS
+        .iter()
+        .find(|&&(_, max_rate, max_pic)| samples <= max_pic && rate <= max_rate)
+        .map(|&(l, _, _)| l)
+        .unwrap_or(60); // 6.0 — a safe ceiling beyond every preset
+    format!("vp09.00.{lvl:02}.08")
 }
 
 #[cfg(test)]
@@ -239,5 +289,28 @@ mod tests {
         let hq = VideoConfig { resolution: Resolution::P1080, fps: Fps::F60, quality_pct: 200 }.suggested_bitrate_kbps();
         let lq = VideoConfig { resolution: Resolution::P1080, fps: Fps::F60, quality_pct: 50 }.suggested_bitrate_kbps();
         assert!(hq > lq);
+    }
+
+    #[test]
+    fn codec_strings_cover_every_preset() {
+        // The advertised level must be ≥ the level the encoder actually writes for each
+        // resolution+fps preset, so no receiver that honors the level drops to audio-only.
+        assert_eq!(av1_codec_string(Resolution::P720, 30), "av01.0.05M.08");
+        assert_eq!(av1_codec_string(Resolution::P720, 60), "av01.0.08M.08");
+        assert_eq!(av1_codec_string(Resolution::P1080, 30), "av01.0.08M.08");
+        assert_eq!(av1_codec_string(Resolution::P1080, 60), "av01.0.09M.08");
+        assert_eq!(av1_codec_string(Resolution::P1440, 30), "av01.0.12M.08");
+        assert_eq!(av1_codec_string(Resolution::P1440, 60), "av01.0.12M.08");
+        assert_eq!(av1_codec_string(Resolution::P2160, 30), "av01.0.12M.08");
+        assert_eq!(av1_codec_string(Resolution::P2160, 60), "av01.0.13M.08");
+
+        assert_eq!(vp9_codec_string(Resolution::P720, 30), "vp09.00.31.08");
+        assert_eq!(vp9_codec_string(Resolution::P720, 60), "vp09.00.40.08");
+        assert_eq!(vp9_codec_string(Resolution::P1080, 30), "vp09.00.40.08");
+        assert_eq!(vp9_codec_string(Resolution::P1080, 60), "vp09.00.41.08");
+        assert_eq!(vp9_codec_string(Resolution::P1440, 30), "vp09.00.50.08");
+        assert_eq!(vp9_codec_string(Resolution::P1440, 60), "vp09.00.50.08");
+        assert_eq!(vp9_codec_string(Resolution::P2160, 30), "vp09.00.50.08");
+        assert_eq!(vp9_codec_string(Resolution::P2160, 60), "vp09.00.51.08");
     }
 }

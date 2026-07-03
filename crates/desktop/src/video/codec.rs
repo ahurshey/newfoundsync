@@ -2,11 +2,11 @@
 // Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
 
 //! Video encoders for the desktop capture pipeline: software AV1 (SVT-AV1) and, on
-//! Windows, GPU hardware via Media Foundation (HEVC, or AV1 where the GPU has an AV1
-//! encoder). Each takes a tightly-packed BGRA frame (what the screen capture produces)
+//! Windows, GPU hardware AV1 via Media Foundation where the GPU has an AV1 encoder.
+//! Each takes a tightly-packed BGRA frame (what the screen capture produces)
 //! and emits an elementary stream the browser's WebCodecs decoder reads: AV1 low-overhead
-//! OBU, or HEVC Annex-B. Also holds the codec-aware keyframe detectors shared by the local
-//! capture path and the web-cast relay.
+//! OBU, or raw VP9 elementary frames. Also holds the codec-aware keyframe detectors shared
+//! by the local capture path and the web-cast relay.
 //!
 //! H.264 is intentionally NOT encoded here: the only software H.264 (openh264) is
 //! patent-encumbered when compiled from source, so it was removed to keep distributable
@@ -152,7 +152,7 @@ pub(crate) fn bgra_to_i420(
 }
 
 /// The active video encoder — software AV1 (SVT-AV1) or, on Windows, GPU hardware via
-/// Media Foundation (HEVC, or AV1 where the GPU supports it). The server holds one; all
+/// Media Foundation (AV1 where the GPU supports it). The server holds one; all
 /// arms expose the same encode/keyframe API.
 pub enum VideoEncoder {
     Av1Cpu(Av1Encoder),
@@ -163,8 +163,8 @@ pub enum VideoEncoder {
 
 impl VideoEncoder {
     /// Build the video encoder: hardware AV1 (Media Foundation) where the GPU has an AV1
-    /// encoder, otherwise software SVT-AV1. `backend` is retained for CLI/GUI wiring; AV1 is the
-    /// only video codec the server encodes natively now (HEVC/H.264 were removed).
+    /// encoder, otherwise software SVT-AV1. `backend` selects AV1 (default) or the VP9
+    /// royalty-free fallback; HEVC/H.264 native encode were removed.
     pub fn new(
         backend: EncoderBackend,
         width: u32,
@@ -215,15 +215,15 @@ impl VideoEncoder {
     }
 
     /// True if this emitted access unit is a keyframe the browser can start/recover decoding
-    /// from. AV1: a Sequence Header OBU (type 1) rides with each keyframe. VP9: the uncompressed
-    /// header's frame_type bit. (H.264 IDR detection for the web-cast relay lives in
-    /// `annexb_has_h264_idr`.)
+    /// from. AV1: a Sequence Header OBU (type 1) rides with each keyframe (the GPU path also ORs
+    /// in the MFT clean-point flag). VP9: the uncompressed header's frame_type bit. (H.264 IDR
+    /// detection for the web-cast relay lives in `annexb_has_h264_idr`.)
     pub fn is_keyframe(&self, au: &[u8]) -> bool {
         match self {
             VideoEncoder::Av1Cpu(_) => obu_has_av1_keyframe(au),
             VideoEncoder::Vp9Cpu(_) => crate::video::vp9::vp9_frame_is_keyframe(au),
             #[cfg(target_os = "windows")]
-            VideoEncoder::Av1Gpu(_) => obu_has_av1_keyframe(au),
+            VideoEncoder::Av1Gpu(e) => obu_has_av1_keyframe(au) || e.last_was_keyframe(),
         }
     }
 

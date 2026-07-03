@@ -6,7 +6,8 @@
 //
 // Connects a WebSocket to the Rust server, NTP-syncs to the server's monotonic
 // clock, and plays the buffered audio (Opus -> WebCodecs -> Web Audio) and video
-// (H.264 -> WebCodecs -> canvas) at each frame's PTS deadline on the synced clock.
+// (AV1/VP9 -> WebCodecs -> canvas; H.264 only for a browser web-cast relay) at each
+// frame's PTS deadline on the synced clock.
 // Every client uses the same buffer, so they all play in lock-step.
 //
 // Mobile notes (iOS Safari + Android Chrome), hard-won:
@@ -917,7 +918,7 @@ function teardownConnection() {
   audioDecoder = null;
   videoDecoder = null;
   gotParams = false;
-  videoAvccMode = false; // next stream re-detects HEVC vs H.264 from its codec + first keyframe
+  videoAvccMode = false; // next stream re-detects the codec (avc1 web-cast vs av01/vp09 native) from its codec + first keyframe
   clearTimeout(noVideoFallbackTimer);
   aPlayhead = null;
   firstPlayoutAc = null;
@@ -1198,11 +1199,11 @@ async function setupDecoders(c) {
     vizStart();
     els.fsbtn.style.display = "none";
   } else if (c.video && window.VideoDecoder.isConfigSupported) {
-    const probe = { codec: c.videoCodec || "hev1.1.6.L153.B0", optimizeForLatency: true };
+    const probe = { codec: c.videoCodec || "av01.0.04M.08", optimizeForLatency: true };
     const r = await VideoDecoder.isConfigSupported(probe).catch(() => null);
     if (r && !r.supported) {
       const cc4 = (c.videoCodec || "").slice(0, 4);
-      const fam = cc4 === "avc1" ? "H.264" : cc4 === "av01" ? "AV1" : cc4 === "vp09" ? "VP9" : "HEVC/H.265";
+      const fam = cc4 === "avc1" ? "H.264" : cc4 === "av01" ? "AV1" : cc4 === "vp09" ? "VP9" : (c.videoCodec || "video");
       showWarn("⚠ This device can't decode the video codec (" + fam + "). Audio will still play.");
     } else {
       els.fsbtn.style.display = "flex";
@@ -1231,7 +1232,7 @@ async function setupDecoders(c) {
 
 let vDecErrStreak = 0;
 let vGoodRun = 0; // consecutive good frames since the last error (gates clearing the streak)
-let videoAvccMode = false; // true when decoding a browser cast's H.264 via AVCC + description (vs raw in-band HEVC Annex-B / AV1 OBU)
+let videoAvccMode = false; // true when decoding a browser cast's H.264 via AVCC + description (vs raw in-band AV1 OBU / VP9 frames from a native server source)
 function onDecErr(kind, e) {
   console.error(kind + " decode error", e);
   if (kind === "video") {
@@ -1263,7 +1264,7 @@ function onVideoChunk(tsUs, key, annexb) {
   if (typeof VideoDecoder === "undefined") return; // no WebCodecs video on this browser → audio-only
   if (!gotParams) {
     if (!key) return; // wait for a keyframe (it carries the parameter sets we configure from)
-    const codecStr = (cfg && cfg.videoCodec) || "hev1.1.6.L153.B0";
+    const codecStr = (cfg && cfg.videoCodec) || "av01.0.04M.08";
     const isAvc = codecStr.slice(0, 4) === "avc1" || codecStr.slice(0, 4) === "avc3";
     if (isAvc) {
       // Browser-cast H.264 (Phase 2): iOS Safari's decoder rejects in-band Annex-B H.264, so build
@@ -1304,9 +1305,9 @@ function onVideoChunk(tsUs, key, annexb) {
         }
       }
     } else {
-      // HEVC (Annex-B, in-band VPS/SPS/PPS), AV1 (low-overhead OBUs), or VP9 (raw frames) from a
-      // native server source: configure WITHOUT a `description` and feed the raw access units as-is.
-      // All three are self-describing in the bitstream, so no avcC/hvcC config blob is built.
+      // AV1 (low-overhead OBUs) or VP9 (raw frames) from a native server source: configure
+      // WITHOUT a `description` and feed the raw access units as-is. Both are self-describing
+      // in the bitstream, so no avcC config blob is built.
       const vcfg = {
         codec: codecStr,
         optimizeForLatency: true,
@@ -1326,7 +1327,7 @@ function onVideoChunk(tsUs, key, annexb) {
           videoAvccMode = false;
           gotParams = true;
         } catch (e2) {
-          const famLabel = codecStr.slice(0, 4) === "av01" ? "AV1" : codecStr.slice(0, 4) === "vp09" ? "VP9" : "HEVC/H.265";
+          const famLabel = codecStr.slice(0, 4) === "av01" ? "AV1" : codecStr.slice(0, 4) === "vp09" ? "VP9" : codecStr.slice(0, 4) === "avc1" ? "H.264" : "this video codec";
           showWarn("⚠ Video decoder couldn't start — this device may not support " + famLabel + ". Audio still plays. (" + e2.message + ")");
           return;
         }
@@ -1335,7 +1336,7 @@ function onVideoChunk(tsUs, key, annexb) {
   }
   // In AVCC mode (H.264 cast) convert each Annex-B access unit to length-prefixed AVCC, DROPPING the
   // in-band SPS/PPS (they live in the decoder's avcC description — iOS rejects samples that repeat
-  // them). HEVC feeds raw Annex-B (decoder configured without a description).
+  // them). Native AV1/VP9 feed raw access units as-is (decoder configured without a description).
   let data;
   if (videoAvccMode) {
     data = annexBToAvccVcl(annexb);

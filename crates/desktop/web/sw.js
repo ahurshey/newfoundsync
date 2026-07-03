@@ -12,7 +12,7 @@
 // The audio/video stream and clock-sync travel over the WebSocket (/ws), which service
 // workers never intercept — so streaming is completely unaffected by this file.
 
-const CACHE = "nfs-shell-v4"; // bump on any shell change → activate() purges the stale precache
+const CACHE = "nfs-shell-" + "__NFS_BUILD__"; // build-stamped by the server → each build gets its own bucket; activate() purges the rest
 const SHELL = ["/", "/app.js", "/manifest.webmanifest", "/icon-128.png", "/icon-256.png", "/icon-512.png", "/icon-512-maskable.png", "/favicon.png"];
 
 self.addEventListener("install", (e) => {
@@ -33,14 +33,18 @@ self.addEventListener("fetch", (e) => {
   // Only the same-origin app shell. Cross-origin, non-GET, and the /ws upgrade are left to
   // the browser (WebSocket handshakes never reach the SW anyway).
   if (req.method !== "GET" || url.origin !== self.location.origin) return;
+  // /version is the stale-shell detector's source of truth — never let the SW answer it from
+  // cache, or the self-heal check could compare against a stale build tag and never fire.
+  if (url.pathname === "/version") return;
 
   e.respondWith(
     fetch(req)
       .then((res) => {
         // Cache a fresh copy of successful responses for offline use. (Same-origin is
         // already guaranteed above; no res.type filter — that could skip caching behind a
-        // proxy/redirect and leave a stale offline shell.)
-        if (res && res.ok) {
+        // proxy/redirect and leave a stale offline shell.) Only a clean 200 — never a 206
+        // partial or a redirect, which would poison the offline shell.
+        if (res && res.status === 200) {
           const copy = res.clone();
           caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
         }

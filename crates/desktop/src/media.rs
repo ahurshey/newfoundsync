@@ -69,7 +69,7 @@ pub struct MediaConfig {
     pub video: bool,
     pub frame_rate: u32,
     pub buffer_ms: i64,
-    pub video_codec: &'static str,
+    pub video_codec: String,
 }
 
 impl MediaConfig {
@@ -230,7 +230,6 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         Some(v) => (v.resolution, v.fps.value()),
         None => (newfoundsync_core::video::Resolution::P1080, 30),
     };
-    let _ = fw;
     // Encode targets dictated to a web caster in the CAST_GRANT, so all receivers get the
     // operator's chosen quality regardless of the caster's hardware. Zero when this isn't a
     // web-uplink video source.
@@ -274,13 +273,14 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         buffer_ms: opts.buffer_ms,
         // Codec advertised to clients (they pick the matching WebCodecs decoder). A *web-uplink*
         // caster sends H.264 ("avc1"; browsers H.264-encode far more reliably); every native
-        // server source is AV1 ("av01", self-describing OBUs) — the royalty-free codec.
+        // server source is AV1 ("av01") or the VP9 fallback — both royalty-free. The level in the
+        // string is derived from the resolution/fps so it never understates the stream.
         video_codec: if web_uplink {
-            "avc1.42E01F"
+            "avc1.42E01F".to_string()
         } else if matches!(opts.encoder, EncoderBackend::Vp9) {
-            "vp09.00.10.08"
+            newfoundsync_core::video::vp9_codec_string(fw, fps)
         } else {
-            "av01.0.04M.08"
+            newfoundsync_core::video::av1_codec_string(fw, fps)
         },
     };
 
@@ -358,7 +358,7 @@ impl AudioCapture {
     }
 }
 
-/// Windows screen-capture → H.264 encode → broadcast WS video frames.
+/// Windows screen-capture → AV1/VP9 encode → broadcast WS video frames.
 #[cfg(target_os = "windows")]
 struct VideoProducer {
     stop: Arc<AtomicBool>,
@@ -403,8 +403,7 @@ impl VideoProducer {
             .name("video-producer".into())
             .spawn(move || {
                 let frame_dur = Duration::from_nanos(1_000_000_000 / fps as u64);
-                let key_interval = (fps as u64 * KEYFRAME_SECS).max(1);
-                let mut frame_count: u64 = 0;
+                let mut last_key_req = Instant::now();
                 let mut scaled = Vec::new();
                 let mut last: Option<CapturedFrame> = None;
                 let mut prev_rx: usize = 0;
@@ -435,7 +434,7 @@ impl VideoProducer {
                             if encoder.is_none() {
                                 match VideoEncoder::new(encoder_backend, dw, dh, fps, bitrate) {
                                     Ok(e) => {
-                                        tracing::info!(backend = e.backend_label(), "video encoder ready (CPU path)");
+                                        tracing::info!(backend = e.backend_label(), "video encoder ready");
                                         encoder = Some(e);
                                     }
                                     Err(e) => {
@@ -453,21 +452,25 @@ impl VideoProducer {
                                     dh as usize,
                                     &mut scaled,
                                 );
-                                let periodic = frame_count % key_interval == 0;
+                                // ~2 s cadence driven by wall-clock, not the emitted-output count
+                                // (which stalls during encoder ramp-up / dropped frames).
+                                let periodic = last_key_req.elapsed() >= Duration::from_secs(KEYFRAME_SECS);
                                 // Emit a keyframe on the periodic cadence AND whenever a new
                                 // client subscribes (reconnect / source swap).
                                 let new_subscriber = rx > prev_rx;
                                 if periodic || new_subscriber {
                                     enc.force_keyframe(); // a REQUEST; the GPU may honor it on its own GOP cadence
+                                    last_key_req = Instant::now();
                                 }
                                 match enc.encode_bgra(&scaled) {
                                     Ok(bits) if !bits.is_empty() => {
                                         let pts = mono_now() + lead_ns;
-                                        // Flag the keyframe from the ACTUAL emitted bitstream (scan for
-                                        // an IDR/IRAP NAL), not the request — force_keyframe is a no-op on
-                                        // the GPU MFT (GOP-driven), so the request would mislabel frames
-                                        // and the client (which discards non-key chunks until a real
-                                        // keyframe) would stay black. Codec-aware (H.264 IDR vs HEVC IRAP).
+                                        // Flag the keyframe from the ACTUAL emitted bitstream (an AV1
+                                        // Sequence-Header OBU or the VP9 keyframe bit), not the request —
+                                        // force_keyframe is a no-op on the GPU MFT (GOP-driven), so the
+                                        // request would mislabel frames and the client (which discards
+                                        // non-key chunks until a real keyframe) would stay black.
+                                        // Codec-aware (AV1 sequence-header OBU / VP9 keyframe bit).
                                         let is_key = enc.is_keyframe(&bits);
                                         let mut msg = Vec::with_capacity(10 + bits.len());
                                         msg.push(MSG_VIDEO);
@@ -475,7 +478,6 @@ impl VideoProducer {
                                         msg.push(if is_key { 1 } else { 0 });
                                         msg.extend_from_slice(&bits);
                                         let _ = tx.send(Arc::new(msg));
-                                        frame_count += 1;
                                     }
                                     Ok(_) => {}
                                     Err(e) => tracing::debug!("video encode: {e}"),

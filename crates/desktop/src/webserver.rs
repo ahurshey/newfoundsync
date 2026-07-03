@@ -64,6 +64,12 @@ fn app_js_body() -> &'static str {
     static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     S.get_or_init(|| APP_JS.replace("__NFS_BUILD__", build_tag())).as_str()
 }
+/// The service worker with `__NFS_BUILD__` stamped, so its cache name (`nfs-shell-<tag>`) rotates
+/// with each build and `activate()` purges the stale bucket — no more hand-bumping the version.
+fn service_worker_body() -> &'static str {
+    static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    S.get_or_init(|| SERVICE_WORKER.replace("__NFS_BUILD__", build_tag())).as_str()
+}
 // Branding (the Newfoundland badge) — shared with the exe/GUI icon.
 const FAVICON_PNG: &[u8] = include_bytes!("../../../branding/icon-32.png");
 const ICON_128_PNG: &[u8] = include_bytes!("../../../branding/icon-128.png");
@@ -439,7 +445,7 @@ async fn service_worker() -> impl IntoResponse {
             (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        SERVICE_WORKER,
+        service_worker_body(),
     )
 }
 

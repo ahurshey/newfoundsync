@@ -61,9 +61,9 @@ const RES_LABELS: [(&str, &str); 4] = [
     ("2160p (4K)", "2160p"),
 ];
 const ENC_LABELS: [(&str, &str); 3] = [
-    ("Auto (GPU, CPU fallback)", "auto"),
-    ("GPU only", "hardware"),
-    ("CPU only", "cpu"),
+    ("Auto (GPU HEVC)", "auto"),
+    ("GPU only (HEVC)", "hardware"),
+    ("AV1 (royalty-free)", "av1"),
 ];
 
 /// Initial server config (from CLI flags) used to seed the GUI + first stream.
@@ -179,10 +179,10 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
     let enc_idx = match init.encoder {
         EncoderBackend::Auto => 0,
         EncoderBackend::Hardware => 1,
-        EncoderBackend::Cpu => 2,
+        EncoderBackend::Av1 => 2,
     };
-    // The Codec picker exposes only HEVC/GPU (0) and H.264/CPU (2); "GPU only" (1) has no GUI option
-    // and `is_h264 == (enc_idx == 2)` would render it as HEVC. Fold a `--encoder hardware` launch
+    // The Codec picker exposes only HEVC/GPU (0) and AV1 (2); "GPU only" (1) has no GUI option
+    // and `is_av1 == (enc_idx == 2)` would render it as HEVC. Fold a `--encoder hardware` launch
     // into Auto (0) so the GUI state and the encoder never disagree. (Auto and Hardware both resolve
     // to GPU HEVC, so this changes no encoding behavior — only the picker's consistency.)
     let enc_idx = if enc_idx == 1 { 0 } else { enc_idx };
@@ -1403,19 +1403,19 @@ impl ServerApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Codec:").on_hover_text(
-                            "HEVC (H.265) = GPU hardware encode — best quality-per-bit, wide desktop \
-                             support. H.264 (AVC) = software (CPU) encode — heavier on the CPU at high \
-                             resolutions, but needs no HEVC-capable GPU and decodes on more browsers.",
+                            "AV1 = royalty-free (SVT-AV1 on the CPU, or your GPU's AV1 encoder if it \
+                             has one) — the clean-to-distribute default. HEVC (H.265) = GPU hardware \
+                             encode, best quality-per-bit and lightest on the CPU, but patent-encumbered \
+                             and not every browser decodes it (Firefox can't).",
                         );
-                        // Codec ⟺ backend here: HEVC = GPU (enc_idx 0 = "auto"); H.264 = software
-                        // openh264 (enc_idx 2 = "cpu"). HEVC has no software encoder and H.264 has no
-                        // GPU encoder in this build, so one picker selects both.
-                        let is_h264 = self.enc_idx == 2;
+                        // Codec ⟺ backend here: HEVC = GPU HEVC (enc_idx 0 = "auto"); AV1 = enc_idx 2 =
+                        // "av1" (GPU AV1 where the hardware supports it, else CPU SVT-AV1).
+                        let is_av1 = self.enc_idx == 2;
                         egui::ComboBox::from_id_salt("codec")
-                            .selected_text(if is_h264 { "H.264 (AVC) · software" } else { "HEVC (H.265) · GPU" })
+                            .selected_text(if is_av1 { "AV1 · royalty-free" } else { "HEVC (H.265) · GPU" })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.enc_idx, 0, "HEVC (H.265) · GPU");
-                                ui.selectable_value(&mut self.enc_idx, 2, "H.264 (AVC) · software");
+                                ui.selectable_value(&mut self.enc_idx, 2, "AV1 · royalty-free");
                             });
                     });
                     ui.horizontal(|ui| {

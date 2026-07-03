@@ -1,88 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
 
-//! Software H.264 encode/decode via openh264 (desktop video pipeline).
+//! Video encoders for the desktop capture pipeline: software AV1 (SVT-AV1) and, on
+//! Windows, GPU hardware via Media Foundation (HEVC, or AV1 where the GPU has an AV1
+//! encoder). Each takes a tightly-packed BGRA frame (what the screen capture produces)
+//! and emits an elementary stream the browser's WebCodecs decoder reads: AV1 low-overhead
+//! OBU, or HEVC Annex-B. Also holds the codec-aware keyframe detectors shared by the local
+//! capture path and the web-cast relay.
 //!
-//! Encode takes a tightly-packed BGRA frame (what the screen capture produces),
-//! converts to RGB then I420, and emits an H.264 Annex-B bitstream. Decode yields
-//! RGBA (ready for an egui texture). Software codec gets the whole pipeline
-//! working/testable now; a hardware encoder is a later drop-in for smooth 4K60.
+//! H.264 is intentionally NOT encoded here: the only software H.264 (openh264) is
+//! patent-encumbered when compiled from source, so it was removed to keep distributable
+//! binaries clean. Browser web-cast sources still send H.264 (the browser's own licensed
+//! codec) and the server merely relays it — `annexb_has_h264_idr` re-derives the keyframe
+//! flag for that path.
 
 use anyhow::{Context, Result};
-use openh264::decoder::Decoder;
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType};
-use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
-use openh264::OpenH264API;
 use rayon::prelude::*;
 
 use shiguredo_svt_av1::{ColorFormat, EncodeOptions, Encoder as SvtAv1Enc, EncoderConfig, FrameData, RcMode};
 use std::num::NonZeroUsize;
 
 use newfoundsync_core::video::EncoderBackend;
-
-/// Threads for the software encoder / parallel conversions: the machine's core
-/// count, capped (diminishing returns + slice-count quality cost past ~8).
-fn worker_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 8)
-}
-
-/// H.264 encoder fed BGRA frames.
-pub struct H264Encoder {
-    enc: Encoder,
-    width: usize,
-    height: usize,
-    rgb: Vec<u8>, // reused BGRA→RGB scratch
-}
-
-impl H264Encoder {
-    pub fn new(width: u32, height: u32, fps: u32, bitrate_kbps: u32) -> Result<Self> {
-        let cfg = EncoderConfig::new()
-            .rate_control_mode(RateControlMode::Bitrate)
-            .bitrate(BitRate::from_bps(bitrate_kbps * 1000))
-            .max_frame_rate(FrameRate::from_hz(fps as f32))
-            // We're encoding a desktop, not camera video — this preset is both
-            // faster and sharper on screen content (text, sharp edges).
-            .usage_type(UsageType::ScreenContentRealTime)
-            // Slice-based multithreading across cores for higher throughput.
-            .num_threads(worker_threads() as u16)
-            .skip_frames(false);
-        let enc =
-            Encoder::with_api_config(OpenH264API::from_source(), cfg).context("create H.264 encoder")?;
-        Ok(H264Encoder {
-            enc,
-            width: width as usize,
-            height: height as usize,
-            rgb: vec![0u8; (width * height * 3) as usize],
-        })
-    }
-
-    /// Encode one tightly-packed BGRA frame (`width*height*4` bytes). Returns the
-    /// H.264 bytes (may be empty if the encoder skipped/buffered the frame).
-    pub fn encode_bgra(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
-        let n = self.width * self.height;
-        debug_assert_eq!(bgra.len(), n * 4);
-        // BGRA → RGB, parallelized per pixel across cores.
-        self.rgb
-            .par_chunks_mut(3)
-            .zip(bgra.par_chunks(4))
-            .for_each(|(o, i)| {
-                o[0] = i[2];
-                o[1] = i[1];
-                o[2] = i[0];
-            });
-        let yuv = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&self.rgb, (self.width, self.height)));
-        let bitstream = self.enc.encode(&yuv).context("H.264 encode")?;
-        Ok(bitstream.to_vec())
-    }
-
-    /// Make the next encoded frame an IDR keyframe (on join / resolution switch).
-    pub fn force_keyframe(&mut self) {
-        self.enc.force_intra_frame();
-    }
-}
 
 /// Software AV1 encoder (SVT-AV1) fed BGRA frames. AV1 is royalty-free, so this is the
 /// distribution-default codec when no hardware AV1 encoder is present. CPU-only here;
@@ -107,8 +45,8 @@ impl Av1Encoder {
         // Realtime, low-delay: CBR ⇒ SVT uses pred_structure=1 (low-delay P) and enables
         // per-frame forced keyframes; RTC mode + screen-content tools + no lookahead.
         cfg.rate_control_mode = RcMode::Cbr;
-        cfg.target_bit_rate = bitrate_kbps.saturating_mul(1000); // bits/sec
-        cfg.fps_numerator = fps.max(1);
+        cfg.target_bit_rate = bitrate_kbps.saturating_mul(1000) as usize; // bits/sec
+        cfg.fps_numerator = fps.max(1) as usize;
         cfg.fps_denominator = 1;
         cfg.enc_mode = 12; // preset 0..=13 (higher = faster); ~12 for realtime screen share
         cfg.rtc = Some(true);
@@ -212,11 +150,10 @@ fn bgra_to_i420(
         });
 }
 
-/// The active video encoder — software H.264 (openh264), software AV1 (SVT-AV1), or, on
-/// Windows, GPU hardware (Media Foundation: HEVC, or AV1 where the GPU supports it).
-/// The server holds one; all arms expose the same encode/keyframe API.
+/// The active video encoder — software AV1 (SVT-AV1) or, on Windows, GPU hardware via
+/// Media Foundation (HEVC, or AV1 where the GPU supports it). The server holds one; all
+/// arms expose the same encode/keyframe API.
 pub enum VideoEncoder {
-    Cpu(H264Encoder),
     Av1Cpu(Av1Encoder),
     #[cfg(target_os = "windows")]
     Av1Gpu(crate::video::mf_encoder::MfEncoder),
@@ -225,10 +162,9 @@ pub enum VideoEncoder {
 }
 
 impl VideoEncoder {
-    /// Build the video encoder. Video is now **HEVC (H.265)**, which has no software
-    /// encoder here (openh264 is H.264-only) — so it's GPU-only via Media Foundation with
-    /// NO fallback. The `backend` selection is therefore moot for video (all map to GPU HEVC);
-    /// it's kept in the signature so the GUI/CLI flag stays wired.
+    /// Build the video encoder from the selected backend:
+    /// - `Av1` → hardware AV1 (Media Foundation) where the GPU has an AV1 encoder, else software SVT-AV1.
+    /// - `Auto` / `Hardware` → GPU HEVC (Media Foundation, Windows-only; HEVC has no software encoder).
     pub fn new(
         backend: EncoderBackend,
         width: u32,
@@ -236,13 +172,9 @@ impl VideoEncoder {
         fps: u32,
         bitrate_kbps: u32,
     ) -> Result<VideoEncoder> {
-        // Codec follows the backend: `Cpu` = software H.264 (openh264, cross-platform); anything
-        // else = GPU HEVC (Media Foundation, Windows-only). HEVC has no software encoder here and
-        // H.264 has no GPU encoder here, so this one choice selects both codec AND backend. The GUI
-        // "Codec" picker maps HEVC→Auto and H.264→Cpu; `--encoder cpu` selects H.264 on the CLI.
         if backend == EncoderBackend::Av1 {
             // AV1 (royalty-free). Prefer a hardware AV1 encoder (Media Foundation) where the GPU
-            // has one; otherwise fall back to software SVT-AV1. Same "av01" stream to clients either way.
+            // has one; otherwise fall back to software SVT-AV1. Same "av01" stream either way.
             #[cfg(target_os = "windows")]
             {
                 match crate::video::mf_encoder::MfEncoder::new_av1(width, height, fps, bitrate_kbps) {
@@ -258,29 +190,23 @@ impl VideoEncoder {
             tracing::info!("video: CPU AV1 (SVT-AV1) encoder active");
             return Ok(VideoEncoder::Av1Cpu(e));
         }
-        if backend == EncoderBackend::Cpu {
-            let e = H264Encoder::new(width, height, fps, bitrate_kbps)
-                .context("software H.264 (openh264) encoder")?;
-            tracing::info!("video: CPU H.264 (openh264) encoder active");
-            return Ok(VideoEncoder::Cpu(e));
-        }
+        // Auto / Hardware → GPU HEVC.
         #[cfg(target_os = "windows")]
         {
             let hw = crate::video::mf_encoder::MfEncoder::new(width, height, fps, bitrate_kbps)
-                .context("GPU (Media Foundation) HEVC encoder — HEVC has no software encoder; pick the H.264 or AV1 codec for CPU encode")?;
+                .context("GPU (Media Foundation) HEVC encoder — HEVC has no software encoder; pick the AV1 codec for software (CPU) encode")?;
             tracing::info!("video: GPU HEVC encoder active");
             Ok(VideoEncoder::Hardware(hw))
         }
         #[cfg(not(target_os = "windows"))]
         {
             let _ = (width, height, fps, bitrate_kbps);
-            anyhow::bail!("HEVC video requires Windows (Media Foundation); select the H.264 or AV1 codec for software encode")
+            anyhow::bail!("HEVC video requires Windows (Media Foundation); select the AV1 codec for software encode")
         }
     }
 
     pub fn encode_bgra(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
         match self {
-            VideoEncoder::Cpu(e) => e.encode_bgra(bgra),
             VideoEncoder::Av1Cpu(e) => e.encode_bgra(bgra),
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(e) => e.encode_bgra(bgra),
@@ -291,7 +217,6 @@ impl VideoEncoder {
 
     pub fn force_keyframe(&mut self) {
         match self {
-            VideoEncoder::Cpu(e) => e.force_keyframe(),
             VideoEncoder::Av1Cpu(e) => e.force_keyframe(),
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(e) => e.force_keyframe(),
@@ -301,12 +226,12 @@ impl VideoEncoder {
     }
 
     /// True if this emitted access unit is a keyframe the browser can start/recover decoding
-    /// from. Codec-aware: H.264 (IDR = NAL type 5, 1-byte header), HEVC (IRAP = types 16..=23,
-    /// 2-byte header), and AV1 (a Sequence Header OBU — type 1 — rides with each keyframe
-    /// temporal unit). One scan across all codecs would misdetect and leave the client stuck.
+    /// from. Codec-aware: HEVC (IRAP = NAL types 16..=23, 2-byte header) and AV1 (a Sequence
+    /// Header OBU — type 1 — rides with each keyframe temporal unit). One scan across codecs
+    /// would misdetect and leave the client stuck. (H.264 IDR detection for the web-cast relay
+    /// lives in `annexb_has_h264_idr`.)
     pub fn is_keyframe(&self, au: &[u8]) -> bool {
         match self {
-            VideoEncoder::Cpu(_) => annexb_has_h264_idr(au),
             VideoEncoder::Av1Cpu(_) => obu_has_av1_keyframe(au),
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(_) => obu_has_av1_keyframe(au),
@@ -318,7 +243,6 @@ impl VideoEncoder {
     /// Human-readable label of the backend actually in use (for logs/telemetry).
     pub fn backend_label(&self) -> &'static str {
         match self {
-            VideoEncoder::Cpu(_) => "CPU (openh264)",
             VideoEncoder::Av1Cpu(_) => "CPU (SVT-AV1)",
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(_) => "GPU AV1 (Media Foundation)",
@@ -329,8 +253,9 @@ impl VideoEncoder {
 }
 
 /// H.264: 1-byte NAL header; nal_type = byte & 0x1f; IDR slice = 5. Scans Annex-B start codes.
-/// `pub` so the web-cast relay can re-derive the keyframe flag from an uploaded AU (never trust the
-/// caster's wire byte) — matching the local capture path.
+/// `pub` and codec-independent so the web-cast relay can re-derive the keyframe flag from a
+/// browser-uploaded H.264 AU (never trust the caster's wire byte) — even though the server no
+/// longer *encodes* H.264 itself.
 pub fn annexb_has_h264_idr(au: &[u8]) -> bool {
     let mut i = 0usize;
     while i + 3 < au.len() {
@@ -410,72 +335,27 @@ pub fn obu_has_av1_keyframe(au: &[u8]) -> bool {
     false
 }
 
-/// H.264 decoder producing RGBA frames.
-pub struct H264Decoder {
-    dec: Decoder,
-}
-
-impl H264Decoder {
-    pub fn new() -> Result<Self> {
-        Ok(H264Decoder {
-            dec: Decoder::new().context("create H.264 decoder")?,
-        })
-    }
-
-    /// Decode an H.264 access unit. Returns `(width, height, rgba)` when a frame
-    /// is produced (the decoder may buffer and return `None`).
-    pub fn decode_rgba(&mut self, data: &[u8]) -> Result<Option<(u32, u32, Vec<u8>)>> {
-        match self.dec.decode(data).context("H.264 decode")? {
-            Some(yuv) => {
-                let (w, h) = yuv.dimensions();
-                let mut rgba = vec![0u8; w * h * 4];
-                yuv.write_rgba8(&mut rgba);
-                Ok(Some((w as u32, h as u32, rgba)))
-            }
-            None => Ok(None),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn h264_encode_decode_roundtrip() {
-        let (w, h) = (320u32, 240u32);
-        let mut enc = H264Encoder::new(w, h, 30, 1000).expect("encoder");
-        let mut dec = H264Decoder::new().expect("decoder");
+    fn av1_keyframe_detection() {
+        // OBU header byte = type<<3 | ext<<2 | has_size<<1 | reserved.
+        // Sequence Header (type 1, has_size) + 0-byte payload → keyframe TU.
+        assert!(obu_has_av1_keyframe(&[0x0A, 0x00]));
+        // A lone Frame OBU (type 6) with no sequence header → not a keyframe.
+        assert!(!obu_has_av1_keyframe(&[0x32, 0x00]));
+        // Temporal Delimiter (type 2) + Frame (type 6), no seq header → not a keyframe.
+        assert!(!obu_has_av1_keyframe(&[0x12, 0x00, 0x32, 0x00]));
+        // Temporal Delimiter + Sequence Header + Frame → keyframe.
+        assert!(obu_has_av1_keyframe(&[0x12, 0x00, 0x0A, 0x00, 0x32, 0x00]));
+    }
 
-        // A simple BGRA gradient frame.
-        let mut bgra = vec![0u8; (w * h * 4) as usize];
-        for y in 0..h {
-            for x in 0..w {
-                let i = ((y * w + x) * 4) as usize;
-                bgra[i] = (x % 256) as u8; // B
-                bgra[i + 1] = (y % 256) as u8; // G
-                bgra[i + 2] = 128; // R
-                bgra[i + 3] = 255; // A
-            }
-        }
-
-        enc.force_keyframe();
-        // Encode a few frames; the first IDR should decode.
-        let mut decoded = None;
-        for _ in 0..3 {
-            let bits = enc.encode_bgra(&bgra).expect("encode");
-            if bits.is_empty() {
-                continue;
-            }
-            if let Some(frame) = dec.decode_rgba(&bits).expect("decode") {
-                decoded = Some(frame);
-                break;
-            }
-        }
-        let (dw, dh, rgba) = decoded.expect("decoder produced a frame");
-        assert_eq!((dw, dh), (w, h), "decoded dimensions match");
-        assert_eq!(rgba.len(), (w * h * 4) as usize);
-        // Alpha channel is filled opaque by write_rgba8.
-        assert!(rgba.iter().skip(3).step_by(4).all(|&a| a == 255));
+    #[test]
+    fn h264_idr_detection() {
+        // Annex-B start code + NAL header; type = byte & 0x1f (5 = IDR).
+        assert!(annexb_has_h264_idr(&[0, 0, 1, 0x65])); // 0x65 & 0x1f == 5
+        assert!(!annexb_has_h264_idr(&[0, 0, 1, 0x61])); // type 1 (non-IDR)
     }
 }

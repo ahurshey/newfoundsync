@@ -26,7 +26,7 @@ use newfoundsync_core::config::mono_now;
 
 use crate::media::{Frame as WireFrame, MSG_VIDEO};
 use crate::video::gpu::GpuConverter;
-use crate::video::mf_encoder::MfHevcEncoder;
+use crate::video::mf_encoder::MfEncoder;
 
 /// One captured frame: tightly-packed BGRA (`width*height*4`).
 pub struct CapturedFrame {
@@ -68,7 +68,7 @@ unsafe impl<T> Send for SendCell<T> {}
 /// GPU fast-lane state (lives on the capture thread). Convert+encode+broadcast happen here.
 struct GpuPipeline {
     converter: GpuConverter,
-    encoder: MfHevcEncoder,
+    encoder: MfEncoder,
     tx: broadcast::Sender<WireFrame>,
     lead_ns: i64,
 }
@@ -77,7 +77,7 @@ struct GpuPipeline {
 /// and the caller falls back to the CPU slot path.
 fn build_gpu_pipeline(p: GpuParams) -> Result<GpuPipeline> {
     let converter = GpuConverter::try_new(p.dw, p.dh).context("GPU converter")?;
-    let encoder = MfHevcEncoder::new_d3d(p.dw, p.dh, p.fps, p.bitrate_kbps, &converter.device)
+    let encoder = MfEncoder::new_d3d(p.dw, p.dh, p.fps, p.bitrate_kbps, &converter.device)
         .context("D3D-aware HEVC encoder")?;
     Ok(GpuPipeline {
         converter,

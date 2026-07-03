@@ -275,7 +275,7 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         // Codec advertised to clients (they pick the matching WebCodecs decoder). A *web-uplink*
         // caster always sends H.264 ("avc1"; browsers H.264-encode far more reliably). Otherwise it
         // follows the server encoder: AV1 ("av01", self-describing OBUs) for the royalty-free path,
-        // H.264 ("avc1", AVCC decode path) for software openh264, else Main-profile HEVC ("hev1" =
+        // else Main-profile HEVC ("hev1" =
         // params in-band, level 5.1 covers up to 4K; decoder reads params from the in-band VPS/SPS/PPS).
         video_codec: if !video_on {
             "hev1.1.6.L153.B0"
@@ -283,8 +283,6 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
             "avc1.42E01F"
         } else if matches!(opts.encoder, EncoderBackend::Av1) {
             "av01.0.04M.08"
-        } else if matches!(opts.encoder, EncoderBackend::Cpu) {
-            "avc1.42E01F"
         } else {
             "hev1.1.6.L153.B0"
         },
@@ -391,12 +389,12 @@ impl VideoProducer {
         let fps = cfg.fps.value();
         let bitrate = cfg.suggested_bitrate_kbps();
 
-        // Try the GPU zero-copy fast-lane unless the user forced CPU. It's built inside the
+        // Try the GPU zero-copy fast-lane unless AV1 is selected (AV1 uses the system-memory MF/SVT path). It's built inside the
         // capture callback (the only place the WGC device/context are valid); if it can't init
         // there it silently degrades to the CPU slot path below — which is why we still spawn
         // the producer thread and create its system-memory encoder LAZILY (only if a frame ever
         // reaches the slot, i.e. only when the GPU lane is NOT handling frames).
-        let gpu = if encoder_backend == EncoderBackend::Cpu {
+        let gpu = if encoder_backend == EncoderBackend::Av1 {
             None
         } else {
             Some(GpuParams { tx: tx.clone(), lead_ns, dw, dh, fps, bitrate_kbps: bitrate })

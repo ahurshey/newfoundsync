@@ -112,8 +112,6 @@ pub enum EncoderBackend {
     Auto,
     /// GPU hardware encode (Windows Media Foundation → AMD AMF / NVENC / QuickSync).
     Hardware,
-    /// CPU/software encode (openh264). Works everywhere.
-    Cpu,
     /// AV1 encode (royalty-free): GPU via Media Foundation where the hardware
     /// supports it (Intel Arc/Xe, NVIDIA RTX 40+, AMD RX 7000+), else CPU
     /// (SVT-AV1). The intended distribution default.
@@ -121,14 +119,13 @@ pub enum EncoderBackend {
 }
 
 impl EncoderBackend {
-    pub const ALL: [EncoderBackend; 4] =
-        [EncoderBackend::Auto, EncoderBackend::Hardware, EncoderBackend::Cpu, EncoderBackend::Av1];
+    pub const ALL: [EncoderBackend; 3] =
+        [EncoderBackend::Auto, EncoderBackend::Hardware, EncoderBackend::Av1];
 
     pub fn label(self) -> &'static str {
         match self {
             EncoderBackend::Auto => "Auto",
             EncoderBackend::Hardware => "Hardware (GPU)",
-            EncoderBackend::Cpu => "CPU (software)",
             EncoderBackend::Av1 => "AV1 (GPU/CPU)",
         }
     }
@@ -137,7 +134,6 @@ impl EncoderBackend {
         match self {
             EncoderBackend::Auto => "auto",
             EncoderBackend::Hardware => "hardware",
-            EncoderBackend::Cpu => "cpu",
             EncoderBackend::Av1 => "av1",
         }
     }
@@ -146,8 +142,7 @@ impl EncoderBackend {
         match s.to_ascii_lowercase().as_str() {
             "auto" => Some(EncoderBackend::Auto),
             "hardware" | "hw" | "gpu" => Some(EncoderBackend::Hardware),
-            "cpu" | "software" | "sw" => Some(EncoderBackend::Cpu),
-            "av1" | "svt-av1" | "svtav1" => Some(EncoderBackend::Av1),
+            "av1" | "svt-av1" | "svtav1" | "cpu" | "software" | "sw" => Some(EncoderBackend::Av1),
             _ => None,
         }
     }
@@ -232,7 +227,7 @@ mod tests {
             assert_eq!(EncoderBackend::parse(b.as_str()), Some(b));
         }
         assert_eq!(EncoderBackend::parse("GPU"), Some(EncoderBackend::Hardware));
-        assert_eq!(EncoderBackend::parse("software"), Some(EncoderBackend::Cpu));
+        assert_eq!(EncoderBackend::parse("software"), Some(EncoderBackend::Av1));
         assert_eq!(EncoderBackend::parse("nope"), None);
         assert_eq!(EncoderBackend::default(), EncoderBackend::Auto);
     }

@@ -395,51 +395,5 @@ impl Drop for MfEncoder {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::video::codec::H264Decoder;
-
-    /// Encode a frame on the GPU and decode it with openh264 — proves the GPU
-    /// pipeline runs AND its bitstream is compatible with our client decoder.
-    /// Ignored by default (needs a GPU H.264 encoder; run alone).
-    #[test]
-    #[ignore = "needs a GPU H.264 encoder; run alone"]
-    fn mf_encode_openh264_decode_roundtrip() {
-        let (w, h) = (640u32, 480u32);
-        let mut enc = match MfEncoder::new(w, h, 30, 4000) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("skipping: no hardware encoder ({e:#})");
-                return;
-            }
-        };
-        let mut dec = H264Decoder::new().expect("decoder");
-
-        let mut bgra = vec![0u8; (w * h * 4) as usize];
-        for y in 0..h {
-            for x in 0..w {
-                let i = ((y * w + x) * 4) as usize;
-                bgra[i] = (x % 256) as u8;
-                bgra[i + 1] = (y % 256) as u8;
-                bgra[i + 2] = 128;
-                bgra[i + 3] = 255;
-            }
-        }
-
-        let mut decoded = None;
-        for _ in 0..120 {
-            let bits = enc.encode_bgra(&bgra).expect("mf encode");
-            if bits.is_empty() {
-                continue;
-            }
-            if let Ok(Some(frame)) = dec.decode_rgba(&bits) {
-                decoded = Some(frame);
-                break;
-            }
-        }
-        let (dw, dh, rgba) = decoded.expect("openh264 decoded the GPU-encoded stream");
-        assert_eq!((dw, dh), (w, h), "decoded dims match");
-        assert_eq!(rgba.len(), (w * h * 4) as usize);
-    }
-}
+// (The old GPU-encode → openh264-decode roundtrip test was removed with the openh264
+// dependency. A hardware-free unit test for keyframe detection lives in codec.rs.)

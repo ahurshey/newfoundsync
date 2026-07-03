@@ -17,7 +17,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 # System-audio capture (loopback) still uses cpal; playback is now the browser's.
 cpal = "0.18.1"
-openh264 = "0.9.3"
 # Software AV1 encode (royalty-free codec). The default build fetches a prebuilt
 # SvtAv1Enc static lib for the target — on Windows this needs only curl/tar/certutil
 # (no CMake/NASM). Wraps SVT-AV1 v4.1.0. NOTE: this crate is edition 2024, so it

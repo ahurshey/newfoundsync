@@ -1202,7 +1202,7 @@ async function setupDecoders(c) {
     const r = await VideoDecoder.isConfigSupported(probe).catch(() => null);
     if (r && !r.supported) {
       const cc4 = (c.videoCodec || "").slice(0, 4);
-      const fam = cc4 === "avc1" ? "H.264" : cc4 === "av01" ? "AV1" : "HEVC/H.265";
+      const fam = cc4 === "avc1" ? "H.264" : cc4 === "av01" ? "AV1" : cc4 === "vp09" ? "VP9" : "HEVC/H.265";
       showWarn("⚠ This device can't decode the video codec (" + fam + "). Audio will still play.");
     } else {
       els.fsbtn.style.display = "flex";
@@ -1304,9 +1304,9 @@ function onVideoChunk(tsUs, key, annexb) {
         }
       }
     } else {
-      // HEVC (Annex-B, in-band VPS/SPS/PPS) or AV1 (self-describing low-overhead OBUs) from a native
-      // server source: configure WITHOUT a `description` and feed the raw access units as-is. Both
-      // codecs carry everything the decoder needs in the bitstream, so no avcC/hvcC blob is built.
+      // HEVC (Annex-B, in-band VPS/SPS/PPS), AV1 (low-overhead OBUs), or VP9 (raw frames) from a
+      // native server source: configure WITHOUT a `description` and feed the raw access units as-is.
+      // All three are self-describing in the bitstream, so no avcC/hvcC config blob is built.
       const vcfg = {
         codec: codecStr,
         optimizeForLatency: true,
@@ -1326,7 +1326,7 @@ function onVideoChunk(tsUs, key, annexb) {
           videoAvccMode = false;
           gotParams = true;
         } catch (e2) {
-          const famLabel = codecStr.slice(0, 4) === "av01" ? "AV1" : "HEVC/H.265";
+          const famLabel = codecStr.slice(0, 4) === "av01" ? "AV1" : codecStr.slice(0, 4) === "vp09" ? "VP9" : "HEVC/H.265";
           showWarn("⚠ Video decoder couldn't start — this device may not support " + famLabel + ". Audio still plays. (" + e2.message + ")");
           return;
         }

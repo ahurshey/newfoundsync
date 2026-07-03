@@ -9,8 +9,8 @@
 //!
 //! Wire frames (binary, server→browser):
 //!   audio: [0x01][pts i64 BE][Opus bytes]
-//!   video: [0x02][pts i64 BE][flags u8][Annex-B bytes — HEVC for a native capture, H.264 for a
-//!          web-uplink cast; the exact codec is advertised in MediaConfig.video_codec]
+//!   video: [0x02][pts i64 BE][flags u8][codec bytes — AV1 OBU or VP9 for a native capture,
+//!          H.264 Annex-B for a web-uplink cast; the exact codec is advertised in MediaConfig.video_codec]
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -277,6 +277,8 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         // server source is AV1 ("av01", self-describing OBUs) — the royalty-free codec.
         video_codec: if web_uplink {
             "avc1.42E01F"
+        } else if matches!(opts.encoder, EncoderBackend::Vp9) {
+            "vp09.00.10.08"
         } else {
             "av01.0.04M.08"
         },
@@ -419,9 +421,10 @@ impl VideoProducer {
                         got_any = true;
                     }
                     if !got_any && !warned_no_frame && started_at.elapsed() > Duration::from_secs(3) {
-                        // The GPU fast-lane bypasses this slot, so silence here doesn't mean "no
-                        // video" — only that the CPU path is idle (GPU active, or source occluded).
-                        tracing::debug!("video-producer: no CPU-path frame in 3s (GPU lane may be active)");
+                        // All video now flows through this capture slot (the HEVC GPU fast-lane was
+                        // removed), so 3s of silence means the source is idle — a minimized/occluded
+                        // window, or simply nothing changing on screen.
+                        tracing::debug!("video-producer: no captured frame in 3s (source idle/occluded?)");
                         warned_no_frame = true;
                     }
                     // Only encode when at least one browser is watching.

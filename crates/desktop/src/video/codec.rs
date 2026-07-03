@@ -100,8 +100,9 @@ impl Av1Encoder {
 }
 
 /// BGRA → I420 planar (BT.601 studio range), 2×2-averaged chroma. Planes are tightly
-/// packed (no row stride), which is what SVT-AV1 expects. Parallelized per row.
-fn bgra_to_i420(
+/// packed (no row stride) — what SVT-AV1 wants, and what the VP9 encoder copies into
+/// libvpx's strided image. Parallelized per row. `pub(crate)` so the VP9 encoder reuses it.
+pub(crate) fn bgra_to_i420(
     bgra: &[u8],
     w: usize,
     h: usize,
@@ -155,6 +156,7 @@ fn bgra_to_i420(
 /// arms expose the same encode/keyframe API.
 pub enum VideoEncoder {
     Av1Cpu(Av1Encoder),
+    Vp9Cpu(crate::video::vp9::Vp9Encoder),
     #[cfg(target_os = "windows")]
     Av1Gpu(crate::video::mf_encoder::MfEncoder),
 }
@@ -170,9 +172,14 @@ impl VideoEncoder {
         fps: u32,
         bitrate_kbps: u32,
     ) -> Result<VideoEncoder> {
-        let _ = backend;
-        // AV1 (royalty-free). Prefer a hardware AV1 encoder (Media Foundation) where the GPU has
-        // one; otherwise fall back to software SVT-AV1. Same "av01" stream either way.
+        if backend == EncoderBackend::Vp9 {
+            let e = crate::video::vp9::Vp9Encoder::new(width, height, fps, bitrate_kbps)
+                .context("software VP9 (libvpx) encoder")?;
+            tracing::info!("video: CPU VP9 (libvpx) encoder active");
+            return Ok(VideoEncoder::Vp9Cpu(e));
+        }
+        // AV1 (royalty-free, default). Prefer a hardware AV1 encoder (Media Foundation) where the GPU
+        // has one; otherwise fall back to software SVT-AV1. Same "av01" stream either way.
         #[cfg(target_os = "windows")]
         {
             match crate::video::mf_encoder::MfEncoder::new_av1(width, height, fps, bitrate_kbps) {
@@ -192,6 +199,7 @@ impl VideoEncoder {
     pub fn encode_bgra(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
         match self {
             VideoEncoder::Av1Cpu(e) => e.encode_bgra(bgra),
+            VideoEncoder::Vp9Cpu(e) => e.encode_bgra(bgra),
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(e) => e.encode_bgra(bgra),
         }
@@ -200,17 +208,20 @@ impl VideoEncoder {
     pub fn force_keyframe(&mut self) {
         match self {
             VideoEncoder::Av1Cpu(e) => e.force_keyframe(),
+            VideoEncoder::Vp9Cpu(e) => e.force_keyframe(),
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(e) => e.force_keyframe(),
         }
     }
 
     /// True if this emitted access unit is a keyframe the browser can start/recover decoding
-    /// from — for AV1, a Sequence Header OBU (type 1) rides with each keyframe temporal unit.
-    /// (H.264 IDR detection for the web-cast relay lives in `annexb_has_h264_idr`.)
+    /// from. AV1: a Sequence Header OBU (type 1) rides with each keyframe. VP9: the uncompressed
+    /// header's frame_type bit. (H.264 IDR detection for the web-cast relay lives in
+    /// `annexb_has_h264_idr`.)
     pub fn is_keyframe(&self, au: &[u8]) -> bool {
         match self {
             VideoEncoder::Av1Cpu(_) => obu_has_av1_keyframe(au),
+            VideoEncoder::Vp9Cpu(_) => crate::video::vp9::vp9_frame_is_keyframe(au),
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(_) => obu_has_av1_keyframe(au),
         }
@@ -220,6 +231,7 @@ impl VideoEncoder {
     pub fn backend_label(&self) -> &'static str {
         match self {
             VideoEncoder::Av1Cpu(_) => "CPU (SVT-AV1)",
+            VideoEncoder::Vp9Cpu(_) => "CPU (VP9/libvpx)",
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(_) => "GPU AV1 (Media Foundation)",
         }

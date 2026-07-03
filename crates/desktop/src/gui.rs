@@ -60,10 +60,9 @@ const RES_LABELS: [(&str, &str); 4] = [
     ("1440p", "1440p"),
     ("2160p (4K)", "2160p"),
 ];
-const ENC_LABELS: [(&str, &str); 3] = [
-    ("Auto (GPU HEVC)", "auto"),
-    ("GPU only (HEVC)", "hardware"),
+const ENC_LABELS: [(&str, &str); 2] = [
     ("AV1 (royalty-free)", "av1"),
+    ("VP9 (royalty-free)", "vp9"),
 ];
 
 /// Initial server config (from CLI flags) used to seed the GUI + first stream.
@@ -177,15 +176,9 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         None => (VideoSourceKind::Off, 1, false),
     };
     let enc_idx = match init.encoder {
-        EncoderBackend::Auto => 0,
-        EncoderBackend::Hardware => 1,
-        EncoderBackend::Av1 => 2,
+        EncoderBackend::Av1 => 0,
+        EncoderBackend::Vp9 => 1,
     };
-    // The Codec picker exposes only HEVC/GPU (0) and AV1 (2); "GPU only" (1) has no GUI option
-    // and `is_av1 == (enc_idx == 2)` would render it as HEVC. Fold a `--encoder hardware` launch
-    // into Auto (0) so the GUI state and the encoder never disagree. (Auto and Hardware both resolve
-    // to GPU HEVC, so this changes no encoding behavior — only the picker's consistency.)
-    let enc_idx = if enc_idx == 1 { 0 } else { enc_idx };
 
     let mut app = ServerApp {
         server_name,
@@ -556,7 +549,7 @@ struct ServerApp {
     res_idx: usize,
     fps60: bool,
     enc_idx: usize,
-    video_quality_pct: u16, // HEVC quality as % of baseline bitrate (slider; 100 = default)
+    video_quality_pct: u16, // video quality as % of baseline bitrate (slider; 100 = default)
     buffer_ms: i32,
     /// The HTTP port the server is CURRENTLY bound to (fixed for this run; used in the URL/QR).
     port: u16,
@@ -846,7 +839,7 @@ impl ServerApp {
         } else {
             None
         };
-        let encoder = EncoderBackend::parse(ENC_LABELS[self.enc_idx].1).unwrap_or(EncoderBackend::Auto);
+        let encoder = EncoderBackend::parse(ENC_LABELS[self.enc_idx].1).unwrap_or(EncoderBackend::Av1);
 
         #[cfg(target_os = "windows")]
         let video_target = match (self.video_kind, self.video_hwnd) {
@@ -1403,14 +1396,17 @@ impl ServerApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Codec:").on_hover_text(
-                            "AV1 — royalty-free (SVT-AV1 on the CPU, or your GPU's AV1 encoder if it \
-                             has one). The only video codec the server encodes; HEVC and H.264 were \
-                             removed so the distributed binary carries no patent-encumbered codec.",
+                            "Both royalty-free. AV1 = best quality; uses your GPU's AV1 encoder if it \
+                             has one, else CPU (SVT-AV1). VP9 = a fallback that decodes on more older \
+                             devices (older Apple / Android / TVs) but encodes CPU-only (libvpx) here.",
                         );
-                        // AV1 is the only server video codec now. Keep enc_idx on the AV1 slot so the
-                        // rest of the wiring (which still carries an EncoderBackend) stays consistent.
-                        self.enc_idx = 2;
-                        ui.label("AV1 · royalty-free");
+                        let is_vp9 = self.enc_idx == 1;
+                        egui::ComboBox::from_id_salt("codec")
+                            .selected_text(if is_vp9 { "VP9 · royalty-free" } else { "AV1 · royalty-free" })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.enc_idx, 0, "AV1 · royalty-free");
+                                ui.selectable_value(&mut self.enc_idx, 1, "VP9 · royalty-free");
+                            });
                     });
                     ui.horizontal(|ui| {
                         ui.label("Quality:");

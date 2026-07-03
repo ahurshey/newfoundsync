@@ -66,8 +66,8 @@ struct Cli {
     /// Video frame rate: 30 or 60.
     #[arg(long, default_value = "30", value_parser = ["30", "60"])]
     fps: String,
-    /// Video encoder: auto (GPU, CPU fallback) | hardware | cpu.
-    #[arg(long, default_value = "auto")]
+    /// Video codec: av1 (royalty-free default; GPU AV1 or CPU SVT-AV1) | vp9 (royalty-free CPU fallback).
+    #[arg(long, default_value = "av1")]
     encoder: String,
     /// Audio source: allapps (survives mute) | system | app | web (a web client casts up to here).
     #[arg(long, default_value = "allapps")]
@@ -96,7 +96,7 @@ fn main() -> Result<()> {
     let codec = CodecKind::parse(&cli.codec)
         .ok_or_else(|| anyhow!("unknown codec '{}' (use opus or pcm)", cli.codec))?;
     let encoder = EncoderBackend::parse(&cli.encoder)
-        .ok_or_else(|| anyhow!("unknown encoder '{}' (use auto|hardware|cpu)", cli.encoder))?;
+        .ok_or_else(|| anyhow!("unknown encoder '{}' (use av1 or vp9)", cli.encoder))?;
     let capture_source = match cli.capture.as_str() {
         "allapps" | "exclude" | "all" => CaptureSource::AllExceptSelf,
         "system" => CaptureSource::System,

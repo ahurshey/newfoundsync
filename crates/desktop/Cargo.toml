@@ -22,6 +22,13 @@ cpal = "0.18.1"
 # (no CMake/NASM). Wraps SVT-AV1 v4.1.0. NOTE: this crate is edition 2024, so it
 # requires rustc >= 1.88 (run `rustup update` if the build complains).
 shiguredo_svt_av1 = "2026.1.0"
+# Software VP9 encode (royalty-free fallback to AV1) via libvpx. env-libvpx-sys ships
+# PRE-GENERATED bindings up to libvpx 1.13.0, so the repo pins libvpx to 1.13.0 (see vcpkg.json)
+# to match — newer libvpx has a different encoder ABI. Build supplies libvpx via vcpkg manifest
+# mode (`vcpkg install --triplet x64-windows-static` in the repo) + env: VPX_LIB_DIR /
+# VPX_INCLUDE_DIR (→ vcpkg_installed/x64-windows-static) / VPX_VERSION=1.13.0 / VPX_STATIC=1.
+# Static libvpx needs a matching CRT (RUSTFLAGS=-Ctarget-feature=+crt-static). See README build notes.
+env-libvpx-sys = "5.1.3"
 # Data-parallel pixel conversions (BGRA→NV12 / BGRA→RGB / scaling) across cores.
 rayon = "1"
 # Web server: serves the embedded web client + a WebSocket that clock-syncs and

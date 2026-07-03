@@ -101,6 +101,31 @@ automatically. On Linux you need `cmake`, a C compiler, and ALSA dev headers
 (`libasound2-dev`). The binary lands at `target\release\newfoundsync.exe`
 (`target/release/newfoundsync` on Linux).
 
+### Video codecs (AV1 default, VP9 fallback)
+
+Video is **AV1** by default — the SVT-AV1 encoder ships as a prebuilt library (no extra
+setup) and uses your GPU's hardware AV1 encoder when it has one. The **VP9** fallback links
+**libvpx**, which you supply via [vcpkg](https://github.com/microsoft/vcpkg). It's pinned to
+1.13.1 in `vcpkg.json` (to match the Rust bindings), so a one-time setup builds it:
+
+```powershell
+git clone https://github.com/microsoft/vcpkg C:\vcpkg
+C:\vcpkg\bootstrap-vcpkg.bat
+$env:VCPKG_ROOT = "C:\vcpkg"
+# From the repo root — builds libvpx 1.13.1 into .\vcpkg_installed\ :
+& "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows-static
+# env-libvpx-sys links `libvpx`, but vcpkg names it vpx.lib — alias it:
+Copy-Item vcpkg_installed\x64-windows-static\lib\vpx.lib vcpkg_installed\x64-windows-static\lib\libvpx.lib
+$env:VPX_LIB_DIR     = "$PWD\vcpkg_installed\x64-windows-static\lib"
+$env:VPX_INCLUDE_DIR = "$PWD\vcpkg_installed\x64-windows-static\include"
+$env:VPX_VERSION = "1.13.0"; $env:VPX_STATIC = "1"
+cargo build --release
+```
+
+> If the link step reports CRT conflicts (`LNK4098`), add
+> `$env:RUSTFLAGS = "-Ctarget-feature=+crt-static"`. (It linked fine without it in our testing,
+> but a static libvpx can require it on some toolchains.)
+
 > **Capture is Windows-only today** (WASAPI loopback + WGC/Media Foundation video). A Linux
 > server (PipeWire capture) is a planned port; the browser client already works everywhere.
 
@@ -134,7 +159,7 @@ newfoundsync --headless --video --resolution 1440p --fps 60
 | `--video` | off | Also share the screen |
 | `--resolution` | `1080p` | `720p` · `1080p` · `1440p` · `2160p` |
 | `--fps` | `30` | `30` or `60` |
-| `--encoder` | `auto` | `auto` (GPU→CPU) · `hardware` · `cpu` |
+| `--encoder` | `av1` | `av1` (royalty-free; GPU AV1 or CPU SVT-AV1) · `vp9` (royalty-free CPU fallback, needs libvpx) |
 | `--insecure-http` | off | Plain HTTP (WebCodecs then only works via localhost / a TLS proxy) |
 
 Run `newfoundsync --help` for the full list.

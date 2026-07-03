@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "newfoundsync",
+  "version-string": "0.2.0",
+  "description": "libvpx for the VP9 fallback encoder. Pinned to 1.13.1 (the 1.13.x line vcpkg carries) to match env-libvpx-sys's pre-generated 1.13.0 bindings — same ABI; newer libvpx differs. Build with: vcpkg install --triplet x64-windows-static, then set VPX_VERSION=1.13.0.",
+  "dependencies": ["libvpx"],
+  "builtin-baseline": "d87340acc46bdeda386037b38aca30136e667e47",
+  "overrides": [
+    { "name": "libvpx", "version": "1.13.1" }
+  ]
+}

@@ -5,3 +5,4 @@ Cargo.lock.bak
 # Runtime server logs / watchdog crash dumps (stderr+stdout capture) - not source
 /nfs-*.log
 /nfs-*.out
+vcpkg_installed/

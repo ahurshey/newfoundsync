@@ -104,45 +104,41 @@ impl Fps {
     }
 }
 
-/// Which encoder the server uses. Server-side only (the client just decodes
-/// H.264), so this lives apart from the negotiated [`VideoConfig`].
+/// Which video codec the server encodes. Server-side only (the client decodes whatever
+/// codec it's told to), so this lives apart from the negotiated [`VideoConfig`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncoderBackend {
-    /// Prefer the GPU; fall back to software if unavailable.
-    Auto,
-    /// GPU hardware encode (Windows Media Foundation → AMD AMF / NVENC / QuickSync).
-    Hardware,
-    /// AV1 encode (royalty-free): GPU via Media Foundation where the hardware
-    /// supports it (Intel Arc/Xe, NVIDIA RTX 40+, AMD RX 7000+), else CPU
-    /// (SVT-AV1). The intended distribution default.
+    /// AV1 (royalty-free, default): GPU via Media Foundation where the hardware supports it
+    /// (Intel Arc/Xe, NVIDIA RTX 40+, AMD RX 7000+), else CPU (SVT-AV1).
     Av1,
+    /// VP9 (royalty-free fallback): CPU via libvpx. Broader decode reach than AV1 on older
+    /// Apple / Android / smart TVs; no hardware VP9 encode except recent Intel QuickSync.
+    Vp9,
 }
 
 impl EncoderBackend {
-    pub const ALL: [EncoderBackend; 3] =
-        [EncoderBackend::Auto, EncoderBackend::Hardware, EncoderBackend::Av1];
+    pub const ALL: [EncoderBackend; 2] = [EncoderBackend::Av1, EncoderBackend::Vp9];
 
     pub fn label(self) -> &'static str {
         match self {
-            EncoderBackend::Auto => "Auto",
-            EncoderBackend::Hardware => "Hardware (GPU)",
-            EncoderBackend::Av1 => "AV1 (GPU/CPU)",
+            EncoderBackend::Av1 => "AV1 (royalty-free)",
+            EncoderBackend::Vp9 => "VP9 (royalty-free)",
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            EncoderBackend::Auto => "auto",
-            EncoderBackend::Hardware => "hardware",
             EncoderBackend::Av1 => "av1",
+            EncoderBackend::Vp9 => "vp9",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "auto" => Some(EncoderBackend::Auto),
-            "hardware" | "hw" | "gpu" => Some(EncoderBackend::Hardware),
-            "av1" | "svt-av1" | "svtav1" | "cpu" | "software" | "sw" => Some(EncoderBackend::Av1),
+            // Legacy aliases (auto/hardware/cpu/…) fold into the AV1 default.
+            "av1" | "svt-av1" | "svtav1" | "auto" | "hardware" | "hw" | "gpu" | "cpu"
+            | "software" | "sw" => Some(EncoderBackend::Av1),
+            "vp9" | "vpx" | "libvpx" => Some(EncoderBackend::Vp9),
             _ => None,
         }
     }
@@ -150,7 +146,7 @@ impl EncoderBackend {
 
 impl Default for EncoderBackend {
     fn default() -> Self {
-        EncoderBackend::Auto
+        EncoderBackend::Av1
     }
 }
 
@@ -226,10 +222,10 @@ mod tests {
         for b in EncoderBackend::ALL {
             assert_eq!(EncoderBackend::parse(b.as_str()), Some(b));
         }
-        assert_eq!(EncoderBackend::parse("GPU"), Some(EncoderBackend::Hardware));
-        assert_eq!(EncoderBackend::parse("software"), Some(EncoderBackend::Av1));
+        assert_eq!(EncoderBackend::parse("gpu"), Some(EncoderBackend::Av1));
+        assert_eq!(EncoderBackend::parse("vp9"), Some(EncoderBackend::Vp9));
         assert_eq!(EncoderBackend::parse("nope"), None);
-        assert_eq!(EncoderBackend::default(), EncoderBackend::Auto);
+        assert_eq!(EncoderBackend::default(), EncoderBackend::Av1);
     }
 
     #[test]

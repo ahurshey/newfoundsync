@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! Build script: on Windows, embed the app icon into newfoundsync.exe so it
 //! shows in Explorer, the taskbar, and the Start menu. No-op elsewhere.
 

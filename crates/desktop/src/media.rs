@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! Media producer: drives the existing capture + encode pipeline and publishes
 //! ready-to-send WebSocket frames onto broadcast channels. Each WebSocket client
 //! task subscribes and forwards; the browser does the buffering, clock-sync, and

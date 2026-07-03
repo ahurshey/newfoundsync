@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! Audio capture. v1 ships system-wide loopback (the whole output mix) via cpal's
 //! WASAPI loopback (building an *input* stream on the default *output* device,
 //! which cpal turns into a loopback capture and COM-initializes itself).

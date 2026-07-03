@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! Software H.264 encode/decode via openh264 (desktop video pipeline).
 //!
 //! Encode takes a tightly-packed BGRA frame (what the screen capture produces),

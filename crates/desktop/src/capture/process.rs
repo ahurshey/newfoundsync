@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! WASAPI process-loopback capture (Windows 10 2004+).
 //!
 //! Unlike endpoint loopback (cpal), this taps applications' render streams via

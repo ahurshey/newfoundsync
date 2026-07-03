@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! Self-signed TLS for the web server.
 //!
 //! Browsers only expose WebCodecs (and Wake Lock, etc.) in a *secure context* —

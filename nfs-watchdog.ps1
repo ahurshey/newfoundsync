@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 # Newfoundsync watchdog — keeps the GUI server alive across the intermittent AMD-driver GUI hang.
 #
 #   Run:   powershell -ExecutionPolicy Bypass -File .\nfs-watchdog.ps1

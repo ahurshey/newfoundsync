@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 // Newfoundsync service worker — makes the web client an installable PWA.
 //
 // Strategy: NETWORK-FIRST for the app shell. On a LAN the server is fast, so we always

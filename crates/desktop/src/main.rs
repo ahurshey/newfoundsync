@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! Newfoundsync server (web client edition).
 //!
 //! Captures this PC's audio (and optionally the screen), encodes it (Opus +

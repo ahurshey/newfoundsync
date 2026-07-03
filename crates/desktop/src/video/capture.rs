@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! Windows screen capture (Windows.Graphics.Capture) → BGRA frames.
 //!
 //! WGC delivers frames on a dedicated thread via a callback; we keep only the

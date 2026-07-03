@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! On-wire frame codec — the load-bearing byte contract.
 //!
 //! Ported field-for-field from `ensemble/internal/stream/wire.go`. Do NOT reorder

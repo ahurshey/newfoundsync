@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! System-wide loopback capture via cpal.
 //!
 //! Opens an *input* stream on the default *output* device — cpal sets the WASAPI

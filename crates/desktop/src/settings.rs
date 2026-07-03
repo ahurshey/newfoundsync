@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! Tiny persisted server settings (currently just the HTTP port picked in the GUI).
 //!
 //! Stored as a dependency-free `key=value` text file in the OS config dir:

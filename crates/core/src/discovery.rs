@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! LAN service discovery over mDNS (`mdns-sd`). The server advertises
 //! `_newfoundsync._udp.local.` with its audio/clock ports and codec in TXT
 //! records; clients browse and present the list to pick from.

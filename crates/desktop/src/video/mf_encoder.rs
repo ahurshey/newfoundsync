@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! GPU hardware HEVC (H.265) encoder via Windows Media Foundation.
 //!
 //! Enumerates the system's hardware HEVC encoder MFT (AMD AMF / NVIDIA NVENC /

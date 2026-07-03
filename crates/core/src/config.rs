@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! Canonical audio constants, runtime defaults, and the single monotonic clock.
 //!
 //! Mirrors the canonical-format constants from `ensemble/internal/stream/wire.go`

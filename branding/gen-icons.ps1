@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 # Generates every icon form from branding/newfoundsync-logo.png.
 #
 #   - Detects the circular emblem's bounding box (color-keyed against the cream

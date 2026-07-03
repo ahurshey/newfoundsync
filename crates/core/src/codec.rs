@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! Audio codec: canonical PCM frame ⟷ wire payload.
 //!
 //! A canonical frame is [`FRAME_SAMPLE_COUNT`] interleaved L/R `i16` samples

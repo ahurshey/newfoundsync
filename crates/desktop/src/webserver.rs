@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! HTTP + WebSocket server (axum). Serves the embedded web client and a
 //! WebSocket that hands each browser the stream config, answers NTP-style
 //! clock-sync requests against the server's monotonic clock, and forwards the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! Video stream configuration — the user-facing resolution + frame-rate toggles.
 //!
 //! This is the fixed data model for the toggles (720p/1080p/2K/4K × 30/60). The

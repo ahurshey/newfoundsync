@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! Native server GUI (eframe). Pick the audio source to share — all apps, one
 //! specific app, or the full system output — optionally share the screen, and see
 //! the URL clients open plus how many are connected.

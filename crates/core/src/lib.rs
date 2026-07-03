@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! Newfoundsync core — the platform-neutral pieces the desktop binary shares:
 //! the wire protocol, codec (PCM/Opus) + frame constants, monotonic clock + audio
 //! config, video config, and mDNS discovery. Platform-specific audio *capture*

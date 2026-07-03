@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! Enumerate selectable audio sources for the server GUI: apps currently making
 //! sound (WASAPI audio sessions) AND visible windows (by title). Picking a window
 //! captures that window's process tree — the practical way to grab "the Chrome that

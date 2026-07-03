@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
+
 //! GPU zero-copy BGRA→NV12 color conversion via the D3D11 VideoProcessor.
 //!
 //! windows-capture creates its D3D11 device with BGRA_SUPPORT but NOT VIDEO_SUPPORT, so a

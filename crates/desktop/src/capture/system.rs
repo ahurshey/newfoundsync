@@ -143,8 +143,8 @@ impl SystemCapture {
 ///
 /// - **Windows:** the default *output* device opened as an *input* stream — cpal
 ///   sets `AUDCLNT_STREAMFLAGS_LOOPBACK` for render endpoints, capturing the mix.
-/// - **Linux:** a PulseAudio/PipeWire `.monitor` input device (the system output
-///   mirrored as a capture source), falling back to the default input device.
+/// - **Linux:** the system output's PulseAudio/PipeWire `.monitor` source (prefers the
+///   default sink's monitor). NEVER the microphone — errors if no monitor exists.
 /// - **Other:** the default input device (no system loopback in v1).
 #[cfg(target_os = "windows")]
 fn pick_capture_device(
@@ -163,17 +163,32 @@ fn pick_capture_device(
 fn pick_capture_device(
     host: &cpal::Host,
 ) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
-    // Prefer a PulseAudio/PipeWire monitor source (mirrors the system output).
-    let monitor = host
-        .input_devices()
-        .ok()
-        .and_then(|mut devs| devs.find(|d| d.to_string().to_lowercase().contains("monitor")));
-    let device = monitor.or_else(|| host.default_input_device()).ok_or_else(|| {
-        anyhow!(
-            "no '.monitor' source or default input device — enable a PulseAudio/\
-             PipeWire monitor source to share system audio"
-        )
-    })?;
+    // Capture the SYSTEM OUTPUT via its PulseAudio/PipeWire `.monitor` source only. We must NEVER
+    // fall back to the default input device — that's the microphone, and silently broadcasting it
+    // would be a privacy leak. Prefer the *default sink's* monitor (the active output), matched
+    // exactly; otherwise any `*.monitor` input; if none, fail with guidance.
+    // cpal::Device has no name() in this version; its Display (to_string) is the device name.
+    let default_sink = host.default_output_device().map(|d| d.to_string());
+    let device = default_sink
+        .as_ref()
+        .and_then(|sink| {
+            let want = format!("{sink}.monitor");
+            host.input_devices()
+                .ok()
+                .and_then(|mut it| it.find(|d| d.to_string() == want))
+        })
+        .or_else(|| {
+            host.input_devices().ok().and_then(|mut it| {
+                it.find(|d| d.to_string().to_lowercase().ends_with(".monitor"))
+            })
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "no PulseAudio/PipeWire monitor source found for the system output — refusing to \
+                 capture the microphone. Expose the active output sink's `<sink>.monitor` source \
+                 (sound settings, or `pactl`), or use `--capture web` to relay a browser cast."
+            )
+        })?;
     let cfg = device
         .default_input_config()
         .context("query monitor input format")?;

@@ -1207,6 +1207,19 @@ impl ServerApp {
     fn ui_audio_source(&mut self, ui: &mut egui::Ui) {
         let audio_quality = self.audio_quality_text();
         card(ui, |ui| {
+            // OS-appropriate source labels — WASAPI "mute" semantics don't apply on Linux/macOS.
+            #[cfg(target_os = "windows")]
+            const ALL_APPS_LABEL: &str = "All apps  —  recommended (keeps playing when Windows is muted)";
+            #[cfg(target_os = "linux")]
+            const ALL_APPS_LABEL: &str = "All apps  —  recommended (captures the system output)";
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            const ALL_APPS_LABEL: &str = "All apps  —  recommended";
+            #[cfg(target_os = "windows")]
+            const SYSTEM_LABEL: &str = "Full system output  —  goes silent when Windows is muted";
+            #[cfg(target_os = "linux")]
+            const SYSTEM_LABEL: &str = "Full system output  —  mirrors the speakers (follows system mute)";
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            const SYSTEM_LABEL: &str = "Full system output";
             eyebrow(ui, "AUDIO SOURCE");
             // Coupling: choosing a LOCAL audio source drops a cast-video selection (you can't relay
             // the caster's screen while capturing local audio — the uplink is one source).
@@ -1214,7 +1227,7 @@ impl ServerApp {
                 .radio_value(
                     &mut self.source,
                     SourceKind::AllApps,
-                    "All apps  —  recommended (keeps playing when Windows is muted)",
+                    ALL_APPS_LABEL,
                 )
                 .clicked()
                 && self.video_kind == VideoSourceKind::WebCast
@@ -1263,11 +1276,19 @@ impl ServerApp {
                     }
                 });
             }
+            #[cfg(not(target_os = "windows"))]
+            ui.label(
+                egui::RichText::new(
+                    "Per-app / single-window capture is Windows-only — on this OS use All apps or Full system output.",
+                )
+                .size(11.0)
+                .color(c_dim()),
+            );
             if ui
                 .radio_value(
                     &mut self.source,
                     SourceKind::System,
-                    "Full system output  —  goes silent when Windows is muted",
+                    SYSTEM_LABEL,
                 )
                 .clicked()
                 && self.video_kind == VideoSourceKind::WebCast

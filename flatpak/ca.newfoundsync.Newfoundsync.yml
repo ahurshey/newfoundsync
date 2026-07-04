@@ -7,8 +7,6 @@ app-id: ca.newfoundsync.Newfoundsync
 runtime: org.freedesktop.Platform
 runtime-version: '24.08'
 sdk: org.freedesktop.Sdk
-sdk-extensions:
-  - org.freedesktop.Sdk.Extension.rust-stable
 command: newfoundsync
 finish-args:
   - --socket=wayland          # egui window (Wayland)
@@ -18,20 +16,23 @@ finish-args:
   - --socket=pulseaudio       # capture system/loopback audio via PipeWire/Pulse
   - --share=network           # serve HTTP/WS + mDNS discovery on the LAN
 build-options:
-  append-path: /usr/lib/sdk/rust-stable/bin
-  # Local build: let cargo fetch crates during the build. (A Flathub submission would instead
-  # vendor them offline via a generated cargo-sources.json.)
+  # Local build: network is shared so cargo can fetch crates AND we can bootstrap rustc.
   build-args:
     - --share=network
   env:
     CARGO_HOME: /run/build/newfoundsync/cargo-home
+    RUSTUP_HOME: /run/build/newfoundsync/rustup
 modules:
   - name: newfoundsync
     buildsystem: simple
     build-commands:
+      # The 24.08 rust-stable SDK extension is rustc 1.89, but eframe 0.34.3 needs rustc 1.92, so
+      # bootstrap a current stable toolchain with rustup instead. (curl ships in the Freedesktop SDK.)
+      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh
+      - sh rustup-init.sh -y --profile minimal --default-toolchain stable --no-modify-path
       # Default features = the egui GUI. Video encoders (SVT-AV1/libvpx) are cfg(windows)-only,
       # so this Linux build is audio + web-cast relay — no libvpx/SVT-AV1 C deps pulled in.
-      - cargo build --release -p newfoundsync
+      - $CARGO_HOME/bin/cargo build --release -p newfoundsync
       - install -Dm755 target/release/newfoundsync /app/bin/newfoundsync
       - install -Dm644 flatpak/ca.newfoundsync.Newfoundsync.desktop /app/share/applications/ca.newfoundsync.Newfoundsync.desktop
       - install -Dm644 flatpak/ca.newfoundsync.Newfoundsync.metainfo.xml /app/share/metainfo/ca.newfoundsync.Newfoundsync.metainfo.xml

@@ -103,6 +103,14 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
     let (ready_tx, ready_rx) = mpsc::channel::<Option<watch::Receiver<Arc<StreamState>>>>();
 
     let initial_opts = init.to_options(&server_name);
+    // If the chosen source can't start (e.g. no PipeWire monitor on Linux, or capture is
+    // unavailable in a sandbox), we still open the GUI by falling back to this no-capture web-cast
+    // relay — the window must never fail to appear just because a local capture failed.
+    let fallback_opts = MediaOptions {
+        capture_source: CaptureSource::WebUplink,
+        video: None,
+        ..init.to_options(&server_name)
+    };
 
     // Media-control thread: owns the live Media + watch sender. Builds captures off
     // the UI thread (a capture start can block for seconds).
@@ -120,9 +128,27 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
                     control_loop(m, tx, cmd_rx, status, starting);
                 }
                 Err(e) => {
-                    *status.lock().unwrap() = format!("Couldn't start: {e:#}");
-                    starting.store(false, Ordering::Relaxed);
-                    let _ = ready_tx.send(None);
+                    // The chosen source couldn't start (e.g. no PipeWire monitor / capture
+                    // unavailable). Don't kill the GUI — fall back to a no-capture web-cast relay
+                    // so the window still opens; show the error and let the operator Apply a source.
+                    tracing::error!("initial audio source failed: {e:#}; opening GUI in relay mode");
+                    match media::start(fallback_opts) {
+                        Ok(m) => {
+                            let (tx, rx) = watch::channel(Arc::new(StreamState::from_media(&m)));
+                            *status.lock().unwrap() = format!(
+                                "⚠ Audio source unavailable ({e}). Relaying web casts — pick a source and Apply."
+                            );
+                            starting.store(false, Ordering::Relaxed);
+                            let _ = ready_tx.send(Some(rx));
+                            control_loop(m, tx, cmd_rx, status, starting);
+                        }
+                        Err(e2) => {
+                            *status.lock().unwrap() =
+                                format!("Couldn't start: {e:#} (fallback also failed: {e2:#})");
+                            starting.store(false, Ordering::Relaxed);
+                            let _ = ready_tx.send(None);
+                        }
+                    }
                 }
             })?;
     }

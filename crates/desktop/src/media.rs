@@ -139,7 +139,7 @@ impl CastRelay {
     /// or hostile caster can't mislabel frames and strand receivers on a black frame — matching the
     /// local capture path (which also scans via `is_keyframe`). Web casts are always H.264 (avc1).
     pub fn push_video(&self, h264: &[u8]) {
-        let key = crate::video::codec::annexb_has_h264_idr(h264);
+        let key = crate::video::relay::annexb_has_h264_idr(h264);
         let pts = mono_now() + self.lead_ns;
         let mut msg = Vec::with_capacity(10 + h264.len());
         msg.push(MSG_VIDEO);

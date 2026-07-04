@@ -5,9 +5,16 @@
 //! the web server (WebSocket); the browser decodes via WebCodecs and renders to a
 //! canvas, A/V-synced to the audio via the shared master clock.
 
-pub mod codec;
-pub mod vp9;
+// Cross-platform: web-cast H.264 keyframe detection (no encoder / no C deps).
+pub mod relay;
 
+// The native video encoders + screen capture are Windows-only (the only platform with local
+// video capture today). On Linux the server builds audio + web-cast relay only, so these — and
+// their C deps (SVT-AV1, libvpx) — aren't compiled.
+#[cfg(target_os = "windows")]
+pub mod codec;
+#[cfg(target_os = "windows")]
+pub mod vp9;
 #[cfg(target_os = "windows")]
 pub mod capture;
 #[cfg(target_os = "windows")]

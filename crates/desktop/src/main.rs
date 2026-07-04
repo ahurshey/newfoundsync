@@ -12,6 +12,7 @@
 //! it). `--headless` runs server-only from those flags.
 
 mod capture;
+#[cfg(feature = "gui")]
 mod gui;
 mod media;
 mod settings;
@@ -124,20 +125,12 @@ fn main() -> Result<()> {
     // Effective HTTP port: an explicit --port wins, else the port last saved in the GUI,
     // else the built-in default. (The GUI lets users change + save this; it applies next launch.)
     let port = cli.port.or_else(settings::load_port).unwrap_or(config::DEFAULT_HTTP_PORT);
-    if cli.headless {
-        run_headless(
-            name,
-            capture_source,
-            video,
-            encoder,
-            codec,
-            cli.bitrate,
-            cli.buffer_ms,
-            port,
-            !cli.insecure_http,
-        )
-    } else {
-        gui::run(
+    // The GUI build (default `gui` feature) opens the picker window unless --headless. A build
+    // without the `gui` feature (the headless Linux/server .deb) has no GUI at all → always
+    // server-only, regardless of the flag.
+    #[cfg(feature = "gui")]
+    if !cli.headless {
+        return gui::run(
             port,
             name,
             gui::InitialConfig {
@@ -148,8 +141,23 @@ fn main() -> Result<()> {
                 codec,
                 bitrate: cli.bitrate,
             },
-        )
+        );
     }
+    #[cfg(not(feature = "gui"))]
+    if !cli.headless {
+        tracing::info!("built without the `gui` feature — running headless (server-only)");
+    }
+    run_headless(
+        name,
+        capture_source,
+        video,
+        encoder,
+        codec,
+        cli.bitrate,
+        cli.buffer_ms,
+        port,
+        !cli.insecure_http,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

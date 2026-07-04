@@ -1,0 +1,26 @@
+[Unit]
+Description=Newfoundsync — LAN audio sync server (headless)
+Documentation=https://github.com/ahurshey/newfoundsync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Default: web-cast relay — a browser casts audio UP to this server and other browsers listen in
+# sync. Needs no local audio hardware, so it runs fine under a locked-down DynamicUser. To instead
+# capture THIS host's own audio, change to `--capture system` (see packaging/README-debian.md for
+# the PipeWire/session caveats).
+ExecStart=/usr/bin/newfoundsync --headless --capture web
+Restart=on-failure
+RestartSec=3
+
+# Sandbox + a writable state dir for the persisted self-signed TLS cert and saved port.
+DynamicUser=yes
+StateDirectory=newfoundsync
+Environment=HOME=%S/newfoundsync
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

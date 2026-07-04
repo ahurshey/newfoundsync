@@ -238,25 +238,6 @@ impl VideoEncoder {
     }
 }
 
-/// H.264: 1-byte NAL header; nal_type = byte & 0x1f; IDR slice = 5. Scans Annex-B start codes.
-/// `pub` and codec-independent so the web-cast relay can re-derive the keyframe flag from a
-/// browser-uploaded H.264 AU (never trust the caster's wire byte) — even though the server no
-/// longer *encodes* H.264 itself.
-pub fn annexb_has_h264_idr(au: &[u8]) -> bool {
-    let mut i = 0usize;
-    while i + 3 < au.len() {
-        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
-            if au[i + 3] & 0x1f == 5 {
-                return true;
-            }
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    false
-}
-
 /// AV1 (low-overhead OBU): a keyframe temporal unit carries a Sequence Header OBU
 /// (obu_type == 1), which SVT-AV1 (and the MF encoder) emit with every keyframe. Scans
 /// the OBUs via their in-band size fields and returns true if a sequence header is present.
@@ -318,12 +299,5 @@ mod tests {
         assert!(!obu_has_av1_keyframe(&[0x12, 0x00, 0x32, 0x00]));
         // Temporal Delimiter + Sequence Header + Frame → keyframe.
         assert!(obu_has_av1_keyframe(&[0x12, 0x00, 0x0A, 0x00, 0x32, 0x00]));
-    }
-
-    #[test]
-    fn h264_idr_detection() {
-        // Annex-B start code + NAL header; type = byte & 0x1f (5 = IDR).
-        assert!(annexb_has_h264_idr(&[0, 0, 1, 0x65])); // 0x65 & 0x1f == 5
-        assert!(!annexb_has_h264_idr(&[0, 0, 1, 0x61])); // type 1 (non-IDR)
     }
 }

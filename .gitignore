@@ -6,3 +6,6 @@ Cargo.lock.bak
 /nfs-*.log
 /nfs-*.out
 vcpkg_installed/
+
+# Build artifacts dropped here for local pickup (debs, flatpak bundle)
+/dist/

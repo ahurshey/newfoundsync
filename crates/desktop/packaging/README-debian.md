@@ -12,15 +12,26 @@ default in the bundled systemd unit) or a PulseAudio/PipeWire **monitor** (`--ca
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential pkg-config libasound2-dev
+sudo apt install -y build-essential pkg-config libasound2-dev libopus-dev
 # Rust toolchain (skip if already installed):
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 . "$HOME/.cargo/env"
 cargo install cargo-deb
 ```
 
-`libasound2-dev` is ALSA for cpal (audio capture). **No** libvpx / SVT-AV1 / NASM / CMake are
-needed — the video encoders are Windows-only and aren't compiled into this build.
+`libasound2-dev` (ALSA, for cpal) and `libopus-dev` (Opus, for `audiopus_sys` — without it the
+crate tries to build Opus from vendored source and needs autotools) are the C deps. **No** libvpx
+/ SVT-AV1 / NASM / CMake are needed — the video encoders are Windows-only and aren't compiled here.
+
+**For the optional graphical build** (`cargo deb -p newfoundsync` *with* default features = the
+egui GUI), also install the display-stack dev libs:
+```bash
+sudo apt install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
+  libxcb1-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
+  libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+```
+> Verified on Ubuntu 26.04 (rustc 1.96, cargo-deb 3.7): both build + install + run — headless
+> `.deb` ≈ 2.7 MB, graphical ≈ 7.7 MB.
 
 ## 2. Get the code onto the box
 

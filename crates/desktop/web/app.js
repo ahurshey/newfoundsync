@@ -2747,7 +2747,15 @@ async function startCast(source) {
       // Tab/screen capture: the browser's own picker chooses the surface. We always take the audio
       // track; the video track is ALSO encoded + cast up IF the server's cast source has video
       // enabled (the CAST_GRANT says so) — otherwise it stays live but unused.
-      castStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      // MUSIC FIDELITY: explicitly disable echo-cancellation / noise-suppression / auto-gain. The
+      // browser turns those voice-DSP blocks ON by default for captured audio, which pumps the level
+      // and eats the highs on music — degrading the signal BEFORE the encoder (no bitrate recovers
+      // it). getDisplayMedia audio-constraint support is uneven, so we also applyConstraints on the
+      // live track below as a backstop.
+      castStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2, sampleRate: 48000 },
+      });
       if (!castStream.getAudioTracks().length) {
         castStream.getTracks().forEach((t) => t.stop());
         castStream = null;
@@ -2755,6 +2763,11 @@ async function startCast(source) {
         setCastStatus('⚠ No audio was shared. Re-share and tick "Share tab/system audio".');
         return;
       }
+      try {
+        await castStream.getAudioTracks()[0].applyConstraints({
+          echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+        });
+      } catch (e) {}
     }
   } catch (e) {
     castPending = null;
@@ -2799,13 +2812,24 @@ function onCastGrant(granted, p) {
     output: (chunk) => sendUpAudio(chunk),
     error: (e) => { setCastStatus("⚠ Encode error: " + e.message); stopCast(true); },
   });
-  castEnc.configure({
-    codec: "opus",
-    sampleRate: ac.sampleRate,
-    numberOfChannels: 2,
-    // Opus tops out at 510 kbps; clamp so a large server bitrate can't make configure() throw.
-    bitrate: Math.min(510000, Math.max(32000, p.audioBps || 128000)),
-  });
+  // Opus tops out at 510 kbps; clamp so a large server bitrate can't make configure() throw. A
+  // missing grant bitrate defaults to the transparent 510k (never silently drop to 128k).
+  const castBitrate = Math.min(510000, Math.max(32000, p.audioBps || 510000));
+  if (!p.audioBps) console.warn("cast: grant carried no audioBps — defaulting to 510 kbps");
+  try {
+    castEnc.configure({
+      codec: "opus",
+      sampleRate: ac.sampleRate,
+      numberOfChannels: 2,
+      bitrate: castBitrate,
+      bitrateMode: "variable",
+      // Tell Opus this is full-band MUSIC (matches the native path's Application::Audio), not voice.
+      opus: { application: "audio", signal: "music" },
+    });
+  } catch (e) {
+    // Older browser that rejects the opus/bitrateMode hints — fall back to the plain config.
+    castEnc.configure({ codec: "opus", sampleRate: ac.sampleRate, numberOfChannels: 2, bitrate: castBitrate });
+  }
   const proc = new MediaStreamTrackProcessor({ track });
   castReader = proc.readable.getReader();
   (async () => {

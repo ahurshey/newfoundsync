@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Newfoundsync
+Comment=LAN audio sharing with tight multi-room sync
+Exec=newfoundsync
+Icon=ca.newfoundsync.Newfoundsync
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Network;
+Keywords=audio;sync;lan;multiroom;cast;stream;

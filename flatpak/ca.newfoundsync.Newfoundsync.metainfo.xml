@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>ca.newfoundsync.Newfoundsync</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Newfoundsync</name>
+  <summary>LAN audio sharing with tight multi-room sync</summary>
+  <description>
+    <p>
+      Newfoundsync streams this PC's audio to any browser on the local network and keeps every
+      device playing in lock-step (sub-millisecond on a LAN). This is the desktop server: pick an
+      audio source, and listeners just open a web page — nothing to install on their end.
+    </p>
+    <p>
+      Audio is Opus over HTTPS + WebSocket; clients clock-sync NTP-style and schedule each frame to
+      a shared deadline. Includes per-device volume/sync trim and mic auto-calibration.
+    </p>
+  </description>
+  <launchable type="desktop-id">ca.newfoundsync.Newfoundsync.desktop</launchable>
+  <url type="homepage">https://newfoundsync.ca</url>
+  <url type="vcs-browser">https://github.com/ahurshey/newfoundsync</url>
+  <developer id="ca.newfoundsync">
+    <name>Alex Hurshman</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.0.1" date="2026-07-04"/>
+  </releases>
+</component>

@@ -1,0 +1,43 @@
+# Flatpak manifest — the GRAPHICAL Newfoundsync desktop server, built in-runtime.
+# Build from the repo root:
+#   flatpak-builder --user --force-clean --install-deps-from=flathub \
+#     --repo=/tmp/nfs-flatpak-repo build-dir flatpak/ca.newfoundsync.Newfoundsync.yml
+#   flatpak build-bundle /tmp/nfs-flatpak-repo ca.newfoundsync.Newfoundsync.flatpak ca.newfoundsync.Newfoundsync
+app-id: ca.newfoundsync.Newfoundsync
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: newfoundsync
+finish-args:
+  - --socket=wayland          # egui window (Wayland)
+  - --socket=fallback-x11     # …or X11
+  - --share=ipc               # X11 shared memory
+  - --device=dri              # GPU for the egui/glow window
+  - --socket=pulseaudio       # capture system/loopback audio via PipeWire/Pulse
+  - --share=network           # serve HTTP/WS + mDNS discovery on the LAN
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  # Local build: let cargo fetch crates during the build. (A Flathub submission would instead
+  # vendor them offline via a generated cargo-sources.json.)
+  build-args:
+    - --share=network
+  env:
+    CARGO_HOME: /run/build/newfoundsync/cargo-home
+modules:
+  - name: newfoundsync
+    buildsystem: simple
+    build-commands:
+      # Default features = the egui GUI. Video encoders (SVT-AV1/libvpx) are cfg(windows)-only,
+      # so this Linux build is audio + web-cast relay — no libvpx/SVT-AV1 C deps pulled in.
+      - cargo build --release -p newfoundsync
+      - install -Dm755 target/release/newfoundsync /app/bin/newfoundsync
+      - install -Dm644 flatpak/ca.newfoundsync.Newfoundsync.desktop /app/share/applications/ca.newfoundsync.Newfoundsync.desktop
+      - install -Dm644 flatpak/ca.newfoundsync.Newfoundsync.metainfo.xml /app/share/metainfo/ca.newfoundsync.Newfoundsync.metainfo.xml
+      - install -Dm644 branding/icon-128.png /app/share/icons/hicolor/128x128/apps/ca.newfoundsync.Newfoundsync.png
+      - install -Dm644 branding/icon-256.png /app/share/icons/hicolor/256x256/apps/ca.newfoundsync.Newfoundsync.png
+      - install -Dm644 branding/icon-512.png /app/share/icons/hicolor/512x512/apps/ca.newfoundsync.Newfoundsync.png
+    sources:
+      - type: dir
+        path: ..

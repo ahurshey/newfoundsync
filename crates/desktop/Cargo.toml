@@ -76,6 +76,16 @@ shiguredo_svt_av1 = "2026.1.0"
 # (→ vcpkg_installed/x64-windows-static) / VPX_VERSION=1.13.0 / VPX_STATIC=1. See README.
 env-libvpx-sys = "5.1.3"
 
+# Linux-only: native PulseAudio/PipeWire capture of the system output's monitor (cpal/ALSA can't
+# see PipeWire `.monitor` sources). libpulse ships in the Freedesktop runtime; the .deb build needs
+# libpulse-dev (Fedora: pulseaudio-libs-devel).
+[target.'cfg(target_os = "linux")'.dependencies]
+# libpulse-binding's lib is `libpulse_binding` and libpulse-simple-binding's is
+# `libpulse_simple_binding`; the ecosystem convention aliases them to `pulse` / `psimple`. Rename
+# via `package =` so the `use pulse::…` / `use psimple::…` in capture/pulse.rs resolve.
+pulse = { package = "libpulse-binding", version = "2" }
+psimple = { package = "libpulse-simple-binding", version = "2" }
+
 # Embed branding/icon.ico into newfoundsync.exe (Explorer / Start menu icon).
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1"

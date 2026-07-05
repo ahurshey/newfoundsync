@@ -25,6 +25,7 @@ use newfoundsync_core::codec::{CodecKind, Encoder};
 use newfoundsync_core::config::mono_now;
 use newfoundsync_core::video::{EncoderBackend, VideoConfig};
 
+#[cfg(not(target_os = "linux"))]
 use crate::capture::system::SystemCapture;
 
 /// Message tags (first byte of each broadcast/WS frame).
@@ -298,7 +299,10 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
 
 /// Holds whichever audio capture is running (stops it on drop).
 enum AudioCapture {
+    #[cfg(not(target_os = "linux"))]
     System(SystemCapture),
+    #[cfg(target_os = "linux")]
+    Pulse(crate::capture::pulse::PulseCapture),
     #[cfg(target_os = "windows")]
     Process(crate::capture::process::ProcessCapture),
     /// No local capture (web-uplink source — frames arrive over the WebSocket).
@@ -313,6 +317,18 @@ impl AudioCapture {
         match source {
             // The web-uplink source never reaches here — start() handles it without local capture.
             CaptureSource::WebUplink => unreachable!("WebUplink has no local capture"),
+
+            // Linux: capture the default sink's MONITOR via PulseAudio/PipeWire (the system output,
+            // never the mic). System / all-apps / per-app all map here (per-app is Windows-only).
+            #[cfg(target_os = "linux")]
+            CaptureSource::System | CaptureSource::AllExceptSelf | CaptureSource::App { .. } => {
+                let c = crate::capture::pulse::PulseCapture::start(on_frame)
+                    .context("start PulseAudio/PipeWire monitor capture")?;
+                let name = c.device_name.clone();
+                Ok((AudioCapture::Pulse(c), name))
+            }
+
+            #[cfg(not(target_os = "linux"))]
             CaptureSource::System => {
                 tracing::info!("[capture] starting audio source = SYSTEM endpoint loopback (cpal)");
                 let c = SystemCapture::start(on_frame).context("start system capture")?;
@@ -347,7 +363,7 @@ impl AudioCapture {
                     .context("start per-app process-loopback capture")?;
                 Ok((AudioCapture::Process(c), format!("App (PID {render_pid}, survives mute)")))
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             CaptureSource::AllExceptSelf | CaptureSource::App { .. } => {
                 tracing::warn!("process-loopback is Windows-only; using system loopback");
                 let c = SystemCapture::start(on_frame).context("start system capture")?;

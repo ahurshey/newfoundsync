@@ -1032,29 +1032,43 @@ impl ServerApp {
                 );
             }
             // ---- Calibrate all (Phase B): align every device at once over the mic ----
-            if n_identified >= 2 || calibrating {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if calibrating {
-                        if ui.button("⏹ Stop calibration").clicked() {
-                            do_stop_calib = true;
-                        }
-                        ui.label(
-                            egui::RichText::new("Aligning all devices…").size(11.5).color(c_accent()),
-                        );
-                    } else if ui
-                        .button("Calibrate all")
+            // Always render the control so the feature is discoverable; it only ENABLES once there
+            // are 2+ identified devices to align. (With fewer, "align all" has nothing to do — a
+            // lone device self-calibrates from its own browser's Calibrate button instead.)
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if calibrating {
+                    if ui.button("⏹ Stop calibration").clicked() {
+                        do_stop_calib = true;
+                    }
+                    ui.label(
+                        egui::RichText::new("Aligning all devices…").size(11.5).color(c_accent()),
+                    );
+                } else {
+                    let ready = n_identified >= 2;
+                    let resp = ui
+                        .add_enabled(ready, egui::Button::new("Calibrate all"))
                         .on_hover_text(
                             "Earliest-connected device plays a sync code; the rest listen on \
                              their mics and align at once. Devices must be in the same room \
                              with working mics. (Uses the coded signal.)",
                         )
-                        .clicked()
-                    {
+                        .on_disabled_hover_text(
+                            "Connect 2+ devices (same room, working mics) to align them. A single \
+                             device self-calibrates from its own browser.",
+                        );
+                    if resp.clicked() {
                         do_calibrate = true;
                     }
-                });
-            }
+                    if !ready {
+                        ui.label(
+                            egui::RichText::new("connect 2+ devices to align them")
+                                .size(11.5)
+                                .color(c_dim()),
+                        );
+                    }
+                }
+            });
             ui.add_space(4.0);
             // Per-client rows scroll independently — the one routinely-growing region. Distinct
             // id_salt from the right column's scroll area so their scroll states don't collide.

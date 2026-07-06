@@ -3,20 +3,39 @@
 
 // Newfoundsync service worker — makes the web client an installable PWA.
 //
-// Strategy: NETWORK-FIRST for the app shell. On a LAN the server is fast, so we always
-// serve fresh code when online (a cache-first SW would hand back stale app.js after a
-// rebuild — exactly the "hard-refresh didn't help" trap). We only fall back to the cached
-// shell when the network is unreachable, so an installed app still opens offline and shows
-// its reconnecting state instead of the browser's error page.
+// Strategy (deliberately conservative after a nasty cache-skew bug):
+//  - The SHELL (navigations, "/", "/app.js", and anything not a known static asset) is served
+//    NETWORK-ONLY, with a short timeout, and is NEVER answered from cache. Serving a stale cached
+//    app.js next to a fresh index.html is exactly the cross-build "half-broken, a reload won't fix
+//    it" skew. On network failure we return a network error so the browser retries — and
+//    index.html's <head> watchdog heals a genuinely stale shell (it does not depend on this SW).
+//  - Only build-agnostic STATIC assets (icons + manifest) are cached, for installability and
+//    offline icons; those use stale-while-revalidate. The cache bucket is build-stamped so
+//    activate() purges older buckets.
 //
-// The audio/video stream and clock-sync travel over the WebSocket (/ws), which service
-// workers never intercept — so streaming is completely unaffected by this file.
+// The audio/video stream and clock-sync travel over the WebSocket (/ws), which service workers
+// never intercept — streaming is unaffected by this file.
 
-const CACHE = "nfs-shell-" + "__NFS_BUILD__"; // build-stamped by the server → each build gets its own bucket; activate() purges the rest
-const SHELL = ["/", "/app.js", "/manifest.webmanifest", "/icon-128.png", "/icon-256.png", "/icon-512.png", "/icon-512-maskable.png", "/favicon.png"];
+const CACHE = "nfs-assets-" + "__NFS_BUILD__"; // build-stamped by the server; activate() purges the rest
+const STATIC = [
+  "/manifest.webmanifest",
+  "/icon-128.png",
+  "/icon-256.png",
+  "/icon-512.png",
+  "/icon-512-maskable.png",
+  "/favicon.png",
+];
+const FETCH_TIMEOUT_MS = 7000;
 
 self.addEventListener("install", (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // allSettled (NOT addAll): addAll is atomic, so one flaky asset fetch would reject the whole
+  // install and block this SW from ever activating — which is what let a bad state persist. Tolerate
+  // individual failures so a new SW always takes over.
+  e.waitUntil(
+    caches.open(CACHE)
+      .then((c) => Promise.allSettled(STATIC.map((u) => c.add(u))))
+      .then(() => self.skipWaiting())
+  );
 });
 
 self.addEventListener("activate", (e) => {
@@ -27,32 +46,50 @@ self.addEventListener("activate", (e) => {
   );
 });
 
+// fetch() with a timeout so a stalled request (e.g. an HTTP/1.1 connection-pool stall behind the
+// long-lived /ws socket) can't hang a navigation forever — it fails fast and the browser retries.
+function fetchWithTimeout(req, ms) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("sw-timeout")), ms);
+    fetch(req).then(
+      (r) => { clearTimeout(t); resolve(r); },
+      (err) => { clearTimeout(t); reject(err); }
+    );
+  });
+}
+
 self.addEventListener("fetch", (e) => {
   const req = e.request;
   const url = new URL(req.url);
-  // Only the same-origin app shell. Cross-origin, non-GET, and the /ws upgrade are left to
-  // the browser (WebSocket handshakes never reach the SW anyway).
+  // Leave cross-origin, non-GET, /version (the self-heal's source of truth), and /ws to the browser.
   if (req.method !== "GET" || url.origin !== self.location.origin) return;
-  // /version is the stale-shell detector's source of truth — never let the SW answer it from
-  // cache, or the self-heal check could compare against a stale build tag and never fire.
-  if (url.pathname === "/version") return;
+  if (url.pathname === "/version" || url.pathname === "/ws") return;
 
+  const isStatic = STATIC.indexOf(url.pathname) !== -1;
+
+  if (!isStatic) {
+    // SHELL: network-only, timed, NEVER from cache — no stale/cross-build shell can be handed back.
+    e.respondWith(fetchWithTimeout(req, FETCH_TIMEOUT_MS).catch(() => Response.error()));
+    return;
+  }
+
+  // STATIC asset: stale-while-revalidate. Serve the cached copy instantly if present and refresh in
+  // the background; otherwise go to the network and cache a clean 200.
   e.respondWith(
-    fetch(req)
-      .then((res) => {
-        // Cache a fresh copy of successful responses for offline use. (Same-origin is
-        // already guaranteed above; no res.type filter — that could skip caching behind a
-        // proxy/redirect and leave a stale offline shell.) Only a clean 200 — never a 206
-        // partial or a redirect, which would poison the offline shell.
-        if (res && res.status === 200) {
-          const copy = res.clone();
-          caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
-        }
-        return res;
-      })
-      .catch(() =>
-        // Offline: serve the cached resource, or the cached shell for navigations.
-        caches.match(req).then((hit) => hit || (req.mode === "navigate" ? caches.match("/") : Response.error()))
-      )
+    caches.match(req).then((hit) => {
+      const net = fetchWithTimeout(req, FETCH_TIMEOUT_MS)
+        .then((res) => {
+          if (res && res.status === 200) {
+            const copy = res.clone();
+            caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
+          }
+          return res;
+        });
+      if (hit) {
+        net.catch(() => {}); // background refresh; ignore failures
+        return hit;
+      }
+      return net.catch(() => Response.error());
+    })
   );
 });

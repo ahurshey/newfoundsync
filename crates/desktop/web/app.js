@@ -2,6 +2,11 @@
 // Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
 
 "use strict";
+// FIRST executable line: stamp the build this app.js was compiled for, BEFORE any DOM access that
+// could throw on a cross-build skew. index.html's <head> watchdog heals if this never matches the
+// server's /version (a stale, hung, or throwing app.js), so recovery never depends on the rest of
+// this file loading or running. The server replaces __NFS_BUILD__ with the current build tag.
+window.__NFS_APP_BOOT = "__NFS_BUILD__";
 // Newfoundsync web client.
 //
 // Connects a WebSocket to the Rust server, NTP-syncs to the server's monotonic
@@ -321,46 +326,11 @@ if (els.zoomout) els.zoomout.addEventListener("click", () => setZoom(pageZoom - 
 if (els.zoomin) els.zoomin.addEventListener("click", () => setZoom(pageZoom + 0.1));
 
 // ---- PWA + self-heal --------------------------------------------------------
-// Emergency reset hatch: opening "…/?reset" unregisters the service worker, clears every cache
-// and saved setting, then reloads clean. Hand this URL to anyone whose client is stuck on a stale
-// build (it nukes the exact state that causes that). Runs first, before any other init.
-if (location.search.toLowerCase().includes("reset")) {
-  (async () => {
-    try { if (navigator.serviceWorker) { for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister(); } } catch (e) {}
-    try { if (window.caches) { for (const k of await caches.keys()) await caches.delete(k); } } catch (e) {}
-    try { localStorage.clear(); } catch (e) {}
-    location.replace(location.pathname); // reload clean, dropping ?reset
-  })();
-}
-
-// ---- Stale-shell self-heal (build handshake) --------------------------------
-// The server stamps a content build tag into app.js (NFS_BUILD, below) and into index.html
-// (window.__NFS_BUILD), and serves the CURRENT tag at /version. If a service worker handed us a
-// stale cached shell, our stamped tag won't match /version → drop the SW + caches and reload to
-// fresh code. THIS is why a plain refresh could previously strand the client on a mismatched build.
-// Runs early + async, so it still fires even if the (stale) rest of init throws before finishing.
-const NFS_BUILD = "__NFS_BUILD__"; // replaced with the build tag by the server at serve time
-(function verifyBuild() {
-  fetch("/version", { cache: "no-store" })
-    .then((r) => (r.ok ? r.text() : null))
-    .then((v) => {
-      if (v == null) return;
-      v = v.trim();
-      if (!v) return;
-      const idxTag = typeof window.__NFS_BUILD === "string" ? window.__NFS_BUILD : v;
-      if (v === NFS_BUILD && v === idxTag) return; // fresh: both app.js AND index.html match the server
-      // Stale shell → self-heal, but throttle so a persistent mismatch can't loop-reload forever.
-      const last = +(sessionStorage.getItem("nfs_healed_at") || 0);
-      if (Date.now() - last < 15000) { console.warn("stale shell but recently self-healed — not looping"); return; }
-      try { sessionStorage.setItem("nfs_healed_at", String(Date.now())); } catch (e) {}
-      (async () => {
-        try { if (navigator.serviceWorker) { for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister(); } } catch (e) {}
-        try { if (window.caches) { for (const k of await caches.keys()) await caches.delete(k); } } catch (e) {}
-        location.reload(); // fresh app.js/index.html; keeps localStorage (settings/volume)
-      })();
-    })
-    .catch(() => {}); // offline / older server without /version → leave the client as-is
-})();
+// The stale-shell RECOVERY (the ?reset hatch + the /version build handshake + a boot watchdog) now
+// lives INLINE in index.html's <head>, so it runs BEFORE this file and can heal even when THIS
+// app.js is itself the stale / broken / hung shell. It used to live here, but it was dead code
+// behind app.js's top-level DOM access (els.canvas.getContext(...) etc.): a cross-build skew that
+// renamed any element id would throw above it, so it never ran. See index.html's <head>.
 
 // Register the SW (network-first — see sw.js — so it never serves stale code while the server is
 // reachable) and auto-heal: if a NEW build activates while this page is open, reload to pick it up.

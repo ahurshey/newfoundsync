@@ -37,15 +37,22 @@ const APP_JS: &str = include_str!("../web/app.js");
 const SERVICE_WORKER: &str = include_str!("../web/sw.js");
 const MANIFEST: &str = include_str!("../web/manifest.webmanifest");
 
-/// A content build tag — FNV-1a hash of the served shell (app.js + index.html). It changes whenever
-/// either file changes, so a browser running a STALE (service-worker-cached) shell can detect the
-/// mismatch against `/version` and self-heal (drop the SW + caches, reload to fresh code). This is
-/// what stops a plain refresh from stranding a client on a mismatched build. Computed once.
+/// A content build tag — FNV-1a hash of the served shell (app.js + index.html + sw.js + manifest).
+/// It changes whenever ANY of those change, so a browser running a STALE (service-worker-cached)
+/// shell can detect the mismatch against `/version` and self-heal (drop the SW + caches, reload to
+/// fresh code). sw.js and the manifest are folded in so a change touching only one of them still
+/// rotates the tag/bucket and triggers the client's `<head>` self-heal. Computed once.
 fn build_tag() -> &'static str {
     static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TAG.get_or_init(|| {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
-        for &b in APP_JS.as_bytes().iter().chain(INDEX_HTML.as_bytes()) {
+        for &b in APP_JS
+            .as_bytes()
+            .iter()
+            .chain(INDEX_HTML.as_bytes())
+            .chain(SERVICE_WORKER.as_bytes())
+            .chain(MANIFEST.as_bytes())
+        {
             h ^= b as u64;
             h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a prime
         }
@@ -451,7 +458,12 @@ async fn service_worker() -> impl IntoResponse {
 
 async fn manifest() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "application/manifest+json; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "application/manifest+json; charset=utf-8"),
+            // no-cache: it's part of build_tag now, so a rebuilt manifest must not be masked by
+            // heuristic/HTTP caching (every other shell route is no-cache too).
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         MANIFEST,
     )
 }

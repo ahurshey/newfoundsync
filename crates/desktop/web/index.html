@@ -16,7 +16,58 @@
 <link rel="apple-touch-icon" href="/icon-256.png" />
 <title>Newfoundsync</title>
 <script>/* apply the saved theme before first paint so there's no flash of the wrong theme */try{if(localStorage.getItem("nfs_theme")==="light")document.documentElement.classList.add("light");}catch(e){}</script>
-<script>/* build tag the server stamps in; app.js compares it + its own to /version and self-heals a stale service-worker shell */window.__NFS_BUILD="__NFS_BUILD__";</script>
+<script>
+/* Build tag + STALE-SHELL RECOVERY. This lives in index.html's <head> (index.html is always served
+   network-fresh, and this runs BEFORE app.js) so it can heal a stale / broken / hung service-worker
+   shell even when app.js itself is the broken thing. It replaces the old app.js-internal self-heal,
+   which sat behind app.js's top-level DOM access and became dead code whenever a cross-build skew
+   renamed an element id. The server replaces __NFS_BUILD__ with the current build tag. */
+window.__NFS_BUILD = "__NFS_BUILD__";
+(function () {
+  var CAP = 3; // bounded so a persistent mismatch can't loop-reload forever
+  function heal(why) {
+    try {
+      var n = +(sessionStorage.getItem("nfs_heal_n") || 0);
+      if (n >= CAP) { console.warn("nfs: stale shell, heal cap reached — " + why); return; }
+      sessionStorage.setItem("nfs_heal_n", String(n + 1));
+    } catch (e) {}
+    console.warn("nfs: self-healing shell — " + why);
+    (async function () {
+      try { if (navigator.serviceWorker) { for (var r of await navigator.serviceWorker.getRegistrations()) await r.unregister(); } } catch (e) {}
+      try { if (window.caches) { for (var k of await caches.keys()) await caches.delete(k); } } catch (e) {}
+      location.reload();
+    })();
+  }
+  // Manual escape hatch: "…/?reset" nukes SW + caches + settings and reloads clean.
+  if (location.search.toLowerCase().indexOf("reset") !== -1) {
+    (async function () {
+      try { if (navigator.serviceWorker) { for (var r of await navigator.serviceWorker.getRegistrations()) await r.unregister(); } } catch (e) {}
+      try { if (window.caches) { for (var k of await caches.keys()) await caches.delete(k); } } catch (e) {}
+      try { localStorage.clear(); } catch (e) {}
+      location.replace(location.pathname);
+    })();
+    return;
+  }
+  // Build handshake: /version is the server's current tag (the SW never caches it). If this
+  // network-fresh index.html's tag != the server's, the whole shell is stale → heal.
+  try {
+    fetch("/version", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.text() : null; })
+      .then(function (v) {
+        if (v == null) return; v = v.trim(); if (!v) return;
+        if (v !== window.__NFS_BUILD) { heal("index " + window.__NFS_BUILD + " != server " + v); return; }
+        // index.html is fresh; confirm app.js actually BOOTED at the SAME build. app.js sets
+        // window.__NFS_APP_BOOT on its first line, so a stale (wrong tag), hung (never set), or
+        // fatally-throwing (set then threw) app.js is all caught here — the exact skew case.
+        setTimeout(function () {
+          if (window.__NFS_APP_BOOT === v) { try { sessionStorage.removeItem("nfs_heal_n"); } catch (e) {} return; }
+          heal("app.js did not boot at " + v + " (got " + window.__NFS_APP_BOOT + ")");
+        }, 8000);
+      })
+      .catch(function () {});
+  } catch (e) {}
+})();
+</script>
 <style>
   /* ---- Harbour Glass design tokens ---------------------------------------- */
   :root {

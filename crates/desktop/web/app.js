@@ -332,21 +332,19 @@ if (els.zoomin) els.zoomin.addEventListener("click", () => setZoom(pageZoom + 0.
 // behind app.js's top-level DOM access (els.canvas.getContext(...) etc.): a cross-build skew that
 // renamed any element id would throw above it, so it never ran. See index.html's <head>.
 
-// Register the SW (network-first — see sw.js — so it never serves stale code while the server is
-// reachable) and auto-heal: if a NEW build activates while this page is open, reload to pick it up.
-// Guarded so it never loops, never fires on first install, and never interrupts active playback.
+// NO service worker. A caching SW on a LAN app that's useless without a live server bought nothing
+// and repeatedly produced stale / half-broken shells that a plain reload couldn't fix (the SW was
+// serving the reload too). The page is served no-cache and always fetched fresh. We don't register
+// a worker; we only proactively CLEAN UP any SW + caches a previous build left behind, so returning
+// clients drop straight onto the plain page. (The served /sw.js is now a self-destruct stub and
+// index.html's <head> handshake is a second cleanup path — belt-and-suspenders.)
 if ("serviceWorker" in navigator) {
-  const hadController = !!navigator.serviceWorker.controller; // false on first-ever load
-  let swReloaded = false;
-  navigator.serviceWorker.addEventListener("controllerchange", () => {
-    if (!hadController || swReloaded) return; // first install → no reload; only react to a real update
-    swReloaded = true;
-    if (started) pendingSwReload = true; // mid-playback → defer the reload until they stop
-    else location.reload();
-  });
-  window.addEventListener("load", () => {
-    navigator.serviceWorker.register("/sw.js").catch((e) => console.warn("SW register failed", e));
-  });
+  navigator.serviceWorker.getRegistrations()
+    .then((rs) => rs.forEach((r) => r.unregister()))
+    .catch(() => {});
+}
+if (window.caches) {
+  caches.keys().then((ks) => ks.forEach((k) => caches.delete(k))).catch(() => {});
 }
 
 // ---- audio visualizer (the logo, shown for audio-only sources) --------------

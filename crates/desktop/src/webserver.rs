@@ -128,6 +128,21 @@ const MSG_CAST_GRANT: u8 = 0x33;
 /// C↔S: stop casting (caster requests, or operator stops it via the clients panel). `[0x34]`.
 const MSG_CAST_STOP: u8 = 0x34;
 
+// --- Cast / uplink safety limits ----------------------------------------------------------------
+/// Bounded per-client outbound queue, drained by a dedicated write task so a slow reader can never
+/// block the serve() loop (which must stay live to free the caster slot + registry entry on drop).
+const OUT_QUEUE: usize = 256;
+/// Per-socket write deadline: a wedged / half-open peer is evicted within this, not held forever.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Max caster uplink payload (AFTER the tag byte). Opus stays well under 8 KiB even at 510 kbps; 4 MiB
+/// covers a pathological H.264 keyframe while staying under the WS frame cap.
+const MAX_UP_AUDIO_BYTES: usize = 8 * 1024;
+const MAX_UP_VIDEO_BYTES: usize = 4 * 1024 * 1024;
+/// Floor for the per-connection caster upload budget (covers audio-only casts + overhead). The ACTUAL
+/// budget is derived per-connection from the server-dictated bitrate in serve() (see uplink_rate_exceeded),
+/// so no operator quality preset — up to the 80 Mbps video clamp — can false-trip the limiter.
+const UPLINK_MIN_BUDGET_BYTES: usize = 2 * 1024 * 1024;
+
 /// The connection id of the single active caster (web-uplink source), or `None`. Shared between
 /// the GUI (operator "Stop cast") and the per-client serve() tasks (claim/relay/release).
 pub type CastState = Arc<Mutex<Option<u64>>>;
@@ -494,7 +509,12 @@ async fn icon_512_maskable_png() -> impl IntoResponse {
 }
 
 async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| ws_client(socket, state))
+    // Cap WS message/frame size well below tungstenite's 64 MiB default so a malicious/buggy caster
+    // can't force huge per-message allocations (each fanned out to every receiver). Above any legit
+    // payload (see MAX_UP_* — largest is a 4 MiB video AU).
+    ws.max_message_size(8 * 1024 * 1024)
+        .max_frame_size(8 * 1024 * 1024)
+        .on_upgrade(move |socket| ws_client(socket, state))
 }
 
 /// Removes this client from the registry and decrements the connected-client
@@ -551,38 +571,85 @@ async fn ws_client(socket: WebSocket, state: Arc<AppState>) {
     serve(socket, &state, conn_id, ctrl_rx).await;
 }
 
+/// Per-connection sliding ~1 s byte-rate limiter for caster uplinks. Returns true once the caster has
+/// exceeded `budget` bytes in the current window (→ evict the abuser). `budget` is derived per-connection
+/// from the server-dictated bitrate (see serve()), so legitimate high-quality casts don't false-trip.
+fn uplink_rate_exceeded(
+    win_start: &mut std::time::Instant,
+    win_bytes: &mut usize,
+    add: usize,
+    budget: usize,
+) -> bool {
+    if win_start.elapsed().as_millis() >= 1000 {
+        *win_start = std::time::Instant::now();
+        *win_bytes = 0;
+    }
+    *win_bytes += add;
+    *win_bytes > budget
+}
+
 async fn serve(
     socket: WebSocket,
     state: &AppState,
     conn_id: u64,
     mut ctrl_rx: mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
-    let (mut sender, mut receiver) = socket.split();
+    let (sender, mut receiver) = socket.split();
 
     // Snapshot the active stream at connect time.
     let mut stream_rx = state.stream.clone();
     let active = stream_rx.borrow_and_update().clone();
 
-    if sender
+    // All outbound frames go through a BOUNDED channel drained by a dedicated write task, so a slow /
+    // non-reading client can never block this loop — it must stay live to observe disconnects and free
+    // the caster slot + registry entry (via ClientGuard) on return. Each socket write is timeout-bounded,
+    // so a wedged / half-open peer is evicted within WRITE_TIMEOUT rather than holding the slot forever.
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(OUT_QUEUE);
+    let mut write_handle = tokio::spawn(async move {
+        let mut sender = sender;
+        while let Some(msg) = out_rx.recv().await {
+            match tokio::time::timeout(WRITE_TIMEOUT, sender.send(msg)).await {
+                Ok(Ok(())) => {}
+                _ => break, // write error OR deadline exceeded → peer is dead (drops sender → socket closes)
+            }
+        }
+    });
+
+    // Config must be the client's first frame; the queue is empty so it lands immediately.
+    if out_tx
         .send(Message::Text(active.config_json.clone()))
         .await
         .is_err()
     {
+        write_handle.abort();
         return;
     }
     let mut arx = active.audio_tx.subscribe();
     let mut vrx = active.video_tx.subscribe();
 
+    // Per-connection uplink rate window + budget (caster-abuse guard, see uplink_rate_exceeded). The
+    // budget is derived from the bitrate the SERVER dictates to this caster (video_kbps + audio_bps) with
+    // ~3x keyframe-burst headroom, floored for audio-only casts — so no operator quality preset (up to the
+    // 80 Mbps video clamp) false-trips it, while a genuinely abusive flood is still cut off.
+    let mut win_start = std::time::Instant::now();
+    let mut win_bytes: usize = 0;
+    let uplink_budget = active
+        .cast_relay
+        .as_deref()
+        .map(|r| ((r.video_kbps as usize * 1000 + r.audio_bps as usize) / 8) * 3)
+        .unwrap_or(0)
+        .max(UPLINK_MIN_BUDGET_BYTES);
+
     loop {
         tokio::select! {
+            // The write task ended (write error or timeout) → the peer is gone; tear down.
+            _ = &mut write_handle => break,
             // The source was swapped (or the server is shutting down) — drop this
             // client so the browser reconnects and picks up the new stream.
             _ = stream_rx.changed() => break,
             // GUI → this client: forward a server-pushed control frame (e.g. SET_VOLUME).
             Some(msg) = ctrl_rx.recv() => {
-                if sender.send(Message::Binary(msg)).await.is_err() {
-                    break;
-                }
+                if out_tx.try_send(Message::Binary(msg)).is_err() { break; } // queue full (too far behind) or closed → evict
             }
             incoming = receiver.next() => {
                 match incoming {
@@ -597,9 +664,7 @@ async fn serve(
                         r.extend_from_slice(&t2.to_be_bytes());
                         let t3 = mono_now();
                         r.extend_from_slice(&t3.to_be_bytes());
-                        if sender.send(Message::Binary(r)).await.is_err() {
-                            break;
-                        }
+                        if out_tx.try_send(Message::Binary(r)).is_err() { break; }
                     }
                     // Calibration progress report (CALIB_CTRL STATUS) → store for the GUI.
                     Some(Ok(Message::Binary(b)))
@@ -657,14 +722,14 @@ async fn serve(
                                 })
                                 .unwrap_or(false);
                         let msg = cast_grant_msg(granted, active.cast_relay.as_deref());
-                        if sender.send(Message::Binary(msg)).await.is_err() {
-                            break;
-                        }
+                        if out_tx.try_send(Message::Binary(msg)).is_err() { break; }
                     }
                     // Web cast: the active caster's uploaded Opus packet → re-stamp + fan out.
                     Some(Ok(Message::Binary(b))) if b.first() == Some(&MSG_UP_AUDIO) && b.len() > 1 => {
                         let is_caster = state.cast.lock().map(|s| *s == Some(conn_id)).unwrap_or(false);
                         if is_caster {
+                            if b.len() - 1 > MAX_UP_AUDIO_BYTES { break; } // oversize payload → protocol abuse, evict
+                            if uplink_rate_exceeded(&mut win_start, &mut win_bytes, b.len(), uplink_budget) { break; }
                             if let Some(relay) = active.cast_relay.as_deref() {
                                 relay.push_audio(&b[1..]);
                             }
@@ -675,6 +740,9 @@ async fn serve(
                         let is_caster = state.cast.lock().map(|s| *s == Some(conn_id)).unwrap_or(false);
                         if is_caster {
                             if let Some(relay) = active.cast_relay.as_deref() {
+                                if !relay.video_on { break; } // audio-only stream must never relay video → evict
+                                if b.len() - 2 > MAX_UP_VIDEO_BYTES { break; } // oversize access unit → evict
+                                if uplink_rate_exceeded(&mut win_start, &mut win_bytes, b.len(), uplink_budget) { break; }
                                 relay.push_video(&b[2..]); // key flag re-derived server-side, not trusted from b[1]
                             }
                         }
@@ -694,26 +762,27 @@ async fn serve(
             }
             audio = arx.recv() => {
                 match audio {
-                    Ok(frame) => {
-                        if sender.send(Message::Binary((*frame).clone())).await.is_err() {
-                            break;
-                        }
-                    }
+                    Ok(frame) => match out_tx.try_send(Message::Binary((*frame).clone())) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {} // client behind; drop this frame (like Lagged)
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    },
                     Err(broadcast::error::RecvError::Lagged(_)) => {} // fell behind; skip
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
             video = vrx.recv() => {
                 match video {
-                    Ok(frame) => {
-                        if sender.send(Message::Binary((*frame).clone())).await.is_err() {
-                            break;
-                        }
-                    }
+                    Ok(frame) => match out_tx.try_send(Message::Binary((*frame).clone())) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {} // client behind; drop this frame
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    },
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
     }
+    write_handle.abort(); // stop the write task; out_tx drops here too, closing the channel
 }

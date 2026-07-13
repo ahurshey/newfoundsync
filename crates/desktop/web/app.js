@@ -283,7 +283,7 @@ function setTrim(ms) {
   try {
     localStorage.setItem("nfs_trim", String(trimMs));
   } catch (e) {}
-  aPlayhead = null; // re-anchor audio so the change takes effect immediately
+  reanchorAudio(); // re-anchor audio so the change takes effect immediately (+ cancel the stale buffered lead)
   flushVideo(); // re-time the video queue to the new offset
   reportSync(); // let the server GUI reflect this device's real sync
 }
@@ -425,6 +425,7 @@ let gotParams = false; // have we configured the video decoder from SPS/PPS yet?
 // the error callback, not the synchronous configure() — see onDecErr.)
 let videoAccel = "no-preference";
 let aPlayhead = null; // AudioContext time of the next audio frame (gapless scheduler)
+let liveSources = new Set(); // scheduled playout AudioBufferSourceNodes, so re-anchor/stop can cancel them
 let firstPlayoutAc = null; // ac time the first buffered audio is scheduled to sound
 let aRateInt = 0; // playout drift servo: integral accumulator (rate units, anti-windup clamped)
 let aRatePrev = 1.0; // last applied playback rate (per-frame slew limiting → smooth pitch)
@@ -444,6 +445,7 @@ const DECODE_AHEAD_MS = 500;
 const MAX_DECODED = 36; // hard ceiling on decoded frames held at once
 let reconnectAttempts = 0;
 let reconnectTimer = null;
+let connEpoch = 0; // bumped on every teardown; setupDecoders() captures it to discard stale post-await work
 let keepaliveTimer = null;
 let statsTimer = null;
 
@@ -857,6 +859,7 @@ function scheduleReconnect() {
 
 // Drop all per-connection resources. Keeps `ac`/`gain`/`wakeLock` alive.
 function teardownConnection() {
+  connEpoch++; // invalidate any in-flight setupDecoders() await from the connection being torn down
   // A reconnect resets the clock/anchor, which invalidates an in-flight calibration.
   calibAbort("Connection dropped — calibration cancelled.");
   // The uplink can't survive the socket; the server frees our caster slot on disconnect. Suspend an
@@ -888,6 +891,11 @@ function teardownConnection() {
   gotParams = false;
   videoAvccMode = false; // next stream re-detects the codec (avc1 web-cast vs av01/vp09 native) from its codec + first keyframe
   clearTimeout(noVideoFallbackTimer);
+  // Only on a DELIBERATE Stop: stop() suspends the AudioContext, which would otherwise freeze the
+  // scheduled lead and replay it (overlap) on the next Start. On a TRANSIENT reconnect we KEEP the
+  // buffered lead so it masks the gap (ac stays running; the next stream re-anchors where the lead
+  // drains) — cancelling it here would turn every brief blip into an audible dropout.
+  if (stopping) stopAudioSources();
   aPlayhead = null;
   firstPlayoutAc = null;
   offsetNs = null;
@@ -1035,7 +1043,7 @@ function onMessage(ev) {
       if (next !== remoteTrimMs) {
         remoteTrimMs = next;
         markAligned(effTrimMs() !== 0); // server push (or reset to 0) re-evaluates whether we're aligned
-        aPlayhead = null; // re-anchor audio so the new offset takes effect immediately
+        reanchorAudio(); // re-anchor audio so the new offset takes effect immediately (+ cancel stale lead)
         flushVideo(); // re-time the video queue too (mirror setTrim, so A/V stay aligned)
         reportSync(); // report the new effective total back so the GUI reflects it
       }
@@ -1085,7 +1093,7 @@ function onMessage(ev) {
       // Device fell behind: shed this frame. Re-anchor so the next decoded frame snaps back
       // to its true PTS instead of butting against the playhead and drifting permanently
       // ahead of the other clients (a silent desync is worse than one brief gap).
-      aPlayhead = null;
+      reanchorAudio(); // shed: cancel the buffered lead and hard re-anchor the next frame
       return;
     }
     const ptsNs = dv.getBigInt64(1, false);
@@ -1140,6 +1148,7 @@ function onConfig(text) {
 }
 
 async function setupDecoders(c) {
+  const epoch = connEpoch; // capture; after any await, bail if a reconnect/stream-switch bumped it (stale)
   // ---- audio ----
   const acfg = {
     codec: c.audioCodec || "opus",
@@ -1153,6 +1162,7 @@ async function setupDecoders(c) {
       return;
     }
   }
+  if (epoch !== connEpoch) return; // a reconnect/stream-switch happened during the support await → stale
   if (audioDecoder) return; // already set up on this connection
   audioDecoder = new AudioDecoder({ output: onAudioData, error: (e) => onDecErr("audio", e) });
   audioDecoder.configure(acfg);
@@ -1169,6 +1179,7 @@ async function setupDecoders(c) {
   } else if (c.video && window.VideoDecoder.isConfigSupported) {
     const probe = { codec: c.videoCodec || "av01.0.04M.08", optimizeForLatency: true };
     const r = await VideoDecoder.isConfigSupported(probe).catch(() => null);
+    if (epoch !== connEpoch) return; // reconnect during the video-support await → stale, don't touch UI
     if (r && !r.supported) {
       const cc4 = (c.videoCodec || "").slice(0, 4);
       const fam = cc4 === "avc1" ? "H.264" : cc4 === "av01" ? "AV1" : cc4 === "vp09" ? "VP9" : (c.videoCodec || "video");
@@ -1440,6 +1451,26 @@ setInterval(() => {
 // rate (≤±1%, inaudible), and we only hard re-anchor on a real discontinuity (resume /
 // gap / trim change). This is what makes a deep buffer play smoothly instead of garbled.
 // =============================================================================
+// Cancel every already-scheduled playout source. AudioContext.suspend() only freezes the clock — it does
+// NOT cancel scheduled AudioBufferSourceNodes — so without this a Stop/re-anchor would let previously
+// buffered audio replay and overlap the new stream. (Mirrors the calibration-tone cleanup.)
+function stopAudioSources() {
+  for (const s of liveSources) {
+    try {
+      s.onended = null;
+      s.stop();
+      s.disconnect();
+    } catch (e) {}
+  }
+  liveSources.clear();
+}
+// Re-anchor the audio scheduler at a discontinuity: drop the buffered lead (cancel scheduled sources) AND
+// force the next frame to hard re-anchor (aPlayhead === null).
+function reanchorAudio() {
+  stopAudioSources();
+  aPlayhead = null;
+}
+
 function onAudioData(ad) {
   aFrames++;
   if (!ac || ac.state !== "running" || offsetNs === null) {
@@ -1506,6 +1537,8 @@ function onAudioData(ad) {
   src.buffer = buf;
   src.playbackRate.value = rate; // gentle PI catch-up/slow-down (slew-limited, ≤±1%)
   src.connect(gain);
+  src.onended = () => liveSources.delete(src);
+  liveSources.add(src); // track so stop()/re-anchor can cancel this scheduled node (suspend() won't)
   src.start(aPlayhead);
   aPlayhead += dur / rate; // advance by the ACTUAL playout time (rate changes it)
 }
@@ -1521,7 +1554,7 @@ function onVisibility() {
     // After a background interval the clock and queue are stale: re-anchor.
     flushVideo();
     gotParams = false; // re-wait for the next keyframe
-    aPlayhead = null; // re-anchor audio
+    reanchorAudio(); // re-anchor audio (+ cancel the stale buffered lead from before backgrounding)
     firstPlayoutAc = null;
     offsets = [];
     offsetNs = null;
@@ -2536,7 +2569,7 @@ async function startListen() {
       if (trimMs !== bestTrim) setTrim(bestTrim);
       committed = true;
       markAligned(true); // calibration folds full output latency into trim → don't also model outLat (persisted)
-      aPlayhead = null; // re-anchor NOW: if bestTrim==current trim, setTrim above was skipped, so the
+      reanchorAudio(); // re-anchor NOW: if bestTrim==current trim, setTrim above was skipped, so the
       //                   outLatSec→0 transition would otherwise be slewed in over seconds (a brief desync)
       const moved = Math.round(bestTrim - startTrim);
       const latNote = selfLoopSec != null ? " (own latency " + Math.round(selfLoopMs) + " ms)" : " (own latency estimated — accuracy limited)";

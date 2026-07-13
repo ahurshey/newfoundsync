@@ -140,6 +140,9 @@ impl CastRelay {
     /// or hostile caster can't mislabel frames and strand receivers on a black frame — matching the
     /// local capture path (which also scans via `is_keyframe`). Web casts are always H.264 (avc1).
     pub fn push_video(&self, h264: &[u8]) {
+        if !self.video_on {
+            return; // audio-only relay must never emit video (defense-in-depth; webserver also gates this)
+        }
         let key = crate::video::relay::annexb_has_h264_idr(h264);
         let pts = mono_now() + self.lead_ns;
         let mut msg = Vec::with_capacity(10 + h264.len());
@@ -265,9 +268,17 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         name: opts.name,
         sample_rate: newfoundsync_core::config::SAMPLE_RATE,
         channels: newfoundsync_core::config::CHANNELS as u16,
-        audio_codec: match opts.codec {
-            CodecKind::Opus => "opus",
-            CodecKind::Pcm => "pcm",
+        // A web-uplink caster ALWAYS Opus-encodes its uplink (the browser's WebCodecs AudioEncoder;
+        // there is no local encoder here for --codec to drive), and browsers can't PCM-decode, so
+        // advertise "opus" regardless of opts.codec — mirroring the video_codec web_uplink case below.
+        // Otherwise honor the operator's codec for a native local source.
+        audio_codec: if web_uplink {
+            "opus"
+        } else {
+            match opts.codec {
+                CodecKind::Opus => "opus",
+                CodecKind::Pcm => "pcm",
+            }
         },
         video: video_on,
         frame_rate: fps,

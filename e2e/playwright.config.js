@@ -67,9 +67,11 @@ module.exports = defineConfig({
     // build box (works on Linux/CI). Re-enable after `npx playwright install firefox`:
     // { name: 'firefox', use: { ...devices['Desktop Firefox'] } },
   ],
-  // Boot the real server for the duration of the run, then kill it.
+  // Boot the real server for the duration of the run, then kill it. `--capture web` (web-uplink relay)
+  // needs NO local audio device, so this runs identically on the Windows build box and on headless
+  // Linux CI; the client still connects + serves, and the specs assert on state, not sound.
   webServer: {
-    command: `"${EXE}" --headless --insecure-http --port ${PORT}`,
+    command: `"${EXE}" --headless --insecure-http --capture web --port ${PORT}`,
     url: `${BASE}/version`,
     reuseExistingServer: !process.env.CI,
     timeout: 30_000,

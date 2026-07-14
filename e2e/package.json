@@ -1,0 +1,17 @@
+{
+  "name": "newfoundsync-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Browser end-to-end / full-loop tests for the Newfoundsync web client (Playwright). Boots the real server headless and drives the actual client — the integration coverage that Rust unit tests can't reach.",
+  "scripts": {
+    "test": "playwright test",
+    "test:chromium": "playwright test --project=chromium",
+    "test:firefox": "playwright test --project=firefox",
+    "test:webkit": "playwright test --project=webkit",
+    "test:headed": "playwright test --project=chromium --headed",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}

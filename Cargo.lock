@@ -2630,7 +2630,7 @@ dependencies = [
 
 [[package]]
 name = "newfoundsync"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2659,7 +2659,7 @@ dependencies = [
 
 [[package]]
 name = "newfoundsync-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "audiopus",

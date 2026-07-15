@@ -60,8 +60,17 @@ window.__NFS_BUILD = "__NFS_BUILD__";
         // window.__NFS_APP_BOOT on its first line, so a stale (wrong tag), hung (never set), or
         // fatally-throwing (set then threw) app.js is all caught here — the exact skew case.
         setTimeout(function () {
-          if (window.__NFS_APP_BOOT === v) { try { sessionStorage.removeItem("nfs_heal_n"); } catch (e) {} return; }
-          heal("app.js did not boot at " + v + " (got " + window.__NFS_APP_BOOT + ")");
+          // "Healthy" = app.js not only STARTED (boot stamp — set on its first line, before any init
+          // could throw) but also FINISHED init (ready stamp — set only after the Start handler is
+          // wired). Boot present + ready missing ⇒ app.js threw mid-startup, usually on a corrupt
+          // persisted value, so clear the likely culprits (persisted sync trim/alignment) too — not just
+          // the SW/caches — otherwise the reload would just re-crash.
+          if (window.__NFS_APP_BOOT === v && window.__NFS_APP_READY === v) {
+            try { sessionStorage.removeItem("nfs_heal_n"); } catch (e) {}
+            return;
+          }
+          try { localStorage.removeItem("nfs_trim"); localStorage.removeItem("nfs_aligned"); } catch (e) {}
+          heal("app.js did not finish init at " + v + " (boot=" + window.__NFS_APP_BOOT + " ready=" + window.__NFS_APP_READY + ")");
         }, 8000);
       })
       .catch(function () {});

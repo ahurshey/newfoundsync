@@ -139,6 +139,11 @@ let muted = false;
 let remoteVol = 1; // 0..1, server-controlled (SET_VOLUME); multiplies the local volume
 let trimMs = 0; // per-device sync trim (ms), persisted: + = play later, - = earlier
 let remoteTrimMs = 0; // server-controlled sync offset (SET_TRIM, ms); ADDS to the local trim
+// MUST be declared before loadTrim() runs (~line 313): loadTrim() writes `aligned` when restoring a
+// persisted nonzero nfs_trim, and a `let` still in its temporal dead zone throws a ReferenceError that
+// aborts the ENTIRE startup before the Start handler is wired — an inert Start button that only
+// clearing site data (which also wipes nfs_trim) "fixes". Keep it with the other persisted-state vars.
+let aligned = false; // true once an alignment is established (calibration / manual trim / server push)
 let chosenName = null; // in-memory device name; survives a failed localStorage write this session
 
 // The playout offset that actually drives scheduling = this device's own trim plus the
@@ -266,7 +271,9 @@ function markAligned(v) {
 function loadTrim() {
   try {
     const t = parseFloat(localStorage.getItem("nfs_trim"));
-    if (!Number.isNaN(t)) trimMs = t;
+    // isFinite (not just !isNaN) rejects a persisted "Infinity"; clamp to the slider range so a corrupt
+    // saved value can't poison scheduling. Mirrors setTrim().
+    if (Number.isFinite(t)) trimMs = Math.max(-2000, Math.min(3000, t));
   } catch (e) {}
   try { if (localStorage.getItem("nfs_aligned") === "1") aligned = true; } catch (e) {}
   if (trimMs !== 0) aligned = true; // legacy: a saved nonzero trim predates the flag → still aligned
@@ -415,7 +422,7 @@ let offsets = []; // recent clock samples: [{ off: ns, rtt: ms }]
 let pending = []; // clock-req send times (FIFO)
 let clockSyncT0 = 0; // performance.now() when the current clock (re-)anchor started (gate timeout)
 let outLatMs = 0; // cached speaker output latency (ms); modeled in the anchor only for un-aligned devices
-let aligned = false; // true once an alignment is established (calibration / manual trim / server push)
+// (`aligned` is declared up with the persisted-state vars near trimMs — it must exist before loadTrim())
 let audioDecoder = null;
 let videoDecoder = null;
 let gotParams = false; // have we configured the video decoder from SPS/PPS yet?
@@ -596,6 +603,10 @@ function avcCodecString(w, h, fps) {
 // Start (user gesture)
 // =============================================================================
 els.start.addEventListener("click", onStart);
+// Startup got far enough to wire the Start handler. index.html's <head> watchdog treats THIS — not the
+// line-1 boot stamp (which is set before any init could throw) — as "the client actually initialized";
+// if it's still missing after a few seconds the watchdog clears persisted state + self-heals.
+window.__NFS_APP_READY = window.__NFS_APP_BOOT;
 
 function onStart() {
   if (started) return;

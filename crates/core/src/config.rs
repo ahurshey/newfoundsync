@@ -23,8 +23,6 @@ pub const FRAME_DURATION_MS: i64 = 20;
 pub const FRAME_SAMPLES: usize = 960;
 /// Total PCM bytes in one canonical frame (FRAME_SAMPLES * CHANNELS * BYTES_PER_SAMPLE).
 pub const FRAME_BYTES: usize = FRAME_SAMPLES * CHANNELS * BYTES_PER_SAMPLE; // 3840
-/// PTS step per frame, in nanoseconds.
-pub const FRAME_NANOS: i64 = FRAME_DURATION_MS * 1_000_000;
 
 // ---- Runtime defaults --------------------------------------------------------
 
@@ -40,17 +38,27 @@ pub const DEFAULT_BITRATE_BPS: i32 = 510_000;
 pub const DEFAULT_BUFFER_MS: i64 = 3_000;
 /// Upper bound for the buffer slider — enough to ride out a truly awful link.
 pub const MAX_BUFFER_MS: i64 = 15_000;
+/// Lower bound. Below roughly this the buffer is thinner than normal Wi-Fi jitter, so playout
+/// underruns constantly and the stream crackles instead of playing.
+pub const MIN_BUFFER_MS: i64 = 200;
+
+/// Clamp a requested client buffer into the supported range.
+///
+/// The single definition of these bounds. They were previously open-coded as a bare `200` and
+/// `MAX_BUFFER_MS` at three call sites in the GUI, and — the actual bug — the HEADLESS entry point
+/// never clamped at all, so `--buffer-ms 999999` or a negative value went straight into the pipeline.
+/// The browser clamps the value it receives too (`app.js`), which is defence in depth, not a reason to
+/// ship a nonsense value: the operator's own UI would still be displaying it.
+pub fn clamp_buffer_ms(ms: i64) -> i64 {
+    ms.clamp(MIN_BUFFER_MS, MAX_BUFFER_MS)
+}
 /// Default server lead (ms): how far ahead of `mono_now()` the server stamps a
 /// frame's PTS, giving receivers budget to clock-sync and buffer before playout.
 pub const DEFAULT_LEAD_MS: i64 = 50;
 
-/// Default service ports. Fixed (not OS-assigned) so a client can reach a server
-/// by IP alone (manual connect) and users can open predictable firewall holes.
-/// The server falls back to an OS-assigned port if one is already in use.
-pub const DEFAULT_AUDIO_PORT: u16 = 47010;
-pub const DEFAULT_CLOCK_PORT: u16 = 47011;
-pub const DEFAULT_VIDEO_PORT: u16 = 47012;
-/// HTTP port the web client + WebSocket are served on (browse to `http://ip:PORT`).
+/// HTTP(S) port the web client + WebSocket are served on (browse to `https://ip:PORT`). The only
+/// port this app uses — the separate audio/clock/video UDP ports of the pre-WebSocket design are
+/// gone, so there is exactly one firewall hole to open.
 pub const DEFAULT_HTTP_PORT: u16 = 47000;
 
 // ---- The one monotonic clock -------------------------------------------------
@@ -97,8 +105,10 @@ mod tests {
     #[test]
     fn canonical_frame_math() {
         assert_eq!(FRAME_BYTES, 3840);
-        assert_eq!(FRAME_NANOS, 20_000_000);
         assert_eq!(FRAME_SAMPLES * CHANNELS * BYTES_PER_SAMPLE, FRAME_BYTES);
+        // 48 kHz for FRAME_DURATION_MS must yield exactly FRAME_SAMPLES — if these ever disagree the
+        // encoder gets short frames and Opus rejects them.
+        assert_eq!(SAMPLE_RATE as i64 * FRAME_DURATION_MS / 1000, FRAME_SAMPLES as i64);
     }
 
     #[test]
@@ -107,5 +117,28 @@ mod tests {
         let b = mono_now();
         let c = mono_now();
         assert!(a <= b && b <= c, "mono_now must be non-decreasing");
+    }
+
+    #[test]
+    fn clamp_buffer_ms_bounds_every_input() {
+        // In-range values pass through untouched.
+        assert_eq!(clamp_buffer_ms(DEFAULT_BUFFER_MS), DEFAULT_BUFFER_MS);
+        assert_eq!(clamp_buffer_ms(MIN_BUFFER_MS), MIN_BUFFER_MS);
+        assert_eq!(clamp_buffer_ms(MAX_BUFFER_MS), MAX_BUFFER_MS);
+        // The cases the headless CLI used to pass through unclamped.
+        assert_eq!(clamp_buffer_ms(999_999), MAX_BUFFER_MS);
+        assert_eq!(clamp_buffer_ms(0), MIN_BUFFER_MS);
+        assert_eq!(clamp_buffer_ms(-5_000), MIN_BUFFER_MS, "a negative buffer must not survive");
+        assert_eq!(clamp_buffer_ms(i64::MAX), MAX_BUFFER_MS);
+        assert_eq!(clamp_buffer_ms(i64::MIN), MIN_BUFFER_MS);
+    }
+
+    #[test]
+    fn buffer_bounds_are_coherent() {
+        // A default outside its own bounds would mean the untouched value gets silently changed.
+        assert!(MIN_BUFFER_MS < MAX_BUFFER_MS);
+        assert!(MIN_BUFFER_MS <= DEFAULT_BUFFER_MS && DEFAULT_BUFFER_MS <= MAX_BUFFER_MS);
+        // The lead must fit inside the smallest buffer, or the shallowest setting can never prime.
+        assert!(DEFAULT_LEAD_MS < MIN_BUFFER_MS);
     }
 }

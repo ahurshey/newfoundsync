@@ -29,7 +29,7 @@ flatpak run ca.newfoundsync.Newfoundsync
 
 - **Sandbox permissions** (`finish-args`): Wayland / X11 + `--device=dri` for the egui window,
   `--socket=pulseaudio` to capture system audio via PipeWire/Pulse, `--share=network` to serve the
-  HTTP/WebSocket + mDNS discovery on the LAN.
+  HTTPS + WebSocket to browsers on the LAN.
 - The manifest builds with `--share=network` so cargo can fetch crates during the build — fine for a
   local build. A Flathub submission would instead vendor crates offline via a generated
   `cargo-sources.json` (flatpak-cargo-generator).

@@ -30,7 +30,7 @@ use tokio::sync::watch;
 
 use newfoundsync_core::codec::CodecKind;
 use newfoundsync_core::config;
-use newfoundsync_core::discovery;
+use newfoundsync_core::net;
 use newfoundsync_core::video::{EncoderBackend, Fps, Resolution, VideoConfig};
 
 use media::{CaptureSource, MediaOptions};
@@ -105,6 +105,19 @@ fn main() -> Result<()> {
     tracing::info!(build = BUILD_ID, "newfoundsync starting");
     let name = cli.name.clone().unwrap_or_else(default_name);
 
+    // Clamp ONCE, here at the entry point, so every downstream path (headless and GUI seed alike) gets
+    // a sane value. The headless path previously passed --buffer-ms through unclamped.
+    let buffer_ms = config::clamp_buffer_ms(cli.buffer_ms);
+    if buffer_ms != cli.buffer_ms {
+        tracing::warn!(
+            requested = cli.buffer_ms,
+            using = buffer_ms,
+            "--buffer-ms outside the supported range ({}..={} ms); clamped",
+            config::MIN_BUFFER_MS,
+            config::MAX_BUFFER_MS
+        );
+    }
+
     // Parse the media config once; both GUI and headless use it.
     let codec = CodecKind::parse(&cli.codec)
         .ok_or_else(|| anyhow!("unknown codec '{}' (use opus or pcm)", cli.codec))?;
@@ -149,7 +162,7 @@ fn main() -> Result<()> {
                 capture_source,
                 video,
                 encoder,
-                buffer_ms: cli.buffer_ms,
+                buffer_ms,
                 codec,
                 bitrate: cli.bitrate,
             },
@@ -166,7 +179,7 @@ fn main() -> Result<()> {
         encoder,
         codec,
         cli.bitrate,
-        cli.buffer_ms,
+        buffer_ms,
         port,
         !cli.insecure_http,
     )
@@ -196,7 +209,7 @@ fn run_headless(
         encoder,
     })?;
 
-    let host = discovery::primary_lan_ipv4()
+    let host = net::primary_lan_ipv4()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "<this-pc>".to_string());
     let scheme = if use_tls { "https" } else { "http" };

@@ -44,6 +44,14 @@ const MSG_CAST_REQUEST = 0x32; // client→server: claim the single caster slot
 const MSG_CAST_GRANT = 0x33; // server→client: grant/deny + encode targets the caster must use
 const MSG_CAST_STOP = 0x34; // client↔server: stop casting (caster requests, or operator stops it)
 
+// Buffer bounds — MUST mirror crates/core/src/config.rs (MIN_BUFFER_MS / MAX_BUFFER_MS /
+// DEFAULT_BUFFER_MS). The server already clamps to this range at its entry point; the client clamps
+// again so an old or misconfigured server can't push a value that makes playout unusable. Named rather
+// than open-coded so the two sides can be checked against each other by eye.
+const MIN_BUFFER_MS = 200;
+const MAX_BUFFER_MS = 15000;
+const DEFAULT_BUFFER_MS = 3000;
+
 const els = {
   dot: document.getElementById("dot"),
   srv: document.getElementById("srv"),
@@ -1132,14 +1140,24 @@ function onConfig(text) {
   try {
     c = JSON.parse(text);
   } catch (e) {
+    // Do NOT swallow this. The config is the FIRST frame the server sends and everything downstream
+    // (decoders, buffer depth, codec choice) depends on it — so returning silently left the client
+    // sitting on a live socket that would never play, with nothing on screen and nothing in the
+    // console to explain why. The server hand-formats this JSON, so a bad field escapes here.
+    console.error("nfs: could not parse the server config —", e, "raw:", text);
+    showWarn(
+      "⚠ The server sent a stream config this client couldn't read, so playback can't start. " +
+        "The server is probably running a different build — check its version, and reload this page."
+    );
     return;
   }
   cfg = c;
   els.srv.textContent = c.name ? "· " + c.name : "";
-  // Honor the full server buffer (up to 10 s). It's cheap now: video is buffered as
-  // ENCODED chunks and only decoded just-in-time, so a deep buffer no longer means
-  // a wall of decoded surfaces.
-  bufferMs = Math.min(Math.max(c.bufferMs || 3000, 200), 15000);
+  // Honor the full server buffer. It's cheap now: video is buffered as ENCODED chunks and only
+  // decoded just-in-time, so a deep buffer no longer means a wall of decoded surfaces.
+  // Clamped to the same range the server enforces (config::MIN/MAX_BUFFER_MS + clamp_buffer_ms) —
+  // defence in depth against an old or misconfigured server, not a substitute for it.
+  bufferMs = Math.min(Math.max(c.bufferMs || DEFAULT_BUFFER_MS, MIN_BUFFER_MS), MAX_BUFFER_MS);
   const fps = c.frameRate || 30;
   // Encoded queue must hold the whole buffer's worth of frames (+ headroom).
   maxEvq = Math.ceil((fps * bufferMs) / 1000) + 90;

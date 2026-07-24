@@ -25,7 +25,7 @@ use tokio::sync::watch;
 
 use newfoundsync_core::codec::CodecKind;
 use newfoundsync_core::video::{EncoderBackend, Fps, Resolution, VideoConfig};
-use newfoundsync_core::{config, discovery};
+use newfoundsync_core::{config, net};
 
 use crate::media::{self, CaptureSource, Media, MediaOptions, VideoTarget};
 use crate::webserver::{self, ClientRegistry, StreamState};
@@ -177,7 +177,7 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
             })?;
     }
 
-    let lan = discovery::primary_lan_ipv4()
+    let lan = net::primary_lan_ipv4()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "<this-pc>".into());
     let url = format!("https://{lan}:{port}");
@@ -709,7 +709,7 @@ impl ServerApp {
             video_quality_pct: self.video_quality_pct,
             // Record the value apply() actually sends (clamped), so the dirty comparison and
             // the applied baseline agree even if buffer_ms was seeded out of range from the CLI.
-            buffer_ms: self.buffer_ms.clamp(200, config::MAX_BUFFER_MS as i32),
+            buffer_ms: config::clamp_buffer_ms(self.buffer_ms as i64) as i32,
             codec: self.codec,
             bitrate: self.bitrate,
         }
@@ -880,7 +880,7 @@ impl ServerApp {
             codec: self.codec,
             bitrate: self.bitrate,
             lead_ms: config::DEFAULT_LEAD_MS,
-            buffer_ms: self.buffer_ms.clamp(200, config::MAX_BUFFER_MS as i32) as i64,
+            buffer_ms: config::clamp_buffer_ms(self.buffer_ms as i64),
             capture_source,
             video,
             video_target,
@@ -1513,7 +1513,7 @@ impl ServerApp {
             // Buffer rationale folded into a hover on the slider (was a standalone 2-line paragraph)
             // to reclaim vertical space for the ad strip below.
             ui.add(
-                egui::Slider::new(&mut self.buffer_ms, 200..=(config::MAX_BUFFER_MS as i32))
+                egui::Slider::new(&mut self.buffer_ms, (config::MIN_BUFFER_MS as i32)..=(config::MAX_BUFFER_MS as i32))
                     .suffix(" ms"),
             )
             .on_hover_text(

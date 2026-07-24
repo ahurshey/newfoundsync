@@ -132,6 +132,12 @@ impl Encoder {
 // ---- Decoder -----------------------------------------------------------------
 
 /// Decodes wire payloads back into canonical PCM frames.
+///
+/// The shipping server never decodes — browsers do, and a web cast is relayed without decoding — so
+/// this has no production caller. It is kept deliberately, as the **test oracle for [`Encoder`]**:
+/// `pcm_roundtrip_is_lossless` and `opus_roundtrip_at_320k` verify the encoder emits something that
+/// actually decodes back, which no other check can establish. Don't remove it as "dead code" without
+/// replacing that coverage.
 pub enum Decoder {
     Pcm,
     Opus(OpusDecoder),

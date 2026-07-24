@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use newfoundsync_core::discovery;
+use newfoundsync_core::net;
 
 /// Where the persisted cert/key live (stable across restarts → accept once/device).
 fn cert_dir() -> PathBuf {
@@ -44,7 +44,7 @@ pub fn load_or_create_cert() -> Result<(Vec<u8>, Vec<u8>)> {
     // Subject Alternative Names: the LAN IP + hostname + localhost. (For a
     // self-signed cert the SAN doesn't remove the warning, but it's correct.)
     let mut sans: Vec<String> = vec!["localhost".into(), "127.0.0.1".into()];
-    if let Some(ip) = discovery::primary_lan_ipv4() {
+    if let Some(ip) = net::primary_lan_ipv4() {
         sans.push(ip.to_string());
     }
     if let Ok(host) = std::env::var("COMPUTERNAME") {

@@ -1,15 +1,16 @@
 # Newfoundsync
 
 **Lightweight LAN audio (and optional screen) sharing to any browser, with tight,
-Sonos-like multi-room sync.** One Windows PC — the **server** — captures its sound
+Sonos-like multi-room sync.** One PC (Windows or Linux) — the **server** — captures its sound
 and serves a small web app over your local network. Every other device (phone,
 tablet, laptop, TV browser) just **opens a URL** — nothing to install — buffers a
 few seconds, clock-syncs, and plays back in lock-step with everything else.
 
 Built in Rust. The sync core is ported from the proven
-[`ensemble`](../ensemble) project, with capture/discovery ideas from
-[`soundsync`](../soundsync). Windows server today (a Linux server is a planned
-port); the client is any modern browser.
+[`ensemble`](../ensemble) project, with capture ideas from
+[`soundsync`](../soundsync). The server runs on **Windows and Linux** — Linux does audio
+(PipeWire/PulseAudio monitor capture) and web-cast relay; local *screen* capture is still
+Windows-only. The client is any modern browser.
 
 ```
 ┌──────────────── server (this PC) ────────────────┐        ┌──────── browser client ────────┐
@@ -50,9 +51,10 @@ port); the client is any modern browser.
 - **Playout.** Each frame carries a presentation timestamp (PTS) on the server's master
   clock. Every client computes `playout = master→local(pts + buffer + per-device trim)`,
   so all devices land the same sample together. A jitter buffer reorders packets, gaps
-  become silence, late frames are dropped, and a gentle single-sample drift nudge bounds
-  long-run clock drift. Audio decodes via **WebCodecs Opus** and plays through a gapless
-  **Web Audio** scheduler.
+  become silence, and late frames are dropped. Long-run clock drift is bounded by a **PI
+  rate servo**: a deadbanded proportional term plus a leaky integrator trim the playback
+  rate by at most ±1 %, slew-limited so corrections stay inaudible. Audio decodes via
+  **WebCodecs Opus** and plays through a gapless **Web Audio** scheduler.
 - **Per-device alignment.** A **sync** slider (ms) per device, set by ear, or…
 - **Auto-calibration (mic).** A device emits a coded spread-spectrum signal (MLS / Gold
   code) and listens on its own microphone to measure and correct its real speaker→ear
@@ -169,9 +171,21 @@ cargo build --release          # builds crates/core + crates/desktop
 ```
 
 …or install CMake standalone (`winget install Kitware.CMake`); the MSVC compiler is found
-automatically. On Linux you need `cmake`, a C compiler, and ALSA dev headers
-(`libasound2-dev`). The binary lands at `target\release\newfoundsync.exe`
+automatically. The binary lands at `target\release\newfoundsync.exe`
 (`target/release/newfoundsync` on Linux).
+
+**On Linux**, build headless — that's the shipping configuration (no X11/Wayland/GL stack needed):
+
+```bash
+sudo apt install -y build-essential pkg-config cmake \
+  libasound2-dev libopus-dev libpulse-dev
+cargo build --release -p newfoundsync --no-default-features
+```
+
+`libpulse-dev` is easy to miss and the build hard-fails without it — it's the PipeWire/PulseAudio
+monitor capture (Fedora: `pulseaudio-libs-devel`). `libopus-dev` spares you building Opus from
+vendored source (which then wants autotools). Building *with* the GUI additionally needs the
+X11/Wayland/GL `-dev` packages — see `crates/desktop/packaging/README-debian.md`.
 
 ### Video codecs (AV1 default, VP9 fallback)
 
@@ -199,8 +213,12 @@ cargo build --release
 > `$env:RUSTFLAGS = "-Ctarget-feature=+crt-static"`. (It linked fine without it in our testing,
 > but a static libvpx can require it on some toolchains.)
 
-> **Capture is Windows-only today** (WASAPI loopback + WGC/Media Foundation video). A Linux
-> server (PipeWire capture) is a planned port; the browser client already works everywhere.
+> **What runs where.** *Audio* capture works on both: Windows via WASAPI loopback (whole-system or
+> per-app), Linux via a PipeWire/PulseAudio monitor. *Screen video* capture is **Windows-only**
+> (WGC + Media Foundation / SVT-AV1). To get video on Linux, have a browser cast it up —
+> `--capture web --video` (the `--video` flag is required; `--capture web` alone relays audio only,
+> and add `--resolution`/`--fps` to dictate the quality the caster encodes to). The browser client
+> works everywhere.
 
 ## Run
 
@@ -253,29 +271,65 @@ Run `newfoundsync --help` for the full list.
 
 A Cargo workspace:
 
-- **`crates/core`** — the platform-neutral engine: wire protocol, NTP-style clock sync,
-  codec (Opus/PCM), jitter buffer + deadline scheduler, the monotonic clock, and shared config.
-- **`crates/desktop`** — the Windows server binary (`newfoundsync`): WASAPI capture, Opus +
-  AV1/VP9 encode, the axum **HTTPS + WebSocket** server, the **embedded web client**, the
-  **egui** GUI, and the CLI.
+- **`crates/core`** — the small platform-neutral pieces: the Opus/PCM codec, the canonical frame +
+  buffer constants, the monotonic master clock, video config, and a LAN-address helper. Note what is
+  *not* here — the **wire protocol** lives beside the code that encodes and decodes it
+  (`crates/desktop/src/webserver.rs` + `media.rs` server-side, `web/app.js` client-side), and the
+  **clock-sync / jitter-buffer / playout** logic lives in the browser client. A `proto.rs` here once
+  claimed to be the authoritative byte contract while being entirely unreferenced *and* contradicting
+  the live wire; it was deleted rather than left to mislead.
+- **`crates/desktop`** — the server binary (`newfoundsync`): audio capture (WASAPI on Windows,
+  PipeWire/PulseAudio on Linux), Opus + AV1/VP9 encode (Windows), the axum **HTTPS + WebSocket**
+  server, the **embedded web client**, the **egui** GUI, and the CLI.
 - **`crates/desktop/web`** — the browser client (`index.html`, `app.js`, `sw.js`): WSS
   transport, clock sync, jitter buffer, WebCodecs decode, Web Audio playout, per-device
   controls, and mic calibration.
 - **`nfs-watchdog.ps1`** — optional helper that keeps a headless server alive (auto-restart +
   crash-log capture) on machines where the windowed GUI is unstable.
 
+## Tests
+
+Two suites, both run by CI on pushes to `main` and on PRs against it
+(`.github/workflows/ci.yml`):
+
+```bash
+cargo test --workspace --no-default-features    # sync core, codec, video config, buffer bounds
+```
+
+```bash
+cd e2e && npm ci && npx playwright install chromium && npx playwright test --project=chromium
+```
+
+The browser suite boots the **real** server binary headless on localhost and drives Chromium
+against it, so it covers the shell/reload/service-worker lifecycle that has historically been the
+actual source of bugs. Build the release binary first — the harness launches
+`target/release/newfoundsync`.
+
+One caveat worth knowing before you trust a green run: CI builds Linux + headless, so
+`gui.rs` and every Windows-only capture/encode module are **not compiled there**. Run
+`cargo check` locally on Windows before trusting a GUI or capture change.
+
 ## Status
 
-**Works today:** WASAPI capture (all-apps / per-app / system), Opus/PCM, HTTPS+WebSocket
-streaming to browser clients, NTP clock sync, jitter-buffered deadline-scheduled playout,
-drift nudging, per-device + master volume, per-device sync trim, mic auto-calibration
-(single + "Calibrate all"), client-reported sync, optional AV1/VP9 screen video, an egui
-server GUI with a live client mixer, a `/status` page, light/dark themes, and a headless CLI.
-The sync core is covered by the workspace test suite, including a hardware-free end-to-end
-loopback test.
+**Works today:** audio capture (WASAPI all-apps / per-app / system on Windows, PipeWire monitor on
+Linux), Opus/PCM, HTTPS+WebSocket streaming to browser clients, NTP clock sync, jitter-buffered
+deadline-scheduled playout, the PI rate servo, per-device + master volume, per-device sync trim, mic
+auto-calibration (single + "Calibrate all"), client-reported sync, optional AV1/VP9 screen video
+(Windows) or a browser cast as the source, an egui server GUI with a live client mixer, `/status` +
+`/health` pages, light/dark themes, and a headless CLI.
 
-**Planned:** a Linux server (PipeWire capture), FEC for lossy Wi-Fi, a full PI rate servo,
-and system-tray minimize.
+**Test coverage, honestly:** the workspace suite covers the codec round-trips, frame/buffer
+constants, and video config — all pure functions. The **sync and playout path itself is not unit
+tested**: the clock-offset selection, the PI servo, and the calibration correlation live in
+`app.js`, where the browser suite only asserts that playback *starts*, not that it lands at the
+right instant. Sync regressions are still caught by a human standing between two speakers.
+
+**Since shipped:** the Linux server (PipeWire/PulseAudio monitor capture, `.deb` packaging), the
+PI rate servo, web-client casting (a browser becomes the source), and the `/health` diagnostic
+endpoint.
+
+**Planned:** native Linux *screen* capture via the PipeWire ScreenCast portal, VA-API GPU encode,
+Flatpak packaging, FEC for lossy Wi-Fi, and system-tray minimize.
 
 This is a **trusted-LAN** tool: the TLS cert exists only to satisfy the browser's
 secure-context requirement (self-signed, accept-once). No accounts, no cloud, no

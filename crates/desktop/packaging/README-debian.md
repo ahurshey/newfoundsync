@@ -12,16 +12,18 @@ default in the bundled systemd unit) or a PulseAudio/PipeWire **monitor** (`--ca
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential pkg-config libasound2-dev libopus-dev
+sudo apt install -y build-essential pkg-config libasound2-dev libopus-dev libpulse-dev
 # Rust toolchain (skip if already installed):
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 . "$HOME/.cargo/env"
 cargo install cargo-deb
 ```
 
-`libasound2-dev` (ALSA, for cpal) and `libopus-dev` (Opus, for `audiopus_sys` — without it the
-crate tries to build Opus from vendored source and needs autotools) are the C deps. **No** libvpx
-/ SVT-AV1 / NASM / CMake are needed — the video encoders are Windows-only and aren't compiled here.
+The C deps: `libpulse-dev` (PipeWire/PulseAudio monitor capture — **the easiest one to miss, and the
+build hard-fails without it**; Fedora: `pulseaudio-libs-devel`), `libopus-dev` (Opus, for
+`audiopus_sys` — without it the crate builds Opus from vendored source and needs autotools), and
+`libasound2-dev` (ALSA, for cpal). **No** libvpx / SVT-AV1 / NASM / CMake are needed — the video
+encoders are Windows-only and aren't compiled here.
 
 **For the optional graphical build** (`cargo deb -p newfoundsync` *with* default features = the
 egui GUI), also install the display-stack dev libs:
@@ -35,10 +37,8 @@ sudo apt install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
 
 ## 2. Get the code onto the box
 
-The v0.0.1 source must be present. Either:
-
 ```bash
-git clone https://github.com/ahurshey/newfoundsync      # once the repo is pushed
+git clone https://github.com/ahurshey/newfoundsync
 # — or copy your working tree over (no build artefacts):
 rsync -av --exclude target --exclude vcpkg_installed ./newfoundsync/ user@server:~/newfoundsync/
 ```
@@ -48,7 +48,15 @@ rsync -av --exclude target --exclude vcpkg_installed ./newfoundsync/ user@server
 ```bash
 cd newfoundsync
 cargo deb -p newfoundsync --no-default-features
-# → target/debian/newfoundsync_0.0.1-1_amd64.deb
+```
+
+The `.deb` lands in `target/debian/` named for the **current** crate version — don't hardcode it,
+just read it back (this doc used to pin `0.0.1`, so every copy-pasted command below it failed after
+the first release):
+
+```bash
+DEB=$(ls -t target/debian/newfoundsync_*_amd64.deb | head -1)
+echo "$DEB"
 ```
 
 `--no-default-features` drops the `gui` feature (so no `eframe`/X11/Wayland/GL). Build *with* the
@@ -57,11 +65,12 @@ GUI only if you really want it — you'd then also need the X11/Wayland/GL `-dev
 ## 4. Install + run
 
 ```bash
-sudo apt install ./target/debian/newfoundsync_0.0.1-1_amd64.deb
+sudo apt install "./$DEB"              # $DEB from the previous step
 sudo systemctl enable --now newfoundsync
 systemctl status newfoundsync
 journalctl -u newfoundsync -f          # logs + the connect URL
 sudo ufw allow 47000/tcp               # open the port if a firewall is on
+newfoundsync --version                 # confirm which build is installed
 ```
 
 Open `https://<server-ip>:47000` in a LAN browser and accept the self-signed cert once
@@ -77,6 +86,8 @@ Open `https://<server-ip>:47000` in a LAN browser and accept the self-signed cer
   `loginctl enable-linger <user>` and a user PipeWire instance instead.
 - **State dir.** The persisted self-signed TLS cert + saved port live under `/var/lib/newfoundsync`
   (the unit points `HOME` there). If the log shows a cert/settings write error, check that path.
-- **Young port.** Newfoundsync is Windows-first; this Linux target compiles cleanly here for both
-  the default and `--no-default-features` configs, but it hasn't been run end-to-end on Linux yet.
-  If the build or run errors on your box, paste the output and we'll fix the platform gate.
+- **Scope of the Linux port.** Build, install, and run are verified on Ubuntu 26.04 (both the default
+  and `--no-default-features` configs), serving audio from a PipeWire/PulseAudio monitor plus
+  web-cast relay. What is *not* here: local **screen capture** and **per-app** audio capture, both
+  still Windows-only. If the build or run errors on your box, paste the output and we'll fix the
+  platform gate.

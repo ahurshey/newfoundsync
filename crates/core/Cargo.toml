@@ -10,7 +10,13 @@ name = "newfoundsync_core"
 
 [dependencies]
 anyhow = "1"
-thiserror = "2"
-tracing = "0.1"
-mdns-sd = "0.20.0"
+# Opus encode/decode (the only C dependency here).
 audiopus = "0.2.0"
+
+# Deliberately absent, and worth keeping absent:
+#   mdns-sd  — the discovery module that used it advertised a multi-server, three-UDP-port design that
+#              was replaced by one HTTPS+WebSocket server reached by URL/QR. Compiled into every build,
+#              never invoked.
+#   thiserror — only the deleted proto.rs used it. For the shipping headless Linux build this crate was
+#              its ONLY consumer, so dropping it removes thiserror + thiserror-impl from that build.
+#   tracing  — only the deleted discovery.rs used it. (The desktop crate still uses tracing directly.)

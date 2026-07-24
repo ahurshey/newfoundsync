@@ -14,7 +14,7 @@ finish-args:
   - --share=ipc               # X11 shared memory
   - --device=dri              # GPU for the egui/glow window
   - --socket=pulseaudio       # capture system/loopback audio via PipeWire/Pulse
-  - --share=network           # serve HTTP/WS + mDNS discovery on the LAN
+  - --share=network           # serve HTTPS + WebSocket to LAN browsers
 build-options:
   # Local build: network is shared so cargo can fetch crates AND we can bootstrap rustc.
   build-args:

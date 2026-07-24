@@ -13,7 +13,9 @@ pub mod relay;
 // their C deps (SVT-AV1, libvpx) — aren't compiled.
 #[cfg(target_os = "windows")]
 pub mod codec;
-#[cfg(target_os = "windows")]
+// VP9 links libvpx (a vcpkg-supplied C library), so it is behind the `vp9` feature — a fresh clone
+// builds without any vcpkg setup and gets AV1, which needs none.
+#[cfg(all(target_os = "windows", feature = "vp9"))]
 pub mod vp9;
 #[cfg(target_os = "windows")]
 pub mod capture;

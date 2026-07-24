@@ -37,45 +37,158 @@ const APP_JS: &str = include_str!("../web/app.js");
 const SERVICE_WORKER: &str = include_str!("../web/sw.js");
 const MANIFEST: &str = include_str!("../web/manifest.webmanifest");
 
+/// The four files that make up the served shell. The name is BOTH the on-disk filename in dev mode
+/// and the key for the compiled-in copy — the request URI is never used to pick or build a path, so
+/// this adds no traversal surface.
+#[derive(Clone, Copy)]
+enum Shell {
+    Index,
+    AppJs,
+    ServiceWorker,
+    Manifest,
+}
+
+impl Shell {
+    const ALL: [Shell; 4] = [Shell::Index, Shell::AppJs, Shell::ServiceWorker, Shell::Manifest];
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Shell::Index => "index.html",
+            Shell::AppJs => "app.js",
+            Shell::ServiceWorker => "sw.js",
+            Shell::Manifest => "manifest.webmanifest",
+        }
+    }
+
+    /// The copy compiled into this binary (`include_str!`).
+    fn embedded(self) -> &'static str {
+        match self {
+            Shell::Index => INDEX_HTML,
+            Shell::AppJs => APP_JS,
+            Shell::ServiceWorker => SERVICE_WORKER,
+            Shell::Manifest => MANIFEST,
+        }
+    }
+}
+
+/// Dev-only override: when `NFS_WEB_DIR` points at a directory, the shell is read from DISK per
+/// request instead of from the compiled-in copies.
+///
+/// Why this exists: the client is embedded via `include_str!`, so a one-line JS change otherwise costs
+/// a full release rebuild (~3–4 min) that on Windows additionally fails at link if the previous server
+/// is still running. The client is where the bugs actually are, and it had the slowest loop in the repo.
+/// With this set, a JS change is just F5.
+///
+/// Read once, and only honored if the directory exists — a typo'd path falls back to the embedded copies
+/// rather than serving 404s.
+fn dev_web_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let raw = std::env::var_os("NFS_WEB_DIR")?;
+        let p = std::path::PathBuf::from(raw);
+        if p.is_dir() {
+            tracing::warn!(
+                dir = %p.display(),
+                "NFS_WEB_DIR is set — serving the web client from DISK, not the embedded copy. \
+                 Development only; unset it for a normal run."
+            );
+            Some(p)
+        } else {
+            tracing::error!(
+                dir = %p.display(),
+                "NFS_WEB_DIR is set but is not a directory — ignoring it and serving the embedded client"
+            );
+            None
+        }
+    })
+    .as_deref()
+}
+
+/// This shell file's current source: from disk in dev mode, else the compiled-in copy. Falls back to
+/// the embedded copy if the file is missing or unreadable, so a half-written tree can't take the
+/// server down mid-edit.
+fn shell_source(which: Shell) -> std::borrow::Cow<'static, str> {
+    if let Some(dir) = dev_web_dir() {
+        match std::fs::read_to_string(dir.join(which.file_name())) {
+            Ok(s) => return std::borrow::Cow::Owned(s),
+            Err(e) => tracing::warn!(
+                file = which.file_name(),
+                "NFS_WEB_DIR read failed ({e}); using the embedded copy for this request"
+            ),
+        }
+    }
+    std::borrow::Cow::Borrowed(which.embedded())
+}
+
 /// A content build tag — FNV-1a hash of the served shell (app.js + index.html + sw.js + manifest).
 /// It changes whenever ANY of those change, so a browser running a STALE (service-worker-cached)
 /// shell can detect the mismatch against `/version` and self-heal (drop the SW + caches, reload to
 /// fresh code). sw.js and the manifest are folded in so a change touching only one of them still
-/// rotates the tag/bucket and triggers the client's `<head>` self-heal. Computed once.
-fn build_tag() -> &'static str {
-    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    TAG.get_or_init(|| {
+/// rotates the tag/bucket and triggers the client's `<head>` self-heal.
+///
+/// Computed once normally. In `NFS_WEB_DIR` mode it is recomputed from the CURRENT on-disk bytes on
+/// every call — otherwise the tag baked into the page you just reloaded wouldn't match `/version`, and
+/// the client's watchdog would decide the shell was stale and heal in a loop.
+fn build_tag() -> std::borrow::Cow<'static, str> {
+    fn compute() -> String {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
-        for &b in APP_JS
-            .as_bytes()
-            .iter()
-            .chain(INDEX_HTML.as_bytes())
-            .chain(SERVICE_WORKER.as_bytes())
-            .chain(MANIFEST.as_bytes())
-        {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a prime
+        for which in Shell::ALL {
+            for &b in shell_source(which).as_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a prime
+            }
         }
         format!("{h:016x}")
-    })
-    .as_str()
+    }
+    if dev_web_dir().is_some() {
+        return std::borrow::Cow::Owned(compute());
+    }
+    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    std::borrow::Cow::Borrowed(TAG.get_or_init(compute).as_str())
 }
 
-/// The shell files with the `__NFS_BUILD__` placeholder stamped with the current build tag, so each
-/// carries the version its client-side self-heal check compares against. Substituted once at startup.
-fn index_body() -> &'static str {
-    static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    S.get_or_init(|| INDEX_HTML.replace("__NFS_BUILD__", build_tag())).as_str()
+/// A shell file with the `__NFS_BUILD__` placeholder stamped with the current build tag, so it carries
+/// the version its client-side self-heal check compares against. Cached in normal operation;
+/// re-read + re-stamped per request under `NFS_WEB_DIR`.
+fn shell_body(which: Shell) -> std::borrow::Cow<'static, str> {
+    if dev_web_dir().is_some() {
+        let tag = build_tag();
+        return std::borrow::Cow::Owned(shell_source(which).replace("__NFS_BUILD__", &tag));
+    }
+    // Normal path: substitute once, then hand out a borrow forever.
+    macro_rules! once {
+        ($slot:ident) => {{
+            static $slot: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            std::borrow::Cow::Borrowed(
+                $slot
+                    .get_or_init(|| which.embedded().replace("__NFS_BUILD__", &build_tag()))
+                    .as_str(),
+            )
+        }};
+    }
+    match which {
+        Shell::Index => once!(INDEX_S),
+        Shell::AppJs => once!(APP_S),
+        Shell::ServiceWorker => once!(SW_S),
+        Shell::Manifest => once!(MANIFEST_S),
+    }
 }
-fn app_js_body() -> &'static str {
-    static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    S.get_or_init(|| APP_JS.replace("__NFS_BUILD__", build_tag())).as_str()
+
+fn index_body() -> std::borrow::Cow<'static, str> {
+    shell_body(Shell::Index)
 }
-/// The service worker with `__NFS_BUILD__` stamped, so its cache name (`nfs-shell-<tag>`) rotates
-/// with each build and `activate()` purges the stale bucket — no more hand-bumping the version.
-fn service_worker_body() -> &'static str {
-    static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    S.get_or_init(|| SERVICE_WORKER.replace("__NFS_BUILD__", build_tag())).as_str()
+fn app_js_body() -> std::borrow::Cow<'static, str> {
+    shell_body(Shell::AppJs)
+}
+/// The service worker. Goes through the same stamping path as the other shell files for uniformity,
+/// but note that `sw.js` no longer *contains* `__NFS_BUILD__` — it is a self-destruct stub that caches
+/// nothing (it unregisters itself and clears any leftover caches), so there is no cache name left to
+/// rotate. It stays folded into `build_tag()` so that changing the stub still rotates the tag.
+fn service_worker_body() -> std::borrow::Cow<'static, str> {
+    shell_body(Shell::ServiceWorker)
+}
+fn manifest_body() -> std::borrow::Cow<'static, str> {
+    shell_body(Shell::Manifest)
 }
 // Branding (the Newfoundland badge) — shared with the exe/GUI icon.
 const FAVICON_PNG: &[u8] = include_bytes!("../../../branding/icon-32.png");
@@ -574,7 +687,7 @@ async fn manifest() -> impl IntoResponse {
             // heuristic/HTTP caching (every other shell route is no-cache too).
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        MANIFEST,
+        manifest_body(),
     )
 }
 

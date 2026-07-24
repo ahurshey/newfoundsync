@@ -97,6 +97,25 @@ test.describe('/health', () => {
     expect(b.uptimeSecs, 'uptime must not go backwards').toBeGreaterThanOrEqual(a.uptimeSecs);
   });
 
+  // Guards what this whole suite is FOR: exercising the client compiled into the binary. In
+  // NFS_WEB_DIR dev mode the server reads the shell from disk and recomputes the tag per request, so a
+  // stable shellTag across calls is the observable proof we are NOT in dev mode. playwright.config.js
+  // scrubs the variable; this asserts the scrub actually worked, since a dev-mode run would otherwise
+  // go green against files that were never built in.
+  test('server is serving the EMBEDDED client, not a filesystem override', async ({ request, baseURL }) => {
+    const health = new URL('/health', baseURL).href;
+    const version = new URL('/version', baseURL).href;
+    const tags = [];
+    for (let i = 0; i < 3; i++) {
+      tags.push(JSON.parse(await (await request.get(health)).text()).shellTag);
+    }
+    expect(new Set(tags).size, `shellTag changed across requests (${tags.join(', ')}) — the server is ` +
+      'reading the client from disk (NFS_WEB_DIR), so these tests are not covering the embedded shell').toBe(1);
+    // /version must agree with /health's shellTag — they're the same value by different routes.
+    const v = (await (await request.get(version)).text()).trim();
+    expect(v, '/version and /health shellTag must agree').toBe(tags[0]);
+  });
+
   test('/status names the build it is reporting on', async ({ request, baseURL }) => {
     // /status is the documented headless diagnostic page; it has to say which server you're looking at.
     const health = JSON.parse(await (await request.get(new URL('/health', baseURL).href)).text());

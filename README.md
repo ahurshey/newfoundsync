@@ -187,13 +187,26 @@ monitor capture (Fedora: `pulseaudio-libs-devel`). `libopus-dev` spares you buil
 vendored source (which then wants autotools). Building *with* the GUI additionally needs the
 X11/Wayland/GL `-dev` packages — see `crates/desktop/packaging/README-debian.md`.
 
-### Video codecs (AV1 default, VP9 fallback)
+### Video codecs (AV1 default, VP9 opt-in)
 
-Video is **AV1** by default. Where your GPU has a hardware AV1 encoder, the server uses it via
-Media Foundation; otherwise it falls back to the CPU **SVT-AV1** encoder, which ships as a
-prebuilt static library (no extra setup). The **VP9** fallback links
-**libvpx**, which you supply via [vcpkg](https://github.com/microsoft/vcpkg). It's pinned to
-1.13.1 in `vcpkg.json` (to match the Rust bindings), so a one-time setup builds it:
+Video is **AV1** by default and needs **no extra setup**: where your GPU has a hardware AV1 encoder
+the server uses it via Media Foundation, otherwise it falls back to the CPU **SVT-AV1** encoder,
+which ships as a prebuilt static library.
+
+**VP9 is opt-in**, behind the `vp9` cargo feature. It links **libvpx**, a C library you supply via
+[vcpkg](https://github.com/microsoft/vcpkg) plus four environment variables — and it used to be an
+unconditional dependency, which meant `cargo build --release` failed on a fresh clone before you'd
+done any of that. Now a plain clone builds and runs; you only need the setup below if you
+specifically want `--encoder vp9`:
+
+```bash
+cargo build --release --features vp9
+```
+
+Without the feature, `--encoder vp9` logs a warning and uses AV1 instead (also royalty-free), and
+advertises `av01` to clients so the advertised codec always matches what is actually sent.
+
+libvpx is pinned to 1.13.1 in `vcpkg.json` (to match the Rust bindings), so a one-time setup builds it:
 
 ```powershell
 git clone https://github.com/microsoft/vcpkg C:\vcpkg
@@ -206,7 +219,7 @@ Copy-Item vcpkg_installed\x64-windows-static\lib\vpx.lib vcpkg_installed\x64-win
 $env:VPX_LIB_DIR     = "$PWD\vcpkg_installed\x64-windows-static\lib"
 $env:VPX_INCLUDE_DIR = "$PWD\vcpkg_installed\x64-windows-static\include"
 $env:VPX_VERSION = "1.13.0"; $env:VPX_STATIC = "1"
-cargo build --release
+cargo build --release --features vp9
 ```
 
 > If the link step reports CRT conflicts (`LNK4098`), add
@@ -287,6 +300,28 @@ A Cargo workspace:
 - **`nfs-watchdog.ps1`** — optional helper that keeps a headless server alive (auto-restart +
   crash-log capture) on machines where the windowed GUI is unstable.
 
+### Working on the web client
+
+`index.html` / `app.js` / `sw.js` / the manifest are compiled into the binary, so a one-line JS
+change would normally mean a full ~3-minute rebuild (which on Windows also fails at link if the
+previous server is still running). Point `NFS_WEB_DIR` at the source directory and the server reads
+those four files from disk **per request** instead — then a client change is just F5:
+
+```powershell
+$env:NFS_WEB_DIR = "$PWD\crates\desktop\web"
+.\target\release\newfoundsync.exe
+```
+
+```bash
+NFS_WEB_DIR=crates/desktop/web ./target/release/newfoundsync
+```
+
+The build tag is recomputed from the on-disk bytes, so the client's self-heal check still agrees and
+won't reload-loop. It logs a warning while active, only ever serves those four fixed filenames (the
+request URI is never used to build a path), and falls back to the embedded copy if a file is missing —
+so a half-saved edit can't take the server down. **Unset it for a real run**; the shipped binary must
+serve its own embedded client.
+
 ## Tests
 
 Two suites, both run by CI on pushes to `main` and on PRs against it
@@ -305,9 +340,17 @@ against it, so it covers the shell/reload/service-worker lifecycle that has hist
 actual source of bugs. Build the release binary first — the harness launches
 `target/release/newfoundsync`.
 
-One caveat worth knowing before you trust a green run: CI builds Linux + headless, so
-`gui.rs` and every Windows-only capture/encode module are **not compiled there**. Run
-`cargo check` locally on Windows before trusting a GUI or capture change.
+CI runs three jobs, which between them compile every configuration that ships:
+
+| Job | Covers |
+|---|---|
+| `cargo test + browser E2E (Linux)` | headless Linux build, the Rust suite, and Chromium E2E |
+| `cargo check with the GUI feature (Linux)` | `gui.rs` — the largest file in the repo |
+| `cargo test (Windows)` | WASAPI capture, the Media Foundation encoder, WGC screen capture |
+
+That last pair exists because CI used to build only Linux + `--no-default-features`, which skipped
+`gui.rs` and every Windows-gated module — half the Rust in the repo, so a borrow error in the largest
+file could ship green. VP9/libvpx stays out of CI by being an opt-in feature, so no job needs vcpkg.
 
 ## Status
 

@@ -9,8 +9,16 @@ description = "Lightweight LAN audio sharing with tight multiroom sync (desktop)
 # `gui` (default): the native egui server GUI (pulls eframe + qrcode; on Linux that needs the
 # X11/Wayland/GL dev stack). Build a pure headless server with `--no-default-features` — no GUI
 # and none of those display dependencies (ideal for a Linux server).
+#
+# `vp9` (NOT default): the CPU VP9 fallback encoder, which links libvpx — a C library you must
+# supply via vcpkg plus four VPX_* environment variables. It is deliberately opt-in because it was
+# previously unconditional, which meant `cargo build --release` (the command in the README) failed on
+# a fresh Windows clone before you'd done any vcpkg setup. Video defaults to AV1 (GPU via Media
+# Foundation, else the prebuilt static SVT-AV1) and needs none of that. Enable with
+# `--features vp9` when you specifically want `--encoder vp9`; see the VP9 section of the README.
 default = ["gui"]
 gui = ["dep:eframe", "dep:qrcode"]
+vp9 = ["dep:env-libvpx-sys"]
 
 [[bin]]
 name = "newfoundsync"
@@ -70,11 +78,12 @@ windows-core = "0.62"
 # Software AV1: prebuilt SvtAv1Enc static lib (Windows needs only curl/tar/certutil; wraps
 # SVT-AV1 v4.1.0; crate is edition 2024 → rustc >= 1.88).
 shiguredo_svt_av1 = "2026.1.0"
-# Software VP9 via libvpx. env-libvpx-sys ships PRE-GENERATED 1.13.0 bindings, so the repo pins
-# libvpx to 1.13.1 (vcpkg.json — closest vcpkg carries, same 1.13.x ABI). Supply libvpx via vcpkg:
+# Software VP9 via libvpx — OPTIONAL, behind the `vp9` feature (see [features] above). env-libvpx-sys
+# ships PRE-GENERATED 1.13.0 bindings, so the repo pins libvpx to 1.13.1 (vcpkg.json — closest vcpkg
+# carries, same 1.13.x ABI). Supply libvpx via vcpkg:
 # `vcpkg install --triplet x64-windows-static` + env VPX_LIB_DIR / VPX_INCLUDE_DIR
 # (→ vcpkg_installed/x64-windows-static) / VPX_VERSION=1.13.0 / VPX_STATIC=1. See README.
-env-libvpx-sys = "5.1.3"
+env-libvpx-sys = { version = "5.1.3", optional = true }
 
 # Linux-only: native PulseAudio/PipeWire capture of the system output's monitor (cpal/ALSA can't
 # see PipeWire `.monitor` sources). libpulse ships in the Freedesktop runtime; the .deb build needs

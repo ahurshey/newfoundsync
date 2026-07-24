@@ -274,9 +274,33 @@ pub struct MediaOptions {
     pub encoder: EncoderBackend,
 }
 
+/// Resolve the requested encoder against what this BUILD can actually do, once, before anything
+/// consumes it.
+///
+/// VP9 links libvpx and is behind the (non-default) `vp9` feature, so a build without it cannot honor
+/// `--encoder vp9`. It must be resolved here rather than at the encoder, because two independent
+/// consumers depend on the answer: the encoder we construct, and the `videoCodec` string we ADVERTISE
+/// to clients. If those disagree the server emits AV1 while telling browsers to decode `vp09` — every
+/// client then fails to decode, which is far worse than the wrong codec. Resolving once makes the
+/// mismatch unrepresentable.
+fn resolve_encoder(requested: EncoderBackend) -> EncoderBackend {
+    #[cfg(not(feature = "vp9"))]
+    if matches!(requested, EncoderBackend::Vp9) {
+        tracing::warn!(
+            "VP9 was requested but this build has no VP9 support (built without the `vp9` feature, \
+             which links libvpx); using AV1 — also royalty-free — and advertising av01 to clients. \
+             Rebuild with `--features vp9` for VP9."
+        );
+        return EncoderBackend::Av1;
+    }
+    requested
+}
+
 /// Start capture + encode, returning the broadcast channels the web server fans
 /// out to browser WebSocket clients.
 pub fn start(opts: MediaOptions) -> Result<Media> {
+    // Resolve BEFORE building the encoder or the advertised codec string (see resolve_encoder).
+    let opts = MediaOptions { encoder: resolve_encoder(opts.encoder), ..opts };
     let lead_ns = opts.lead_ms.max(0) * 1_000_000;
     // Bounded ring; each WS client task forwards immediately, so it only needs to
     // cover momentary scheduling jitter (the *browser* holds the big buffer).

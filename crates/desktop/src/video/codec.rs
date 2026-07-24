@@ -156,6 +156,7 @@ pub(crate) fn bgra_to_i420(
 /// arms expose the same encode/keyframe API.
 pub enum VideoEncoder {
     Av1Cpu(Av1Encoder),
+    #[cfg(feature = "vp9")]
     Vp9Cpu(crate::video::vp9::Vp9Encoder),
     #[cfg(target_os = "windows")]
     Av1Gpu(crate::video::mf_encoder::MfEncoder),
@@ -173,10 +174,22 @@ impl VideoEncoder {
         bitrate_kbps: u32,
     ) -> Result<VideoEncoder> {
         if backend == EncoderBackend::Vp9 {
-            let e = crate::video::vp9::Vp9Encoder::new(width, height, fps, bitrate_kbps)
-                .context("software VP9 (libvpx) encoder")?;
-            tracing::info!("video: CPU VP9 (libvpx) encoder active");
-            return Ok(VideoEncoder::Vp9Cpu(e));
+            #[cfg(feature = "vp9")]
+            {
+                let e = crate::video::vp9::Vp9Encoder::new(width, height, fps, bitrate_kbps)
+                    .context("software VP9 (libvpx) encoder")?;
+                tracing::info!("video: CPU VP9 (libvpx) encoder active");
+                return Ok(VideoEncoder::Vp9Cpu(e));
+            }
+            // Built without the `vp9` feature (the default, so no vcpkg/libvpx setup is needed).
+            // Fall through to AV1 rather than failing: the operator asked for video and AV1 is
+            // royalty-free too, so a working stream in the wrong codec beats no stream. Warn loudly,
+            // because the advertised codec string will say av01 and that surprises otherwise.
+            #[cfg(not(feature = "vp9"))]
+            tracing::warn!(
+                "--encoder vp9 requested but this build has no VP9 support (built without the \
+                 `vp9` feature); using AV1 instead. Rebuild with --features vp9 for VP9."
+            );
         }
         // AV1 (royalty-free, default). Prefer a hardware AV1 encoder (Media Foundation) where the GPU
         // has one; otherwise fall back to software SVT-AV1. Same "av01" stream either way.
@@ -199,6 +212,7 @@ impl VideoEncoder {
     pub fn encode_bgra(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
         match self {
             VideoEncoder::Av1Cpu(e) => e.encode_bgra(bgra),
+            #[cfg(feature = "vp9")]
             VideoEncoder::Vp9Cpu(e) => e.encode_bgra(bgra),
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(e) => e.encode_bgra(bgra),
@@ -208,6 +222,7 @@ impl VideoEncoder {
     pub fn force_keyframe(&mut self) {
         match self {
             VideoEncoder::Av1Cpu(e) => e.force_keyframe(),
+            #[cfg(feature = "vp9")]
             VideoEncoder::Vp9Cpu(e) => e.force_keyframe(),
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(e) => e.force_keyframe(),
@@ -221,6 +236,7 @@ impl VideoEncoder {
     pub fn is_keyframe(&self, au: &[u8]) -> bool {
         match self {
             VideoEncoder::Av1Cpu(_) => obu_has_av1_keyframe(au),
+            #[cfg(feature = "vp9")]
             VideoEncoder::Vp9Cpu(_) => crate::video::vp9::vp9_frame_is_keyframe(au),
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(e) => obu_has_av1_keyframe(au) || e.last_was_keyframe(),
@@ -231,6 +247,7 @@ impl VideoEncoder {
     pub fn backend_label(&self) -> &'static str {
         match self {
             VideoEncoder::Av1Cpu(_) => "CPU (SVT-AV1)",
+            #[cfg(feature = "vp9")]
             VideoEncoder::Vp9Cpu(_) => "CPU (VP9/libvpx)",
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(_) => "GPU AV1 (Media Foundation)",

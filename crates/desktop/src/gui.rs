@@ -201,9 +201,14 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         }
         None => (VideoSourceKind::Off, 1, false),
     };
+    // Normalize the seed HERE, not in the UI: VP9 lives behind the non-default `vp9` feature, so on a
+    // build without it `enc_idx == 1` must be unrepresentable from the start. Doing this in the codec
+    // picker instead would be wrong twice over — that picker sits in a collapsed-by-default disclosure
+    // (so it wouldn't run at all until expanded), and mutating state during rendering would flip the
+    // Apply button to "changes pending" the moment the operator merely opened the panel.
     let enc_idx = match init.encoder {
-        EncoderBackend::Av1 => 0,
-        EncoderBackend::Vp9 => 1,
+        EncoderBackend::Vp9 if cfg!(feature = "vp9") => 1,
+        _ => 0,
     };
 
     let mut app = ServerApp {
@@ -865,7 +870,14 @@ impl ServerApp {
         } else {
             None
         };
-        let encoder = EncoderBackend::parse(ENC_LABELS[self.enc_idx].1).unwrap_or(EncoderBackend::Av1);
+        // The one place the encoder choice leaves the GUI, so clamp here too: a build without the
+        // `vp9` feature must never request VP9, whatever the UI state says. (media::start's
+        // resolve_encoder would also catch it, but then the GUI and the stream would disagree.)
+        let mut encoder =
+            EncoderBackend::parse(ENC_LABELS[self.enc_idx].1).unwrap_or(EncoderBackend::Av1);
+        if !cfg!(feature = "vp9") {
+            encoder = EncoderBackend::Av1;
+        }
 
         #[cfg(target_os = "windows")]
         let video_target = match (self.video_kind, self.video_hwnd) {
@@ -1461,12 +1473,27 @@ impl ServerApp {
                              has one, else CPU (SVT-AV1). VP9 = a fallback that decodes on more older \
                              devices (older Apple / Android / TVs) but encodes CPU-only (libvpx) here.",
                         );
-                        let is_vp9 = self.enc_idx == 1;
+                        // VP9 links libvpx and lives behind the (non-default) `vp9` feature, so this
+                        // build may be unable to honor it. Don't offer a choice we'd silently
+                        // substitute AV1 for — the picker must not claim a codec we won't send.
+                        // (`enc_idx` is already normalized at the seed site, so no mutation here — this
+                        // closure only runs once the disclosure is expanded, and writing state during
+                        // rendering would fake a pending change.)
+                        let vp9_available = cfg!(feature = "vp9");
+                        let is_vp9 = self.enc_idx == 1 && vp9_available;
                         egui::ComboBox::from_id_salt("codec")
                             .selected_text(if is_vp9 { "VP9 · royalty-free" } else { "AV1 · royalty-free" })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.enc_idx, 0, "AV1 · royalty-free");
-                                ui.selectable_value(&mut self.enc_idx, 1, "VP9 · royalty-free");
+                                if vp9_available {
+                                    ui.selectable_value(&mut self.enc_idx, 1, "VP9 · royalty-free");
+                                } else {
+                                    ui.add_enabled(false, egui::Button::new("VP9 · not in this build"))
+                                        .on_disabled_hover_text(
+                                            "This build was compiled without the `vp9` feature (it links \
+                                             libvpx via vcpkg). Rebuild with --features vp9 to enable it.",
+                                        );
+                                }
                             });
                     });
                     ui.horizontal(|ui| {

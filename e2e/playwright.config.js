@@ -26,6 +26,23 @@ const EXE = process.env.NFS_EXE || DEFAULT_EXE;
 const PORT = Number(process.env.NFS_PORT || 47155);
 const BASE = `http://localhost:${PORT}`;
 
+// This suite exists to validate the shell that is COMPILED INTO the binary. Playwright spawns the
+// webServer with this process's environment inherited, so a developer who has followed the dev-loop
+// instructions (`NFS_WEB_DIR=crates/desktop/web`) would otherwise have those exports leak in and the
+// server would serve the files from DISK instead — the suite would go green on a shell that was never
+// built in. That's precisely the tested-one-thing-shipped-another failure the harness is here to
+// prevent, so scrub it before the server starts.
+//
+// Deleted rather than set to '': an empty value is still "set", and the server logs an error for a
+// non-directory path, which would be noise on every clean run.
+if (process.env.NFS_WEB_DIR) {
+  console.warn(
+    '[playwright] NFS_WEB_DIR was set (%s) — ignoring it so the tests exercise the EMBEDDED web client.',
+    process.env.NFS_WEB_DIR
+  );
+  delete process.env.NFS_WEB_DIR;
+}
+
 module.exports = defineConfig({
   testDir: './tests',
   // The reload loop reloads the page many times; give tests room. Individual asserts still fail fast.

@@ -11,7 +11,73 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Coverage note — read before trusting a green run.
+#
+# The `test` job below builds Linux + `--no-default-features`. That combination excludes gui.rs (the
+# largest file in the repo, behind the `gui` feature) AND every Windows-gated module: WASAPI capture,
+# the Media Foundation encoder, WGC screen capture. That was HALF the Rust in the repo never being
+# compiled by CI, so a type or borrow error in gui.rs could ship green. The `gui-check` and `windows`
+# jobs exist purely to close that gap — keep them.
 jobs:
+  # Type-check the GUI. Compiling gui.rs at all is the point; no tests here need a display.
+  gui-check:
+    name: cargo check with the GUI feature (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The `gui` feature pulls eframe, which needs the X11/Wayland/GL dev stack even just to compile.
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libopus-dev libasound2-dev libpulse-dev \
+            libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev libxrandr-dev \
+            libxi-dev libxcursor-dev libgl1-mesa-dev
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: gui-check
+
+      # Default features = `gui`. --all-targets so the GUI's tests/examples type-check too.
+      - name: cargo check (default features, incl. gui.rs)
+        run: cargo check --workspace --all-targets
+
+  # Compile + test the Windows-only half: WASAPI capture, the MF encoder, WGC capture.
+  #
+  # VP9/libvpx is behind the non-default `vp9` feature precisely so this job needs no vcpkg. Known and
+  # accepted gap: that means video/vp9.rs (and its one test) is still not compiled by ANY CI job —
+  # covering it would mean building libvpx from vcpkg here, which is a lot of CI time for an opt-in
+  # fallback codec. If VP9 ever stops being optional, add `--features vp9` plus a vcpkg cache step.
+  windows:
+    name: cargo test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+
+      # Default features: the GUI plus every cfg(windows) capture/encode module. This is the first
+      # config in which capture/{system,process,sessions}.rs and video/{capture,codec,mf_encoder}.rs
+      # are compiled by CI at all.
+      - name: cargo test (default features)
+        run: cargo test --workspace --all-targets
+
+      # The headless Windows build broke once before (a windows-rs feature was only satisfied via
+      # eframe's feature unification), so check it explicitly rather than assuming.
+      - name: cargo check (headless)
+        run: cargo check -p newfoundsync --no-default-features
+
   test:
     name: cargo test + browser E2E (Linux)
     runs-on: ubuntu-latest

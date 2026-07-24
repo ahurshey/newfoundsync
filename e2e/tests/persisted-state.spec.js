@@ -70,6 +70,33 @@ test.describe('persisted-state startup (nfs_trim TDZ regression)', () => {
     expect(h.trimVal || '', 'trim display must be finite, not Infinity').not.toMatch(/inf/i);
   });
 
+  // Structural guard for the readiness sentinel. It only means "all top-level init completed" if it is
+  // literally the LAST statement in app.js — it originally sat ~20% in (right after the Start handler),
+  // so a crash in the other 80% (calibration, cast, the later listeners) still reported healthy and the
+  // <head> watchdog never fired. Asserting position (not just presence) is what stops it drifting back
+  // up the file the next time someone appends init.
+  test('__NFS_APP_READY is the last statement in app.js (chromium)', async ({ page, browserName, baseURL }) => {
+    test.skip(browserName !== 'chromium', 'source-level invariant — check once');
+    const res = await page.request.get(new URL('/app.js', baseURL).href);
+    expect(res.ok(), '/app.js should be served').toBeTruthy();
+    const src = await res.text();
+
+    // Strip blank lines and whole-line comments; whatever remains is executable top-level source.
+    const code = src
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith('//'));
+    expect(code.length, 'app.js should not be empty').toBeGreaterThan(100);
+
+    const idx = code.findIndex((l) => l.startsWith('window.__NFS_APP_READY'));
+    expect(idx, 'app.js must stamp window.__NFS_APP_READY').toBeGreaterThanOrEqual(0);
+    expect(
+      code.length - 1 - idx,
+      `readiness stamp must be the LAST statement, but ${code.length - 1 - idx} statement(s) follow it — ` +
+        'anything after it runs UNVERIFIED and a crash there would still report the client healthy',
+    ).toBe(0);
+  });
+
   test('?reset clears persisted trim/alignment + SW + caches (chromium)', async ({ page, browserName }) => {
     test.skip(browserName !== 'chromium', 'chromium');
     // Seed via a normal load (NOT addInitScript, which would re-seed after the reset's redirect).

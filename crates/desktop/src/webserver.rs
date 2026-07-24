@@ -157,6 +157,9 @@ pub struct StreamState {
     /// Present iff the active source is a web-client cast: the relay the serve() task pushes a
     /// caster's uploaded frames into. `Some` also signals to serve() that casting is allowed.
     pub cast_relay: Option<Arc<crate::media::CastRelay>>,
+    /// This stream's liveness/failure counters, reported by `/health`. Rides on the stream (rather
+    /// than `AppState`) so a source swap automatically publishes the NEW pipeline's counters.
+    pub health: Arc<crate::media::MediaHealth>,
 }
 
 impl StreamState {
@@ -166,6 +169,7 @@ impl StreamState {
             audio_tx: media.audio_tx.clone(),
             video_tx: media.video_tx.clone(),
             cast_relay: media.cast_relay.clone(),
+            health: media.health.clone(),
         }
     }
 }
@@ -197,6 +201,11 @@ pub struct ClientEntry {
     pub calib_status: String,
     /// True once HELLO has been received (so `stable_id`/`name` are meaningful).
     pub identified: bool,
+    /// Frames this client never received: shed because its outbound queue was full, plus frames the
+    /// broadcast ring overwrote before this task could read them (tokio reports the latter count and
+    /// it used to be discarded). Non-zero is the objective signal that stuttering is THIS client
+    /// falling behind — not the network, and not the browser's decoder.
+    pub frames_dropped: Arc<AtomicU64>,
 }
 
 /// All currently-connected clients, keyed by ephemeral connection id. Shared
@@ -304,6 +313,7 @@ pub async fn run(
     addr: SocketAddr,
     use_tls: bool,
 ) -> Result<()> {
+    let _ = STARTED_AT.set(std::time::Instant::now()); // for /health uptime
     let state = Arc::new(AppState {
         stream,
         clients,
@@ -317,6 +327,7 @@ pub async fn run(
         .route("/status", get(status)) // headless-friendly live view of connected clients
         .route("/app.js", get(app_js))
         .route("/version", get(version)) // content build tag — the client self-heals a stale cached shell
+        .route("/health", get(health)) // build identity + pipeline liveness (JSON, for diagnosis)
         .route("/sw.js", get(service_worker))
         .route("/manifest.webmanifest", get(manifest))
         .route("/favicon.png", get(favicon_png))
@@ -331,7 +342,7 @@ pub async fn run(
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("bind HTTP server on {addr}"))?;
-        tracing::warn!(%addr, "serving plain HTTP — WebCodecs only works via localhost or a TLS proxy");
+        tracing::warn!(%addr, build = crate::BUILD_ID, "serving plain HTTP — WebCodecs only works via localhost or a TLS proxy");
         axum::serve(listener, app.into_make_service())
             .await
             .context("web server error")?;
@@ -348,6 +359,7 @@ pub async fn run(
 
     tracing::info!(
         %addr,
+        build = crate::BUILD_ID,
         "HTTPS server listening — open https://<this-pc>:{} (accept the one-time self-signed cert)",
         addr.port()
     );
@@ -392,6 +404,64 @@ async fn version() -> impl IntoResponse {
     )
 }
 
+/// Process start, so `/health` can report uptime.
+static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Build identity + pipeline liveness as JSON. Answers the two questions that a field report can't
+/// currently answer: *which build is this box running* (hand-copied .exe files are otherwise
+/// indistinguishable — `/version` only hashes the web shell and is blind to Rust changes), and *is the
+/// pipeline actually producing media* (frame counters + the age of the last frame, so silence-with-no-
+/// error is visible without standing in front of a speaker).
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let s = state.stream.borrow().clone();
+    let h = &s.health;
+    let now = mono_now();
+    // Age of the last published frame, in ms; -1 (and ONLY -1) means "none produced yet".
+    // `.max(0)` because a negative age is meaningless here and, worse, could land on the -1 sentinel
+    // and claim a live stream had never produced a frame.
+    let age_ms = |last: i64| -> i64 {
+        if last == 0 {
+            -1
+        } else {
+            ((now - last).max(0)) / 1_000_000
+        }
+    };
+    let uptime = STARTED_AT.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
+    let body = format!(
+        concat!(
+            "{{\"build\":\"{}\",\"version\":\"{}\",\"gitSha\":\"{}\",\"shellTag\":\"{}\",",
+            "\"uptimeSecs\":{},\"clients\":{},\"casting\":{},\"castSource\":{},",
+            "\"audioFrames\":{},\"videoFrames\":{},\"captureFrames\":{},",
+            "\"audioErrors\":{},\"videoErrors\":{},",
+            "\"lastAudioAgeMs\":{},\"lastVideoAgeMs\":{},\"videoEncoderFailed\":{}}}"
+        ),
+        crate::BUILD_ID,
+        env!("CARGO_PKG_VERSION"),
+        env!("NFS_GIT_SHA"),
+        build_tag(),
+        uptime,
+        state.clients.load(Ordering::Relaxed),
+        state.cast.lock().map(|c| c.is_some()).unwrap_or(false),
+        s.cast_relay.is_some(),
+        h.audio_frames.load(Ordering::Relaxed),
+        h.video_frames.load(Ordering::Relaxed),
+        // Distinguishes a frozen picture (videoFrames climbs, captureFrames flat) from a dead encoder.
+        h.capture_frames.load(Ordering::Relaxed),
+        h.audio_errors.load(Ordering::Relaxed),
+        h.video_errors.load(Ordering::Relaxed),
+        age_ms(h.last_audio_ns.load(Ordering::Relaxed)),
+        age_ms(h.last_video_ns.load(Ordering::Relaxed)),
+        h.video_encoder_failed.load(Ordering::Relaxed),
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+}
+
 const STATUS_HEAD: &str = "<!doctype html><html lang=en><head><meta charset=utf-8>\
 <title>Newfoundsync — clients</title><meta http-equiv=refresh content=2>\
 <meta name=viewport content=\"width=device-width, initial-scale=1\"><meta name=color-scheme content=dark>\
@@ -403,6 +473,23 @@ th{color:#94a1b2;font-weight:600;font-size:12px}td{font-variant-numeric:tabular-
 
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// Make a client-supplied string safe to write into a log line. The device name arrives in HELLO from
+/// any device on the LAN, so without this a client could embed newlines or ANSI escapes and forge
+/// entries in the very log this change makes the authoritative record. Control characters become '.'
+/// and the result is truncated — a name is for recognizing a device, not for carrying payload.
+fn log_safe(s: &str) -> String {
+    const MAX: usize = 64;
+    let mut out: String = s
+        .chars()
+        .take(MAX)
+        .map(|c| if c.is_control() { '.' } else { c })
+        .collect();
+    if s.chars().count() > MAX {
+        out.push('…');
+    }
+    out
 }
 
 /// Headless-friendly server-side view of connected clients (the GUI mixer hangs on some
@@ -429,6 +516,8 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             };
             let vol = format!("{}%", (e.volume * 100.0).round() as i64);
             let calib = html_escape(&e.calib_status);
+            // Non-zero = this client is losing frames, i.e. the stutter is here and not the network.
+            let drops = e.frames_dropped.load(Ordering::Relaxed);
             rows.push_str("<tr><td>");
             rows.push_str(&name);
             rows.push_str("</td><td>");
@@ -437,20 +526,26 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             rows.push_str(&sync);
             rows.push_str("</td><td>");
             rows.push_str(&vol);
+            rows.push_str(if drops > 0 { "</td><td>" } else { "</td><td class=dim>" });
+            rows.push_str(&drops.to_string());
             rows.push_str("</td><td class=dim>");
             rows.push_str(&calib);
             rows.push_str("</td></tr>");
         }
     }
     if n == 0 {
-        rows.push_str("<tr><td colspan=5 class=dim>No clients connected yet.</td></tr>");
+        rows.push_str("<tr><td colspan=6 class=dim>No clients connected yet.</td></tr>");
     }
     let mut body = String::from(STATUS_HEAD);
     body.push_str("<h1>Connected clients <span class=dim>(");
     body.push_str(&n.to_string());
-    body.push_str(")</span></h1><table><thead><tr><th>Device</th><th>Status</th><th>Sync</th><th>Volume</th><th>Calibration</th></tr></thead><tbody>");
+    body.push_str(")</span></h1><table><thead><tr><th>Device</th><th>Status</th><th>Sync</th><th>Volume</th><th>Dropped</th><th>Calibration</th></tr></thead><tbody>");
     body.push_str(&rows);
-    body.push_str("</tbody></table><p class=dim>Auto-refreshes every 2 s · server-side view (works headless)</p></body></html>");
+    // Build identity in the footer: this page is the documented headless diagnostic surface, so it has
+    // to be able to tell you WHICH server you're looking at.
+    body.push_str("</tbody></table><p class=dim>Auto-refreshes every 2 s · server-side view (works headless) · build ");
+    body.push_str(&html_escape(crate::BUILD_ID));
+    body.push_str(" · <a href=/health style=color:#94a1b2>/health</a></p></body></html>");
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -541,8 +636,9 @@ impl Drop for ClientGuard {
 }
 
 async fn ws_client(socket: WebSocket, state: Arc<AppState>) {
-    state.clients.fetch_add(1, Ordering::Relaxed);
+    let n = state.clients.fetch_add(1, Ordering::Relaxed) + 1;
     let conn_id = state.next_id.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(conn_id, clients = n, "client connected");
     // Per-client push channel: the GUI sends control frames (e.g. SET_VOLUME) here,
     // and this client's serve() loop forwards them over the socket.
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
@@ -559,6 +655,7 @@ async fn ws_client(socket: WebSocket, state: Arc<AppState>) {
                 reported_trim_ms: None,
                 calib_status: String::new(),
                 identified: false,
+                frames_dropped: Arc::new(AtomicU64::new(0)),
             },
         );
     }
@@ -588,6 +685,77 @@ fn uplink_rate_exceeded(
     *win_bytes > budget
 }
 
+/// Why a client's `serve()` loop ended. Every exit path sets one of these and the loop logs a single
+/// line on the way out, so the failures this tool actually has in the field are distinguishable in the
+/// log instead of all looking like an ordinary disconnect: "my phone keeps dropping" (`WriteFailed` /
+/// `QueueFull`), "the cast won't start" (`VideoOnAudioOnly`), "it stopped after a minute"
+/// (`UplinkRate`). One variant per `break` — the alternative is 18 scattered log statements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    /// Peer closed the socket — normal (tab closed, navigated away, device slept).
+    PeerClosed,
+    /// Socket read error.
+    SocketError,
+    /// The write task ended: a send error or the `WRITE_TIMEOUT` deadline (wedged/half-open peer).
+    WriteFailed,
+    /// Source swapped or server shutting down; the browser reconnects on its own. Normal.
+    SourceSwapped,
+    /// Couldn't deliver the config as the first frame.
+    ConfigSendFailed,
+    /// Outbound queue was full pushing a control/clock/grant frame — this client is far behind.
+    QueueFull,
+    /// Uplink audio payload over `MAX_UP_AUDIO_BYTES`.
+    OversizeAudio,
+    /// Uplink video access unit over `MAX_UP_VIDEO_BYTES`.
+    OversizeVideo,
+    /// Caster exceeded its per-connection byte-rate budget.
+    UplinkRate,
+    /// A caster pushed video at an audio-only stream.
+    VideoOnAudioOnly,
+}
+
+impl Exit {
+    /// A tripped abuse/limit guard. Logged at `warn` because a false positive here silently evicts a
+    /// legitimate client, and until now left no trace at all.
+    fn is_guard(self) -> bool {
+        matches!(
+            self,
+            Exit::OversizeAudio | Exit::OversizeVideo | Exit::UplinkRate | Exit::VideoOnAudioOnly
+        )
+    }
+
+    /// True for endings that are expected in normal operation (logged at `debug`).
+    fn is_normal(self) -> bool {
+        matches!(self, Exit::PeerClosed | Exit::SourceSwapped)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Exit::PeerClosed => "peer closed",
+            Exit::SocketError => "socket error",
+            Exit::WriteFailed => "write failed or timed out",
+            Exit::SourceSwapped => "source swapped",
+            Exit::ConfigSendFailed => "config send failed",
+            Exit::QueueFull => "outbound queue full (client too far behind)",
+            Exit::OversizeAudio => "oversize uplink audio payload",
+            Exit::OversizeVideo => "oversize uplink video access unit",
+            Exit::UplinkRate => "uplink byte-rate budget exceeded",
+            Exit::VideoOnAudioOnly => "video uplink on an audio-only stream",
+        }
+    }
+}
+
+/// Classify a failed `out_tx.try_send`. A FULL queue means this client is too far behind; a CLOSED
+/// channel means the write task already died (write error or `WRITE_TIMEOUT`). Collapsing both into
+/// "queue full" blames a slow client for what is really a dead peer — the exact kind of
+/// misattribution this logging exists to prevent.
+fn send_exit<T>(e: mpsc::error::TrySendError<T>) -> Exit {
+    match e {
+        mpsc::error::TrySendError::Full(_) => Exit::QueueFull,
+        mpsc::error::TrySendError::Closed(_) => Exit::WriteFailed,
+    }
+}
+
 async fn serve(
     socket: WebSocket,
     state: &AppState,
@@ -615,6 +783,16 @@ async fn serve(
         }
     });
 
+    // Per-connection counters + a start instant, so the exit line can report how long this client
+    // lasted and how many frames it never got.
+    let started = std::time::Instant::now();
+    let dropped = state
+        .clients_reg
+        .lock()
+        .ok()
+        .and_then(|reg| reg.get(&conn_id).map(|e| e.frames_dropped.clone()))
+        .unwrap_or_default();
+
     // Config must be the client's first frame; the queue is empty so it lands immediately.
     if out_tx
         .send(Message::Text(active.config_json.clone()))
@@ -622,6 +800,7 @@ async fn serve(
         .is_err()
     {
         write_handle.abort();
+        tracing::warn!(conn_id, reason = Exit::ConfigSendFailed.label(), "client evicted");
         return;
     }
     let mut arx = active.audio_tx.subscribe();
@@ -640,16 +819,20 @@ async fn serve(
         .unwrap_or(0)
         .max(UPLINK_MIN_BUDGET_BYTES);
 
+    // Set by whichever path ends the loop; logged once on exit (see `Exit`).
+    let mut exit = Exit::PeerClosed;
+
     loop {
         tokio::select! {
             // The write task ended (write error or timeout) → the peer is gone; tear down.
-            _ = &mut write_handle => break,
+            _ = &mut write_handle => { exit = Exit::WriteFailed; break }
             // The source was swapped (or the server is shutting down) — drop this
             // client so the browser reconnects and picks up the new stream.
-            _ = stream_rx.changed() => break,
+            _ = stream_rx.changed() => { exit = Exit::SourceSwapped; break }
             // GUI → this client: forward a server-pushed control frame (e.g. SET_VOLUME).
             Some(msg) = ctrl_rx.recv() => {
-                if out_tx.try_send(Message::Binary(msg)).is_err() { break; } // queue full (too far behind) or closed → evict
+                // queue full (too far behind) or closed (write task dead) → evict
+                if let Err(e) = out_tx.try_send(Message::Binary(msg)) { exit = send_exit(e); break; }
             }
             incoming = receiver.next() => {
                 match incoming {
@@ -664,7 +847,7 @@ async fn serve(
                         r.extend_from_slice(&t2.to_be_bytes());
                         let t3 = mono_now();
                         r.extend_from_slice(&t3.to_be_bytes());
-                        if out_tx.try_send(Message::Binary(r)).is_err() { break; }
+                        if let Err(e) = out_tx.try_send(Message::Binary(r)) { exit = send_exit(e); break; }
                     }
                     // Calibration progress report (CALIB_CTRL STATUS) → store for the GUI.
                     Some(Ok(Message::Binary(b)))
@@ -693,6 +876,7 @@ async fn serve(
                     // its volume across reconnects (matched by stable_id).
                     Some(Ok(Message::Binary(b))) if b.first() == Some(&MSG_HELLO) => {
                         if let Some((stable_id, name)) = parse_hello(&b) {
+                            let mut shown = String::new();
                             if let Ok(mut reg) = state.clients_reg.lock() {
                                 if let Some(e) = reg.get_mut(&conn_id) {
                                     e.name = if name.trim().is_empty() {
@@ -702,8 +886,12 @@ async fn serve(
                                     };
                                     e.stable_id = stable_id;
                                     e.identified = true;
+                                    shown = e.name.clone();
                                 }
                             }
+                            // Ties this conn_id to a human-recognizable device for every later log
+                            // line. Sanitized: the name is client-supplied (see log_safe).
+                            tracing::info!(conn_id, name = %log_safe(&shown), "client identified");
                         }
                     }
                     // Web cast: a client claims the single caster slot. Granted only when the active
@@ -722,14 +910,29 @@ async fn serve(
                                 })
                                 .unwrap_or(false);
                         let msg = cast_grant_msg(granted, active.cast_relay.as_deref());
-                        if out_tx.try_send(Message::Binary(msg)).is_err() { break; }
+                        // A denial is a real support question ("why won't my phone cast?") — record
+                        // whether the source even allows casting vs. the slot already being taken.
+                        if !granted {
+                            tracing::info!(
+                                conn_id,
+                                castable = active.cast_relay.is_some(),
+                                "cast request denied (no web-uplink source, or slot already taken)"
+                            );
+                        } else {
+                            tracing::info!(conn_id, "cast slot granted");
+                        }
+                        if let Err(e) = out_tx.try_send(Message::Binary(msg)) { exit = send_exit(e); break; }
                     }
                     // Web cast: the active caster's uploaded Opus packet → re-stamp + fan out.
                     Some(Ok(Message::Binary(b))) if b.first() == Some(&MSG_UP_AUDIO) && b.len() > 1 => {
                         let is_caster = state.cast.lock().map(|s| *s == Some(conn_id)).unwrap_or(false);
                         if is_caster {
-                            if b.len() - 1 > MAX_UP_AUDIO_BYTES { break; } // oversize payload → protocol abuse, evict
-                            if uplink_rate_exceeded(&mut win_start, &mut win_bytes, b.len(), uplink_budget) { break; }
+                            // oversize payload → protocol abuse, evict
+                            if b.len() - 1 > MAX_UP_AUDIO_BYTES { exit = Exit::OversizeAudio; break; }
+                            if uplink_rate_exceeded(&mut win_start, &mut win_bytes, b.len(), uplink_budget) {
+                                exit = Exit::UplinkRate;
+                                break;
+                            }
                             if let Some(relay) = active.cast_relay.as_deref() {
                                 relay.push_audio(&b[1..]);
                             }
@@ -740,9 +943,14 @@ async fn serve(
                         let is_caster = state.cast.lock().map(|s| *s == Some(conn_id)).unwrap_or(false);
                         if is_caster {
                             if let Some(relay) = active.cast_relay.as_deref() {
-                                if !relay.video_on { break; } // audio-only stream must never relay video → evict
-                                if b.len() - 2 > MAX_UP_VIDEO_BYTES { break; } // oversize access unit → evict
-                                if uplink_rate_exceeded(&mut win_start, &mut win_bytes, b.len(), uplink_budget) { break; }
+                                // audio-only stream must never relay video → evict
+                                if !relay.video_on { exit = Exit::VideoOnAudioOnly; break; }
+                                // oversize access unit → evict
+                                if b.len() - 2 > MAX_UP_VIDEO_BYTES { exit = Exit::OversizeVideo; break; }
+                                if uplink_rate_exceeded(&mut win_start, &mut win_bytes, b.len(), uplink_budget) {
+                                    exit = Exit::UplinkRate;
+                                    break;
+                                }
                                 relay.push_video(&b[2..]); // key flag re-derived server-side, not trusted from b[1]
                             }
                         }
@@ -755,8 +963,8 @@ async fn serve(
                             }
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(_)) => break,
+                    Some(Ok(Message::Close(_))) | None => break, // stays Exit::PeerClosed (the initial value)
+                    Some(Err(_)) => { exit = Exit::SocketError; break }
                     _ => {} // ping/pong/text — ignore
                 }
             }
@@ -764,25 +972,51 @@ async fn serve(
                 match audio {
                     Ok(frame) => match out_tx.try_send(Message::Binary((*frame).clone())) {
                         Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {} // client behind; drop this frame (like Lagged)
-                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        // client behind; drop this frame (like Lagged) — counted, not silent
+                        Err(mpsc::error::TrySendError::Full(_)) => { dropped.fetch_add(1, Ordering::Relaxed); }
+                        Err(mpsc::error::TrySendError::Closed(_)) => { exit = Exit::WriteFailed; break }
                     },
-                    Err(broadcast::error::RecvError::Lagged(_)) => {} // fell behind; skip
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    // The broadcast ring overwrote `n` frames before this task read them. tokio hands
+                    // us the count and it used to be thrown away — it's the objective measure of
+                    // "this client can't keep up".
+                    Err(broadcast::error::RecvError::Lagged(n)) => { dropped.fetch_add(n, Ordering::Relaxed); }
+                    Err(broadcast::error::RecvError::Closed) => { exit = Exit::SourceSwapped; break }
                 }
             }
             video = vrx.recv() => {
                 match video {
                     Ok(frame) => match out_tx.try_send(Message::Binary((*frame).clone())) {
                         Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {} // client behind; drop this frame
-                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        Err(mpsc::error::TrySendError::Full(_)) => { dropped.fetch_add(1, Ordering::Relaxed); }
+                        Err(mpsc::error::TrySendError::Closed(_)) => { exit = Exit::WriteFailed; break }
                     },
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(n)) => { dropped.fetch_add(n, Ordering::Relaxed); }
+                    Err(broadcast::error::RecvError::Closed) => { exit = Exit::SourceSwapped; break }
                 }
             }
         }
     }
     write_handle.abort(); // stop the write task; out_tx drops here too, closing the channel
+
+    // ONE line per disconnect, carrying the reason, how long the client lasted, and how many frames it
+    // never received. Previously every one of these paths returned in silence.
+    let n_dropped = dropped.load(Ordering::Relaxed);
+    // One decimal: these lines are read by a human scanning for "how long did it last", and raw f32
+    // precision (1.0200855731964111) is just noise.
+    let secs = (started.elapsed().as_secs_f32() * 10.0).round() / 10.0;
+    if exit.is_guard() {
+        tracing::warn!(conn_id, reason = exit.label(), secs, dropped = n_dropped, "client evicted by a limit guard");
+    } else if exit.is_normal() {
+        // `info`, not `debug`: "client connected" is logged at info, so hiding the matching
+        // disconnect would leave every session looking like it never ended at the default level —
+        // and a connect/disconnect pair is once per client, not a hot path.
+        tracing::info!(conn_id, reason = exit.label(), secs, dropped = n_dropped, "client disconnected");
+    } else {
+        tracing::warn!(conn_id, reason = exit.label(), secs, dropped = n_dropped, "client disconnected abnormally");
+    }
+    if n_dropped > 0 {
+        // Surfaced separately at warn: a client that dropped frames is the answer to "why does it
+        // stutter on my phone" — and it's invisible if the disconnect itself was normal.
+        tracing::warn!(conn_id, dropped = n_dropped, secs, "client fell behind and lost frames");
+    }
 }

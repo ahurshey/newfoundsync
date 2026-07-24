@@ -603,10 +603,9 @@ function avcCodecString(w, h, fps) {
 // Start (user gesture)
 // =============================================================================
 els.start.addEventListener("click", onStart);
-// Startup got far enough to wire the Start handler. index.html's <head> watchdog treats THIS — not the
-// line-1 boot stamp (which is set before any init could throw) — as "the client actually initialized";
-// if it's still missing after a few seconds the watchdog clears persisted state + self-heals.
-window.__NFS_APP_READY = window.__NFS_APP_BOOT;
+// NOTE: the readiness stamp (__NFS_APP_READY) is deliberately NOT here — it lives at the very END of
+// this file. Wiring Start is only ~20% of top-level init; stamping here would report "healthy" for a
+// crash anywhere in the remaining 80% (calibration, cast, all the later listeners).
 
 function onStart() {
   if (started) return;
@@ -2974,3 +2973,16 @@ els.castbtn.addEventListener("click", () => {
 els.casttab.addEventListener("click", () => startCast("tab"));
 els.castmic.addEventListener("click", () => startCast("mic"));
 els.caststop.addEventListener("click", () => stopCast(true));
+
+// =============================================================================
+// Readiness stamp — MUST be the last statement in this file.
+// =============================================================================
+// index.html's <head> watchdog treats this — not the line-1 __NFS_APP_BOOT stamp — as "the client
+// actually initialized", because BOOT is set before any init could throw. Being the LAST statement is
+// the whole point: it proves every top-level listener and initializer above ran without throwing. If
+// it's still missing a few seconds after load, the watchdog clears the persisted sync state (a corrupt
+// nfs_trim once crashed startup here) and self-heals.
+//
+// Do not move this earlier, and add new top-level init ABOVE it. Guarded by
+// e2e/tests/persisted-state.spec.js, which asserts the stamp survives a crash-prone persisted state.
+window.__NFS_APP_READY = window.__NFS_APP_BOOT;

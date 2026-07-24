@@ -36,8 +36,18 @@ use newfoundsync_core::video::{EncoderBackend, Fps, Resolution, VideoConfig};
 use media::{CaptureSource, MediaOptions};
 use webserver::StreamState;
 
+/// Full build identity: crate version + the git commit stamped in by `build.rs`. Reported by
+/// `--version`, logged once at startup, and served by `/health` — so a field report can always be
+/// tied to exact bytes (hand-copied builds on several machines are otherwise indistinguishable).
+/// A `const` (not a function) because clap's `version` needs a `'static` str.
+pub const BUILD_ID: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("NFS_GIT_SHA"), ")");
+
 #[derive(Parser)]
-#[command(name = "newfoundsync", about = "LAN audio/video sharing with a web client")]
+#[command(
+    name = "newfoundsync",
+    about = "LAN audio/video sharing with a web client",
+    version = BUILD_ID
+)]
 struct Cli {
     /// HTTP port for the web client + WebSocket. Overrides the saved GUI setting for this run;
     /// if omitted, the port last set in the GUI is used, else the default (47000).
@@ -91,6 +101,8 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // First line in every log: which build produced everything below it.
+    tracing::info!(build = BUILD_ID, "newfoundsync starting");
     let name = cli.name.clone().unwrap_or_else(default_name);
 
     // Parse the media config once; both GUI and headless use it.

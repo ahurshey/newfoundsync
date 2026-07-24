@@ -156,7 +156,12 @@ impl ScreenCapture {
 impl Drop for ScreenCapture {
     fn drop(&mut self) {
         if let Some(c) = self.control.take() {
-            let _ = c.stop();
+            // `stop()` joins the WGC capture thread and returns BOTH its own control error and that
+            // thread's `Result`. Discarding it destroyed the only record of a capture that died from
+            // device loss or a session-switch access denial — the exact "video just stopped" report.
+            if let Err(e) = c.stop() {
+                tracing::warn!("screen capture stopped with an error: {e}");
+            }
         }
     }
 }

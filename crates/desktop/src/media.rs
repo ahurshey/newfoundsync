@@ -13,7 +13,7 @@
 //!          H.264 Annex-B for a web-uplink cast; the exact codec is advertised in MediaConfig.video_codec]
 
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -34,6 +34,106 @@ pub const MSG_VIDEO: u8 = 0x02;
 
 /// One ready-to-send WebSocket binary frame.
 pub type Frame = Arc<Vec<u8>>;
+
+/// How often a repeating hot-path failure may log. Encode errors recur per frame (30–60/s), so an
+/// unthrottled `warn!` would flood the log — but logging them at `debug!` (which the default `info`
+/// filter drops) is what made a failing encoder produce silence with NOTHING in the log.
+const HOT_LOG_EVERY: Duration = Duration::from_secs(5);
+
+/// Rate-limiter for a hot-path log line: emits the first occurrence immediately, then at most one per
+/// [`HOT_LOG_EVERY`], reporting how many were suppressed in between (so the log shows the true rate).
+struct LogThrottle {
+    next: Option<Instant>,
+    suppressed: u64,
+}
+
+impl LogThrottle {
+    const fn new() -> LogThrottle {
+        LogThrottle { next: None, suppressed: 0 }
+    }
+
+    /// `Some(suppressed_since_last_line)` when the caller should log now; `None` to stay quiet.
+    fn tick(&mut self) -> Option<u64> {
+        let now = Instant::now();
+        match self.next {
+            Some(t) if now < t => {
+                self.suppressed += 1;
+                None
+            }
+            _ => {
+                let n = std::mem::take(&mut self.suppressed);
+                self.next = Some(now + HOT_LOG_EVERY);
+                Some(n)
+            }
+        }
+    }
+}
+
+/// Liveness + failure counters for the running pipeline, shared with the web layer (via
+/// [`crate::webserver::StreamState`]) so `/health` can answer "is this thing actually producing
+/// media?" without a human standing in front of a speaker.
+///
+/// Phase 1 only EMITS this data. Acting on it — a stall watchdog, the GUI pill, and withdrawing the
+/// advertised `video: true` once the encoder is dead — is deliberately left to the reliability phase,
+/// so this change stays observability-only.
+///
+/// # What these counters do and do NOT prove
+///
+/// Be precise here: a diagnostic that overstates what it knows is worse than none, because you trust
+/// it while it misleads you.
+/// * `audio_frames` counts frames the pipeline PUBLISHED, not audible sound. The default
+///   `--capture allapps` source pads silence to keep a steady 20 ms cadence, so this keeps climbing
+///   through a silent or dead device. It proves the pipeline is turning, not that anyone can hear it.
+///   (A peak-level field would settle that; it belongs with the reliability phase.)
+/// * `video_frames` counts ENCODER output. The producer re-encodes its last captured frame when the
+///   capture goes idle, so this also climbs while the picture is frozen — which is why
+///   `capture_frames` is tracked separately: it only advances when a genuinely NEW frame arrives from
+///   the OS capture, so `video_frames` climbing while `capture_frames` is flat means capture died,
+///   not the encoder.
+#[derive(Debug, Default)]
+pub struct MediaHealth {
+    /// Encoded audio frames successfully published.
+    pub audio_frames: AtomicU64,
+    /// Encoded video frames successfully published (see the caveat on the struct).
+    pub video_frames: AtomicU64,
+    /// NEW frames taken from the OS capture slot — the honest measure of capture liveness, since
+    /// `video_frames` keeps climbing off a stale frame after capture stops.
+    pub capture_frames: AtomicU64,
+    /// Audio encode failures since start.
+    pub audio_errors: AtomicU64,
+    /// Video encode failures since start.
+    pub video_errors: AtomicU64,
+    /// `mono_now()` at the moment the last audio frame was published; 0 = none yet.
+    pub last_audio_ns: AtomicI64,
+    /// `mono_now()` at the moment the last video frame was published; 0 = none yet.
+    pub last_video_ns: AtomicI64,
+    /// Set once the video encoder failed to initialize — video is then off for the life of this
+    /// stream even though clients were told `video: true`.
+    pub video_encoder_failed: AtomicBool,
+}
+
+impl MediaHealth {
+    /// Note a published audio frame. Takes NO timestamp on purpose: these stamps must be the
+    /// *publish instant*, and the caller's nearest value is the wire PTS — which is
+    /// `mono_now() + lead_ns`, i.e. ~50 ms in the FUTURE. Storing that made `/health` report a
+    /// negative age for a perfectly healthy stream, and could even land on the `-1` "no frames yet"
+    /// sentinel. Reading the clock here makes that mistake unrepresentable.
+    fn note_audio(&self) {
+        self.audio_frames.fetch_add(1, Ordering::Relaxed);
+        self.last_audio_ns.store(mono_now(), Ordering::Relaxed);
+    }
+
+    /// Note a published video frame. Same no-timestamp rule as [`MediaHealth::note_audio`].
+    fn note_video(&self) {
+        self.video_frames.fetch_add(1, Ordering::Relaxed);
+        self.last_video_ns.store(mono_now(), Ordering::Relaxed);
+    }
+
+    /// Note a NEW frame arriving from the OS capture (not an encode).
+    fn note_capture(&self) {
+        self.capture_frames.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Where the shared audio comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +202,8 @@ pub struct Media {
     /// client's already-encoded frames here, which get re-stamped + fanned out like a
     /// local capture. `None` for local sources.
     pub cast_relay: Option<Arc<CastRelay>>,
+    /// Liveness/failure counters for this stream, surfaced by `/health`.
+    pub health: Arc<MediaHealth>,
 }
 
 /// Relays a casting web client's ALREADY-ENCODED frames onto the broadcast channels,
@@ -122,6 +224,8 @@ pub struct CastRelay {
     pub height: u16,
     pub fps: u8,
     pub video_kbps: u32,
+    /// Same counters as the local capture path, so `/health` reports a relayed cast identically.
+    health: Arc<MediaHealth>,
 }
 
 impl CastRelay {
@@ -133,6 +237,7 @@ impl CastRelay {
         msg.extend_from_slice(&pts.to_be_bytes());
         msg.extend_from_slice(opus);
         let _ = self.audio_tx.send(Arc::new(msg)); // Err only if no clients
+        self.health.note_audio();
     }
 
     /// Wrap+fan-out one H.264 access unit (Annex-B) uploaded by the caster (Phase 2). The keyframe
@@ -151,6 +256,7 @@ impl CastRelay {
         msg.push(if key { 1 } else { 0 });
         msg.extend_from_slice(h264);
         let _ = self.video_tx.send(Arc::new(msg));
+        self.health.note_video();
     }
 }
 
@@ -181,12 +287,16 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
     // frames arrive over the WebSocket and are relayed onto these same channels.
     let web_uplink = matches!(opts.capture_source, CaptureSource::WebUplink);
 
+    let health = Arc::new(MediaHealth::default());
+
     // --- audio producer (skipped for web uplink) ------------------------
     let (audio_capture, capture_device) = if web_uplink {
         (AudioCapture::None, "Web client cast".to_string())
     } else {
         let mut encoder = Encoder::new(opts.codec, opts.bitrate).context("build audio encoder")?;
         let audio_pub = audio_tx.clone();
+        let audio_health = health.clone();
+        let mut enc_err = LogThrottle::new();
         let on_frame = move |frame: &[i16]| {
             // FFI callback (cpal/WGC) — trap panics so they can't unwind across C.
             let _ = std::panic::catch_unwind(AssertUnwindSafe(|| match encoder.encode(frame) {
@@ -197,8 +307,17 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
                     msg.extend_from_slice(&pts.to_be_bytes());
                     msg.extend_from_slice(&payload);
                     let _ = audio_pub.send(Arc::new(msg)); // Err only if no clients
+                    audio_health.note_audio();
                 }
-                Err(e) => tracing::debug!("audio encode: {e}"),
+                Err(e) => {
+                    // WARN, not debug: a persistently failing encoder makes the whole room silent, and
+                    // at debug! this was invisible under the default `info` filter — the console a user
+                    // sends back had nothing in it. Throttled so a per-frame failure can't flood.
+                    audio_health.audio_errors.fetch_add(1, Ordering::Relaxed);
+                    if let Some(suppressed) = enc_err.tick() {
+                        tracing::warn!(suppressed, "audio encode failed — stream is silent: {e}");
+                    }
+                }
             }));
         };
         AudioCapture::start(opts.capture_source, on_frame)?
@@ -211,8 +330,15 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
     } else {
         match opts.video {
             Some(vcfg) => Some(
-                VideoProducer::start(vcfg, opts.video_target, opts.encoder, lead_ns, video_tx.clone())
-                    .context("start video producer")?,
+                VideoProducer::start(
+                    vcfg,
+                    opts.video_target,
+                    opts.encoder,
+                    lead_ns,
+                    video_tx.clone(),
+                    health.clone(),
+                )
+                .context("start video producer")?,
             ),
             None => None,
         }
@@ -259,6 +385,7 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
             height: cast_h,
             fps: cast_fps,
             video_kbps: cast_kbps,
+            health: health.clone(),
         }))
     } else {
         None
@@ -305,6 +432,7 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         _video: video,
         capture_device,
         cast_relay,
+        health,
     })
 }
 
@@ -401,6 +529,7 @@ impl VideoProducer {
         encoder_backend: EncoderBackend,
         lead_ns: i64,
         tx: broadcast::Sender<Frame>,
+        health: Arc<MediaHealth>,
     ) -> Result<VideoProducer> {
         use crate::video::capture::{CapturedFrame, ScreenCapture};
         use crate::video::codec::VideoEncoder;
@@ -439,18 +568,25 @@ impl VideoProducer {
                 let started_at = Instant::now();
                 let mut got_any = false;
                 let mut warned_no_frame = false;
+                let mut enc_err = LogThrottle::new();
 
                 while !stop_t.load(Ordering::Relaxed) {
                     let tick = Instant::now();
                     if let Some(f) = slot.lock().unwrap().take() {
                         last = Some(f);
                         got_any = true;
+                        // Counted separately from encoded output: the loop below happily re-encodes
+                        // `last` forever after capture stops, so video_frames alone can't tell a live
+                        // screen from a frozen one. This only moves on a genuinely NEW OS frame.
+                        health.note_capture();
                     }
                     if !got_any && !warned_no_frame && started_at.elapsed() > Duration::from_secs(3) {
                         // All video now flows through this capture slot (the HEVC GPU fast-lane was
                         // removed), so 3s of silence means the source is idle — a minimized/occluded
-                        // window, or simply nothing changing on screen.
-                        tracing::debug!("video-producer: no captured frame in 3s (source idle/occluded?)");
+                        // window, or simply nothing changing on screen. One-shot, so `info` can't
+                        // flood; at `debug` it was invisible, and this is the only signal that
+                        // distinguishes "capture never delivered" from "encoder broken".
+                        tracing::info!("video-producer: no captured frame in 3s (source idle/occluded?)");
                         warned_no_frame = true;
                     }
                     // Only encode when at least one browser is watching.
@@ -465,8 +601,13 @@ impl VideoProducer {
                                         encoder = Some(e);
                                     }
                                     Err(e) => {
-                                        tracing::error!("video encoder init failed: {e:#}");
+                                        // Latched: video stays off for the life of this stream even
+                                        // though clients were already told `video: true`, so they show
+                                        // a stage that never receives a frame. Recorded in health so
+                                        // /health can report the mismatch.
+                                        tracing::error!("video encoder init failed — video is off for this stream: {e:#}");
                                         encoder_failed = true;
+                                        health.video_encoder_failed.store(true, Ordering::Relaxed);
                                     }
                                 }
                             }
@@ -505,9 +646,19 @@ impl VideoProducer {
                                         msg.push(if is_key { 1 } else { 0 });
                                         msg.extend_from_slice(&bits);
                                         let _ = tx.send(Arc::new(msg));
+                                        health.note_video();
                                     }
                                     Ok(_) => {}
-                                    Err(e) => tracing::debug!("video encode: {e}"),
+                                    Err(e) => {
+                                        // WARN, not debug: a per-frame failure (e.g. after a GPU driver
+                                        // reset) freezes the client picture on its last frame while
+                                        // everything still reports healthy. Throttled — this fires at
+                                        // frame rate.
+                                        health.video_errors.fetch_add(1, Ordering::Relaxed);
+                                        if let Some(suppressed) = enc_err.tick() {
+                                            tracing::warn!(suppressed, "video encode failed — picture is frozen: {e}");
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -556,7 +707,17 @@ impl Drop for VideoProducer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            // Report a panicked producer instead of discarding the payload: this thread dying is
+            // exactly the "video silently stopped" failure, and `let _ = join()` destroyed the only
+            // evidence. (A panic here also means the loop never observed `stop`.)
+            if let Err(panic) = t.join() {
+                let why = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic payload".to_string());
+                tracing::error!("video producer thread panicked: {why}");
+            }
         }
     }
 }

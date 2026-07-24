@@ -81,13 +81,85 @@ Run with **no flags** for the GUI; `--headless` runs server-only from the flags.
 windowed GUI is flaky); everything is driven by flags or the browser-side controls.
 
 **`/status`** — browse to `https://<server>:47000/status` for a live, read-only list of
-connected clients (name, status, sync, volume, calibration). Works in headless mode.
+connected clients (name, status, sync, volume, **frames dropped**, calibration), plus the
+running build id in the footer. Works in headless mode.
+
+### Diagnosing a problem
+
+A shared listening session can degrade *silently* — audio stops, or one device drifts — while
+every indicator still reads normal. These surfaces exist so you don't have to reproduce a
+fault on your own hardware to understand it:
+
+**`--version`** — the crate version plus the exact git commit the binary was built from
+(`0.0.2 (a1b2c3d4e5f6)`, with `-dirty` appended if it was built over uncommitted changes).
+Hand-copied binaries are otherwise impossible to tell apart, so quote this in any bug report.
+
+**`/health`** — JSON, safe to `curl`, answers the two questions a report can't otherwise
+settle:
+
+```bash
+curl -sk https://<server>:47000/health
+```
+
+- `build` / `gitSha` — *which* build this box is actually running. `-dirty` is appended when
+  the compiled sources differed from the commit (it is scoped to files that affect the
+  binary, so editing docs or CI does not flag a build).
+- `audioErrors`, `videoErrors` — encode failures. Non-zero means the pipeline is running but
+  failing, which sounds like silence or looks like a frozen picture.
+- `lastAudioAgeMs`, `lastVideoAgeMs` — milliseconds since the last frame was published; `-1`
+  (and only `-1`) means none has been produced yet. A climbing value with a steady client
+  count means the *source* stopped, not the network.
+- `videoEncoderFailed` — the encoder never initialized, so clients were told video was on
+  but will never receive a frame.
+- `audioFrames`, `videoFrames`, `captureFrames` — read these together, and mind what each
+  one actually proves:
+  - `videoFrames` counts *encoder output*, and the encoder re-encodes its last frame when
+    capture goes idle. So `videoFrames` climbing while **`captureFrames` stays flat** means
+    screen capture died and the picture is frozen — the encoder is fine.
+  - `audioFrames` counts frames *published*, not sound anyone can hear. The default
+    `--capture allapps` source pads silence to hold a steady 20 ms cadence, so this keeps
+    climbing through a muted or dead device. It proves the pipeline is turning, not that the
+    room can hear it — confirm audibility at a client.
+
+**Logs** — the default level is `info`, which now includes each client connecting,
+identifying, and disconnecting *with the reason* (a normal close, a write timeout, a queue
+overflow, or a tripped abuse guard — previously all indistinguishable silence). Encode
+failures log at `warn`, rate-limited to one line every 5 s with a count of those suppressed.
+For more detail:
+
+```bash
+RUST_LOG=newfoundsync=debug newfoundsync --headless
+```
+
+**"It stutters on one device"** — check that device's **Dropped** count on `/status`. Non-zero
+means the server shed frames for *that client* because it couldn't keep up; zero points at the
+network or the browser's own decoding instead.
 
 ## Build (Windows / Linux)
 
 Needs **Rust** (stable) and, for the Opus codec, a **C toolchain + CMake** (the vendored
 libopus is compiled at build time). The web client is embedded into the binary, so there's
 no separate front-end build.
+
+> **Two gotchas that will stop your build.** Both look like mysterious failures the first time:
+>
+> 1. **Stop the running server first.** Linking overwrites `newfoundsync.exe` in place, so if a
+>    previous server is still running the build fails at the *very end* with
+>    `error: linking with link.exe failed: exit code 101` / `Access is denied`. Fix:
+>    `Stop-Process -Name newfoundsync -Force` (or just close the window) and rebuild.
+> 2. **The `VPX_*` variables are per-shell.** They are environment variables, not saved
+>    anywhere, so they vanish when you open a new terminal and the next build fails to find
+>    libvpx. Either re-export them each session (see the VP9 section below) or make them
+>    permanent in `.cargo/config.toml`:
+>
+>    ```toml
+>    # .cargo/config.toml — repo-local, so no per-shell setup
+>    [env]
+>    VPX_LIB_DIR = { value = "vcpkg_installed/x64-windows-static/lib", relative = true }
+>    VPX_INCLUDE_DIR = { value = "vcpkg_installed/x64-windows-static/include", relative = true }
+>    VPX_VERSION = "1.13.0"
+>    VPX_STATIC = "1"
+>    ```
 
 On Windows, CMake ships with the Visual Studio Build Tools but may not be on your `PATH`:
 

@@ -15,6 +15,17 @@
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
+use std::time::Duration;
+
+/// How long `pump` waits for the MFT to ask for input before declaring the frame a failure.
+///
+/// A healthy hardware encoder signals `METransformNeedInput` within milliseconds, so this never
+/// trips in normal operation — it exists purely so a driver reset or lost device can't hang the video
+/// thread forever. Generous on purpose: the cost of being late is one dropped frame, while the cost of
+/// false-tripping would be spurious encode failures on a loaded machine.
+const PUMP_DEADLINE: Duration = Duration::from_millis(1_000);
+/// Poll gap while waiting. Short enough not to add visible latency, long enough not to spin a core.
+const PUMP_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
@@ -167,18 +178,50 @@ impl MfEncoder {
     }
 
     /// Feed one input sample to the async MFT and drain whatever output is ready.
+    ///
+    /// POLLED, NOT BLOCKING — deliberately. This used to call `GetEvent(MF_EVENT_FLAG_NONE)`, which
+    /// waits forever. When a GPU driver resets or the device is lost, the MFT can simply stop raising
+    /// `METransformNeedInput`, and that hang propagated badly: this runs on the video-producer thread,
+    /// which the media-control thread joins on, so a wedge here left the GUI pill on "Starting…"
+    /// permanently and every later Apply queued into a channel nobody read — source, resolution and
+    /// video became unchangeable for the life of the process, while the previous stream kept serving.
+    /// It presented as a UI bug, not a deadlock, which is why it was hard to place.
+    ///
+    /// Now: poll with `MF_EVENT_FLAG_NO_WAIT` until [`PUMP_DEADLINE`], then return `Err` so
+    /// `media.rs` treats it as an ordinary (rate-limit-logged) encode failure and keeps serving.
     unsafe fn pump(&mut self, sample: &IMFSample) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        // Block until the MFT asks for input, draining any output that arrives meanwhile.
-        loop {
-            let ev = self.events.GetEvent(MF_EVENT_FLAG_NONE).context("GetEvent")?;
-            match ev.GetType()? {
-                t if t == METransformNeedInput.0 as u32 => {
-                    self.transform.ProcessInput(0, sample, 0).context("ProcessInput")?;
-                    break;
+        let started = std::time::Instant::now();
+        // Wait for the MFT to ask for input, draining any output that arrives meanwhile.
+        let mut fed = false;
+        while !fed {
+            match self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+                Ok(ev) => match ev.GetType()? {
+                    t if t == METransformNeedInput.0 as u32 => {
+                        self.transform.ProcessInput(0, sample, 0).context("ProcessInput")?;
+                        fed = true;
+                    }
+                    t if t == METransformHaveOutput.0 as u32 => self.drain_output(&mut out)?,
+                    // The MFT reporting its own failure. Surface it instead of spinning until the
+                    // deadline — `_ => {}` used to swallow this.
+                    t if t == MEError.0 as u32 => {
+                        let hr = ev.GetStatus().unwrap_or_default();
+                        bail!("encoder MFT reported MEError (status {hr:?})");
+                    }
+                    _ => {}
+                },
+                // No event yet (the expected case for NO_WAIT). Also covers a hard GetEvent failure,
+                // which the deadline below turns into an error rather than a spin.
+                Err(_) => {
+                    if started.elapsed() > PUMP_DEADLINE {
+                        bail!(
+                            "encoder did not request input within {:?} — treating as an encode failure \
+                             rather than blocking the video thread forever",
+                            PUMP_DEADLINE
+                        );
+                    }
+                    std::thread::sleep(PUMP_POLL_INTERVAL);
                 }
-                t if t == METransformHaveOutput.0 as u32 => self.drain_output(&mut out)?,
-                _ => {}
             }
         }
         // Collect any output that's immediately ready (non-blocking).

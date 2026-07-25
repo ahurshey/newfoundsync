@@ -36,6 +36,9 @@ pub type FrameSlot = Arc<Mutex<Option<CapturedFrame>>>;
 /// What the capture Handler is initialized with.
 pub struct CaptureInit {
     pub slot: FrameSlot,
+    /// Set when Windows closes the capture session (see `Handler::on_closed`). This is the ONLY
+    /// trustworthy "capture died" signal — see the note on [`ScreenCapture::closed`].
+    pub closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 type CapErr = Box<dyn std::error::Error + Send + Sync>;
@@ -44,6 +47,7 @@ struct Handler {
     slot: FrameSlot,
     scratch: Vec<u8>,
     first_frame_logged: bool,
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl GraphicsCaptureApiHandler for Handler {
@@ -51,11 +55,12 @@ impl GraphicsCaptureApiHandler for Handler {
     type Error = CapErr;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let CaptureInit { slot } = ctx.flags;
+        let CaptureInit { slot, closed } = ctx.flags;
         Ok(Handler {
             slot,
             scratch: Vec::new(),
             first_frame_logged: false,
+            closed,
         })
     }
 
@@ -84,7 +89,19 @@ impl GraphicsCaptureApiHandler for Handler {
         Ok(())
     }
 
+    /// Windows closed the capture session — the shared window/display went away, the device was lost,
+    /// or a session switch revoked access. This is the AUTHORITATIVE "capture died" signal.
+    ///
+    /// It matters that this is the signal used, and not frame silence: WGC delivery is
+    /// change-driven, so a static screen legitimately produces NO frames for an unbounded time (a
+    /// still slide, a fullscreen photo). Inferring death from silence therefore reports a fault on the
+    /// most ordinary state a presentation tool has, which is worse than reporting nothing.
     fn on_closed(&mut self) -> Result<(), Self::Error> {
+        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            "screen capture session was CLOSED by Windows — the shared window/display is gone or \
+             access was revoked; clients will see the last captured frame from now on"
+        );
         Ok(())
     }
 }
@@ -92,12 +109,20 @@ impl GraphicsCaptureApiHandler for Handler {
 /// A running primary-monitor capture. Stops on drop.
 pub struct ScreenCapture {
     control: Option<CaptureControl<Handler, CapErr>>,
+    /// Set once Windows closes the capture session (`Handler::on_closed`).
+    ///
+    /// Read this — do NOT infer capture death from a lack of new frames. WGC is change-driven: a
+    /// static screen produces no frames at all, for an unbounded time. A silence-based heuristic
+    /// therefore fires on a still slide, which is the single most common state for a
+    /// share-your-screen tool.
+    pub closed: Arc<std::sync::atomic::AtomicBool>,
     pub slot: FrameSlot,
 }
 
 impl ScreenCapture {
     pub fn start_primary() -> Result<ScreenCapture> {
         let slot: FrameSlot = Arc::new(Mutex::new(None));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let monitor = Monitor::primary().context("get primary monitor")?;
         let settings = Settings::new(
             monitor,
@@ -107,10 +132,10 @@ impl ScreenCapture {
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
-            CaptureInit { slot: slot.clone() },
+            CaptureInit { slot: slot.clone(), closed: closed.clone() },
         );
         let control = Handler::start_free_threaded(settings).context("start screen capture")?;
-        Ok(ScreenCapture { control: Some(control), slot })
+        Ok(ScreenCapture { control: Some(control), slot, closed })
     }
 
     /// Capture a single window by its raw `HWND` value (from the source picker).
@@ -138,6 +163,7 @@ impl ScreenCapture {
         interval: MinimumUpdateIntervalSettings,
     ) -> Result<ScreenCapture> {
         let slot: FrameSlot = Arc::new(Mutex::new(None));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let settings = Settings::new(
             Window::from_raw_hwnd(raw),
             CursorCaptureSettings::Default,
@@ -146,10 +172,10 @@ impl ScreenCapture {
             interval,
             DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
-            CaptureInit { slot: slot.clone() },
+            CaptureInit { slot: slot.clone(), closed: closed.clone() },
         );
         let control = Handler::start_free_threaded(settings).context("start window capture")?;
-        Ok(ScreenCapture { control: Some(control), slot })
+        Ok(ScreenCapture { control: Some(control), slot, closed })
     }
 }
 

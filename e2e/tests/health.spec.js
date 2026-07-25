@@ -25,6 +25,9 @@ const SHAPE = {
   videoErrors: 'number',
   lastAudioAgeMs: 'number',
   lastVideoAgeMs: 'number',
+  lastCaptureAgeMs: 'number',
+  audioStalled: 'boolean',
+  captureClosed: 'boolean',
   videoEncoderFailed: 'boolean',
 };
 
@@ -58,6 +61,11 @@ test.describe('/health', () => {
     // No frames have been produced (nothing is casting), so ages read -1 rather than a bogus 0.
     expect(h.lastAudioAgeMs, 'no audio yet → age -1, not a misleading 0').toBe(-1);
     expect(h.videoEncoderFailed, 'no local encoder in web-uplink mode').toBe(false);
+
+    // The harness server has produced NOTHING ever (no caster). That is *waiting*, not a stall — the
+    // watchdog must not cry wolf on a freshly started cast source, which is the common real-world state.
+    expect(h.audioStalled, 'a source that never started must not report a stall').toBe(false);
+    expect(h.captureClosed, 'no capture session at all must not report one closed').toBe(false);
     expect(h.uptimeSecs, 'uptime should be a sane non-negative').toBeGreaterThanOrEqual(0);
 
     // Counters can only be non-negative; a negative would mean an underflow or a bad cast.

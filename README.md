@@ -123,6 +123,25 @@ curl -sk https://<server>:47000/health
     climbing through a muted or dead device. It proves the pipeline is turning, not that the
     room can hear it — confirm audibility at a client.
 
+- `audioStalled` / `captureStalled` — the straight answer, so you don't have to reimplement
+  the threshold. Crucially these mean *"it was producing and stopped"*, **not** "it hasn't
+  started": a cast source waiting for its first caster reports `false`, because a watchdog
+  that cries wolf on every startup is one you learn to ignore.
+
+**The server now tells you when it goes quiet.** A watchdog checks the pipeline every second
+and logs once on each transition, so a stopped stream is not silent in the log too:
+
+```
+ERROR AUDIO HAS STOPPED — the pipeline was producing and is now silent; clients are still
+      connected and will hear nothing  stalled_ms=2412 clients=3
+INFO  audio recovered — frames are flowing again
+```
+
+It distinguishes a **frozen picture** from a dead encoder, which look identical from the
+outside: the encoder happily re-encodes its last captured frame forever, so `videoFrames`
+keeps climbing while `captureFrames` stays flat. `/status` shows a banner for either, since
+that page is the headless diagnostic surface.
+
 **Logs** — the default level is `info`, which now includes each client connecting,
 identifying, and disconnecting *with the reason* (a normal close, a write timeout, a queue
 overflow, or a tripped abuse guard — previously all indistinguishable silence). Encode

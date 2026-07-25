@@ -251,6 +251,13 @@ const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// covers a pathological H.264 keyframe while staying under the WS frame cap.
 const MAX_UP_AUDIO_BYTES: usize = 8 * 1024;
 const MAX_UP_VIDEO_BYTES: usize = 4 * 1024 * 1024;
+/// How long the single caster slot may be held without any uplink frame arriving before it is
+/// reclaimed. A peer that vanishes without a FIN (phone sleeps, Wi-Fi drops, tab frozen) leaves its
+/// TCP connection open from our side, so `ClientGuard` never runs and the slot stays claimed —
+/// blocking every other device from casting with no way to clear it short of restarting the server.
+/// Generous enough that a genuine caster mid-silence is never evicted: even a muted cast keeps sending
+/// Opus frames every 20 ms.
+const CAST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Floor for the per-connection caster upload budget (covers audio-only casts + overhead). The ACTUAL
 /// budget is derived per-connection from the server-dictated bitrate in serve() (see uplink_rate_exceeded),
 /// so no operator quality preset — up to the 80 Mbps video clamp — can false-trip the limiter.
@@ -435,6 +442,8 @@ pub async fn run(
         cast,
     });
 
+    spawn_stall_watchdog(state.clone());
+
     let app = Router::new()
         .route("/", get(index))
         .route("/status", get(status)) // headless-friendly live view of connected clients
@@ -520,6 +529,107 @@ async fn version() -> impl IntoResponse {
 /// Process start, so `/health` can report uptime.
 static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
+/// How long without a published frame counts as a stall. Audio frames arrive every 20 ms, so 2 s of
+/// nothing is unambiguous while still tolerating a scheduling hiccup.
+const STALL_MS: i64 = 2_000;
+
+/// Watch the pipeline and SAY SOMETHING when it stops producing.
+///
+/// Without this, capture or encode can die and every indicator keeps reading normal — the GUI pill, the
+/// client count, `/status`, and each browser's "playing" state — so the first sign of trouble is a room
+/// full of people noticing the silence. Headless has no pill at all, which makes the log the only
+/// channel. Logs the transition in BOTH directions (once each, not per tick) so the log shows a
+/// bounded outage rather than a wall of repeats.
+fn spawn_stall_watchdog(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut audio_bad = false;
+        let mut video_bad = false;
+        loop {
+            tick.tick().await;
+            // Clone out immediately — never hold a watch borrow across an await.
+            let s = state.stream.borrow().clone();
+            let h = &s.health;
+
+            // ---- AUDIO ------------------------------------------------------------------------
+            let stalled = audio_stall_is_a_fault(&state, &s);
+            if stalled && !audio_bad {
+                audio_bad = true;
+                tracing::error!(
+                    stalled_ms = h.audio_stall_ms().unwrap_or(-1),
+                    clients = state.clients.load(Ordering::Relaxed),
+                    "AUDIO HAS STOPPED — the pipeline was producing and is now silent; connected \
+                     clients will hear nothing"
+                );
+            } else if !stalled && audio_bad {
+                audio_bad = false;
+                // Only claim recovery when audio is genuinely FLOWING again. Previously any
+                // not-stalled state cleared the latch, so a source swap (fresh zeroed counters) or a
+                // cast simply ending logged "recovered" about something that had not recovered.
+                let flowing = h.audio_stall_ms().map(|ms| ms <= STALL_MS).unwrap_or(false);
+                if flowing {
+                    tracing::info!("audio recovered — frames are flowing again");
+                } else {
+                    tracing::info!("audio stall cleared — this stream is no longer expected to produce audio");
+                }
+            }
+
+            // ---- VIDEO ------------------------------------------------------------------------
+            // Total video death, which the first version of this watchdog missed entirely: it only
+            // ever used video freshness as a GATE for the capture check, so the worse failure — video
+            // stopping altogether — was the one case never reported. Gated on `video_expected` so a
+            // stream with video switched off is silent, not "broken".
+            let video_stalled = h.video_expected.load(Ordering::Relaxed)
+                && h.video_stall_ms().map(|ms| ms > STALL_MS).unwrap_or(false);
+            if video_stalled && !video_bad {
+                video_bad = true;
+                tracing::error!(
+                    stalled_ms = h.video_stall_ms().unwrap_or(-1),
+                    "VIDEO HAS STOPPED — the encoder was producing and has stopped; clients will see \
+                     a frozen picture"
+                );
+            } else if !video_stalled && video_bad {
+                video_bad = false;
+                tracing::info!("video recovered — frames are flowing again");
+            }
+
+            // ---- SCREEN CAPTURE --------------------------------------------------------------
+            // Reported ONLY from the authoritative signal (Windows closed the session), never from
+            // frame silence. WGC delivery is change-driven: a static screen produces no frames for an
+            // unbounded time, so a silence heuristic fires on a still slide — the most ordinary state
+            // a screen-share has. `capture_closed` is a one-way latch, so this logs once.
+            if h.capture_closed.swap(false, Ordering::Relaxed) {
+                tracing::error!(
+                    "SCREEN CAPTURE SESSION CLOSED — the shared window or display is gone (or access \
+                     was revoked). Video is now frozen on the last captured frame; re-pick the source."
+                );
+            }
+        }
+    });
+}
+
+/// Whether stale audio should be reported as a FAULT for the current stream.
+///
+/// The subtlety that made the first version cry wolf: for a web-uplink source the casting client is the
+/// ONLY audio producer, so "no audio" is the normal state whenever nobody holds the cast slot — between
+/// casts, after a caster stops, after an idle reclaim. The timestamp from the last cast stays behind, so
+/// a naive age check reports a permanent fault on any server that has ever hosted a cast. Gating on the
+/// slot keeps the alert that matters (a caster that died while still holding the slot) and drops the one
+/// that doesn't.
+///
+/// Shared by the watchdog, `/health` and `/status` deliberately — three copies of this predicate would
+/// drift and disagree with each other.
+fn audio_stall_is_a_fault(state: &AppState, s: &StreamState) -> bool {
+    if !s.health.audio_stall_ms().map(|ms| ms > STALL_MS).unwrap_or(false) {
+        return false; // fresh, or never produced (= waiting, not a fault)
+    }
+    if s.cast_relay.is_some() {
+        // Web uplink: only a currently-held cast slot can stall.
+        return state.cast.lock().map(|c| c.is_some()).unwrap_or(false);
+    }
+    true // local capture should always be producing
+}
+
 /// Build identity + pipeline liveness as JSON. Answers the two questions that a field report can't
 /// currently answer: *which build is this box running* (hand-copied .exe files are otherwise
 /// indistinguishable — `/version` only hashes the web shell and is blind to Rust changes), and *is the
@@ -546,7 +656,8 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             "\"uptimeSecs\":{},\"clients\":{},\"casting\":{},\"castSource\":{},",
             "\"audioFrames\":{},\"videoFrames\":{},\"captureFrames\":{},",
             "\"audioErrors\":{},\"videoErrors\":{},",
-            "\"lastAudioAgeMs\":{},\"lastVideoAgeMs\":{},\"videoEncoderFailed\":{}}}"
+            "\"lastAudioAgeMs\":{},\"lastVideoAgeMs\":{},\"lastCaptureAgeMs\":{},",
+            "\"audioStalled\":{},\"captureClosed\":{},\"videoEncoderFailed\":{}}}"
         ),
         crate::BUILD_ID,
         env!("CARGO_PKG_VERSION"),
@@ -564,6 +675,14 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         h.video_errors.load(Ordering::Relaxed),
         age_ms(h.last_audio_ns.load(Ordering::Relaxed)),
         age_ms(h.last_video_ns.load(Ordering::Relaxed)),
+        age_ms(h.last_capture_ns.load(Ordering::Relaxed)),
+        // The straight answers, via the SAME predicate the watchdog uses so the log and this endpoint
+        // can never disagree. False also means "not started yet" / "not expected to produce".
+        audio_stall_is_a_fault(&state, &s),
+        // Reported from the authoritative session-closed signal, NOT from frame silence — a static
+        // screen legitimately delivers no frames (see MediaHealth::capture_closed). Peeked, not
+        // consumed; the watchdog owns clearing it.
+        h.capture_closed.load(Ordering::Relaxed),
         h.video_encoder_failed.load(Ordering::Relaxed),
     );
     (
@@ -650,6 +769,27 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         rows.push_str("<tr><td colspan=6 class=dim>No clients connected yet.</td></tr>");
     }
     let mut body = String::from(STATUS_HEAD);
+    // A stalled pipeline is the one thing that must not be buried under a healthy-looking client list:
+    // everything else on this page keeps reading normal while the room hears nothing.
+    {
+        // Same predicate as the watchdog and /health — see audio_stall_is_a_fault.
+        let s = state.stream.borrow().clone();
+        if audio_stall_is_a_fault(&state, &s) {
+            body.push_str(
+                "<p style=\"background:#3b1f1f;border:1px solid #a8443c;color:#ffd9d4;\
+                 padding:10px 12px;border-radius:4px;margin:0 0 12px\">\
+                 <b>Audio has stopped.</b> The pipeline was producing and is now silent — clients are \
+                 still connected and will hear nothing. Check the server's capture source.</p>",
+            );
+        } else if s.health.capture_closed.load(Ordering::Relaxed) {
+            body.push_str(
+                "<p style=\"background:#362b14;border:1px solid #94690d;color:#f7edd5;\
+                 padding:10px 12px;border-radius:4px;margin:0 0 12px\">\
+                 <b>The screen-capture session was closed.</b> The shared window or display is gone, so \
+                 clients see a frozen picture. Re-pick the video source.</p>",
+            );
+        }
+    }
     body.push_str("<h1>Connected clients <span class=dim>(");
     body.push_str(&n.to_string());
     body.push_str(")</span></h1><table><thead><tr><th>Device</th><th>Status</th><th>Sync</th><th>Volume</th><th>Dropped</th><th>Calibration</th></tr></thead><tbody>");
@@ -935,8 +1075,34 @@ async fn serve(
     // Set by whichever path ends the loop; logged once on exit (see `Exit`).
     let mut exit = Exit::PeerClosed;
 
+    // Caster-liveness: the last time an uplink frame arrived from this connection, checked on a tick so
+    // a vanished caster's slot is reclaimed (see CAST_IDLE_TIMEOUT). Only meaningful while we hold the
+    // slot; a plain listener is never evicted by this.
+    let mut last_uplink = std::time::Instant::now();
+    let mut idle_check = tokio::time::interval(std::time::Duration::from_secs(2));
+    idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
+            // Reclaim the single cast slot from a caster that stopped sending without disconnecting.
+            _ = idle_check.tick() => {
+                let holds_slot = state.cast.lock().map(|s| *s == Some(conn_id)).unwrap_or(false);
+                if holds_slot && last_uplink.elapsed() > CAST_IDLE_TIMEOUT {
+                    if let Ok(mut slot) = state.cast.lock() {
+                        if *slot == Some(conn_id) {
+                            *slot = None;
+                        }
+                    }
+                    tracing::warn!(
+                        conn_id,
+                        idle_secs = last_uplink.elapsed().as_secs(),
+                        "cast slot reclaimed — the caster stopped sending without disconnecting \
+                         (device asleep / Wi-Fi dropped); another device can cast now"
+                    );
+                    // Tell it too, so its own UI stops claiming it is casting if it ever comes back.
+                    let _ = out_tx.try_send(Message::Binary(cast_stop_msg()));
+                }
+            }
             // The write task ended (write error or timeout) → the peer is gone; tear down.
             _ = &mut write_handle => { exit = Exit::WriteFailed; break }
             // The source was swapped (or the server is shutting down) — drop this
@@ -1010,6 +1176,11 @@ async fn serve(
                     // Web cast: a client claims the single caster slot. Granted only when the active
                     // source is a web uplink (cast_relay present) AND the slot is free (or already ours).
                     Some(Ok(Message::Binary(b))) if b.first() == Some(&MSG_CAST_REQUEST) => {
+                        // `fresh` distinguishes a NEW claim from an idempotent re-request. It matters
+                        // for the idle clock below: re-stamping on every re-request would let a client
+                        // hold the single slot indefinitely by re-asking, never sending a frame, and
+                        // never being reclaimed.
+                        let mut fresh = false;
                         let granted = active.cast_relay.is_some()
                             && state
                                 .cast
@@ -1017,6 +1188,7 @@ async fn serve(
                                 .map(|mut slot| match *slot {
                                     None => {
                                         *slot = Some(conn_id);
+                                        fresh = true;
                                         true
                                     }
                                     Some(c) => c == conn_id, // re-request is idempotent; else taken
@@ -1032,7 +1204,14 @@ async fn serve(
                                 "cast request denied (no web-uplink source, or slot already taken)"
                             );
                         } else {
-                            tracing::info!(conn_id, "cast slot granted");
+                            tracing::info!(conn_id, fresh, "cast slot granted");
+                            // Start the idle clock only on a FRESH claim: the caster still has to get
+                            // through a screen/mic permission prompt before its first frame, and that
+                            // must not count against it. An idempotent re-request must NOT refresh it,
+                            // or the reclaim could be dodged forever without ever casting.
+                            if fresh {
+                                last_uplink = std::time::Instant::now();
+                            }
                         }
                         if let Err(e) = out_tx.try_send(Message::Binary(msg)) { exit = send_exit(e); break; }
                     }
@@ -1048,6 +1227,7 @@ async fn serve(
                             }
                             if let Some(relay) = active.cast_relay.as_deref() {
                                 relay.push_audio(&b[1..]);
+                                last_uplink = std::time::Instant::now(); // caster is alive
                             }
                         }
                     }
@@ -1065,6 +1245,7 @@ async fn serve(
                                     break;
                                 }
                                 relay.push_video(&b[2..]); // key flag re-derived server-side, not trusted from b[1]
+                                last_uplink = std::time::Instant::now(); // caster is alive
                             }
                         }
                     }

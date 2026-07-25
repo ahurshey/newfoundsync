@@ -73,9 +73,16 @@ impl LogThrottle {
 /// [`crate::webserver::StreamState`]) so `/health` can answer "is this thing actually producing
 /// media?" without a human standing in front of a speaker.
 ///
-/// Phase 1 only EMITS this data. Acting on it — a stall watchdog, the GUI pill, and withdrawing the
-/// advertised `video: true` once the encoder is dead — is deliberately left to the reliability phase,
-/// so this change stays observability-only.
+/// Acted on by the web layer's stall watchdog (see `webserver::spawn_stall_watchdog`), which logs a
+/// stopped pipeline and surfaces it on `/status` and `/health`.
+///
+/// One thing deliberately NOT done: withdrawing the advertised `video: true` when
+/// `video_encoder_failed` is set. It looked necessary, but the client already handles it — if no frame
+/// arrives within 6 s it swaps the dead video stage for the audio visualizer and swaps back
+/// automatically if video ever appears (`noVideoFallbackTimer` in app.js). So the user-visible symptom
+/// is already handled, and the operator now learns about it from the `error!` log and `/health`.
+/// Republishing a whole new `StreamState` to correct one boolean would reconnect every client for no
+/// gain.
 ///
 /// # What these counters do and do NOT prove
 ///
@@ -99,6 +106,8 @@ pub struct MediaHealth {
     /// NEW frames taken from the OS capture slot — the honest measure of capture liveness, since
     /// `video_frames` keeps climbing off a stale frame after capture stops.
     pub capture_frames: AtomicU64,
+    /// `mono_now()` when the last NEW capture frame arrived; 0 = none yet.
+    pub last_capture_ns: AtomicI64,
     /// Audio encode failures since start.
     pub audio_errors: AtomicU64,
     /// Video encode failures since start.
@@ -110,6 +119,17 @@ pub struct MediaHealth {
     /// Set once the video encoder failed to initialize — video is then off for the life of this
     /// stream even though clients were told `video: true`.
     pub video_encoder_failed: AtomicBool,
+    /// Set when Windows CLOSED the screen-capture session (the shared window/display went away or
+    /// access was revoked). Mirrors `ScreenCapture::closed`.
+    ///
+    /// This is the authoritative capture-death signal, and the reason `capture_frames` must NOT be used
+    /// to infer one: WGC delivery is change-driven, so a static screen legitimately produces no frames
+    /// at all for an unbounded time. A still slide is the most ordinary state a screen-share has, and a
+    /// silence-based check reports it as a fault.
+    pub capture_closed: AtomicBool,
+    /// True when this stream is expected to be producing video at all (video on, encoder alive). Lets
+    /// the watchdog tell "video is off" from "video died".
+    pub video_expected: AtomicBool,
 }
 
 impl MediaHealth {
@@ -132,6 +152,36 @@ impl MediaHealth {
     /// Note a NEW frame arriving from the OS capture (not an encode).
     fn note_capture(&self) {
         self.capture_frames.fetch_add(1, Ordering::Relaxed);
+        self.last_capture_ns.store(mono_now(), Ordering::Relaxed);
+    }
+
+    /// Milliseconds since the last published AUDIO frame, or `None` if none has ever been published.
+    ///
+    /// The `None` case is load-bearing, not a nicety: "never produced a frame" is *waiting* (a web-cast
+    /// source with no caster yet, or the first moments after Apply) and must not be reported as a
+    /// fault. A stall is specifically "it WAS producing and stopped".
+    pub fn audio_stall_ms(&self) -> Option<i64> {
+        Self::age(self.last_audio_ns.load(Ordering::Relaxed))
+    }
+
+    /// Milliseconds since the last published VIDEO frame, or `None` if none ever was. Note that video
+    /// legitimately produces nothing when it's switched off, which is why `None` must stay distinct.
+    pub fn video_stall_ms(&self) -> Option<i64> {
+        Self::age(self.last_video_ns.load(Ordering::Relaxed))
+    }
+
+    /// Milliseconds since the last NEW frame arrived from the OS capture. Compare against
+    /// [`MediaHealth::video_stall_ms`]: video fresh + capture stale = the screen is frozen and the
+    /// encoder is dutifully re-encoding one stale frame.
+    pub fn capture_stall_ms(&self) -> Option<i64> {
+        Self::age(self.last_capture_ns.load(Ordering::Relaxed))
+    }
+
+    fn age(last_ns: i64) -> Option<i64> {
+        if last_ns == 0 {
+            return None; // never produced — waiting, not stalled
+        }
+        Some((mono_now() - last_ns).max(0) / 1_000_000)
     }
 }
 
@@ -543,6 +593,9 @@ struct VideoProducer {
     stop: Arc<AtomicBool>,
     _capture: crate::video::capture::ScreenCapture,
     thread: Option<JoinHandle<()>>,
+    /// Signalled by the producer thread just before it exits, so `Drop` can wait a BOUNDED time for a
+    /// clean exit instead of joining unconditionally (see the `Drop` impl).
+    done_rx: std::sync::mpsc::Receiver<()>,
 }
 
 #[cfg(target_os = "windows")]
@@ -577,6 +630,13 @@ impl VideoProducer {
         };
         let slot = capture.slot.clone();
         let stop = Arc::new(AtomicBool::new(false));
+        // Clean-exit signal for a BOUNDED teardown — see VideoProducer's Drop impl.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        // The capture's authoritative "Windows closed the session" flag, mirrored into health below.
+        let capture_closed = capture.closed.clone();
+        // This stream IS meant to be producing video, so a video stall is a real fault (rather than
+        // "video is simply off"). Set before the thread starts so the watchdog can't race it.
+        health.video_expected.store(true, Ordering::Relaxed);
 
         let stop_t = stop.clone();
         let thread = thread::Builder::new()
@@ -596,6 +656,14 @@ impl VideoProducer {
 
                 while !stop_t.load(Ordering::Relaxed) {
                     let tick = Instant::now();
+                    // Mirror the authoritative capture-death signal into health so the web layer can
+                    // report it (see MediaHealth::capture_closed for why frame silence must NOT be
+                    // used for this).
+                    if capture_closed.load(Ordering::Relaxed)
+                        && !health.capture_closed.load(Ordering::Relaxed)
+                    {
+                        health.capture_closed.store(true, Ordering::Relaxed);
+                    }
                     if let Some(f) = slot.lock().unwrap().take() {
                         last = Some(f);
                         got_any = true;
@@ -693,6 +761,14 @@ impl VideoProducer {
                         thread::sleep(frame_dur - el);
                     }
                 }
+                // Drop the encoder BEFORE signalling. MfEncoder's own Drop talks to the GPU driver, so
+                // it can hang too — signalling first would tell the waiting Drop "I'm clean", and it
+                // would then join and block forever inside the encoder teardown: exactly the wedge this
+                // bounded handshake exists to prevent, just moved one frame later.
+                drop(encoder);
+                // Observed `stop`, left the loop, and released the encoder — Drop can join safely.
+                // (Err = the receiver is already gone, which is fine.)
+                let _ = done_tx.send(());
 
                 /// Nearest-neighbor BGRA scale, parallel by row.
                 fn scale_bgra(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, out: &mut Vec<u8>) {
@@ -722,6 +798,7 @@ impl VideoProducer {
             stop,
             _capture: capture,
             thread: Some(thread),
+            done_rx,
         })
     }
 }
@@ -730,18 +807,98 @@ impl VideoProducer {
 impl Drop for VideoProducer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            // Report a panicked producer instead of discarding the payload: this thread dying is
-            // exactly the "video silently stopped" failure, and `let _ = join()` destroyed the only
-            // evidence. (A panic here also means the loop never observed `stop`.)
-            if let Err(panic) = t.join() {
-                let why = panic
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic payload".to_string());
-                tracing::error!("video producer thread panicked: {why}");
+        // BOUNDED teardown, mirroring PulseCapture::drop. This runs on every source switch, Apply, and
+        // shutdown, so it must never hang: the producer thread can be parked inside a GPU encoder call
+        // that isn't observing `stop` yet. Wait briefly for the clean-exit signal and join (so a panic
+        // payload is still reported); otherwise DETACH and say so. The deadline is comfortably longer
+        // than one encode attempt (see mf_encoder's PUMP_DEADLINE) so a clean exit is the normal path.
+        const TEARDOWN_WAIT: Duration = Duration::from_millis(1_500);
+        // Three outcomes, and they are NOT interchangeable:
+        //   Ok           — clean exit; join is instant.
+        //   Disconnected — the sender was dropped WITHOUT signalling, i.e. the thread unwound. This
+        //                  returns immediately (not after the timeout), and the thread has finished, so
+        //                  joining is safe and is the only way to recover the panic payload. Treating
+        //                  this as "wedged" would both lie in the log and destroy the evidence.
+        //   Timeout      — still running and not observing `stop`, most likely parked in a GPU driver
+        //                  call. Do NOT join: that is exactly what turned an encoder wedge into a
+        //                  permanently unusable Apply button.
+        match self.done_rx.recv_timeout(TEARDOWN_WAIT) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(t) = self.thread.take() {
+                    if let Err(panic) = t.join() {
+                        let why = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic payload".to_string());
+                        tracing::error!("video producer thread panicked: {why}");
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    "video producer did not stop within {TEARDOWN_WAIT:?} — detaching it so teardown \
+                     can finish (it is probably stuck in a GPU encoder call)"
+                );
+                let _ = self.thread.take(); // drop the JoinHandle without joining
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The distinction the stall watchdog is built on: "never produced" must NOT look like "stopped".
+    /// A web-cast source with no caster yet, or the first moments after Apply, legitimately has zero
+    /// frames — reporting that as a fault would cry wolf on every startup.
+    #[test]
+    fn stall_helpers_distinguish_never_started_from_stopped() {
+        let h = MediaHealth::default();
+        assert_eq!(h.audio_stall_ms(), None, "no frames yet must be None, not a stall");
+        assert_eq!(h.video_stall_ms(), None);
+        assert_eq!(h.capture_stall_ms(), None);
+
+        h.note_audio();
+        let age = h.audio_stall_ms().expect("a published frame must produce Some(age)");
+        assert!((0..1_000).contains(&age), "age right after a frame should be ~0ms, got {age}");
+        assert_eq!(h.audio_frames.load(Ordering::Relaxed), 1);
+        // Publishing audio must not make video look alive.
+        assert_eq!(h.video_stall_ms(), None, "audio frames must not affect the video age");
+    }
+
+    /// An age far in the past reads as a stall; the threshold comparison is the watchdog's whole
+    /// decision, so pin it rather than trusting it by inspection.
+    #[test]
+    fn a_stale_timestamp_reads_as_stalled() {
+        let h = MediaHealth::default();
+        // 10s ago on the same monotonic clock the helpers read.
+        h.last_audio_ns.store(mono_now() - 10_000_000_000, Ordering::Relaxed);
+        let ms = h.audio_stall_ms().expect("a set timestamp must yield Some");
+        assert!(ms >= 9_000, "expected ~10000ms of staleness, got {ms}");
+        assert!(ms > 2_000, "must exceed the watchdog's 2s threshold");
+    }
+
+    /// Frozen picture: the encoder keeps emitting from a stale frame, so video looks fresh while
+    /// capture has stopped. That pairing is the ONLY way to tell a frozen screen from a dead encoder.
+    #[test]
+    fn fresh_video_with_stale_capture_is_a_frozen_picture() {
+        let h = MediaHealth::default();
+        h.note_video(); // encoder still producing
+        h.last_capture_ns.store(mono_now() - 5_000_000_000, Ordering::Relaxed); // capture died 5s ago
+        assert!(h.video_stall_ms().unwrap() < 2_000, "video should look fresh");
+        assert!(h.capture_stall_ms().unwrap() > 2_000, "capture should look stale");
+    }
+
+    /// The log throttle must emit the FIRST occurrence immediately — an encoder that fails once and
+    /// recovers should still leave a trace — and then suppress, counting what it swallowed.
+    #[test]
+    fn log_throttle_emits_first_then_suppresses_with_a_count() {
+        let mut t = LogThrottle::new();
+        assert_eq!(t.tick(), Some(0), "the first occurrence must log immediately");
+        assert_eq!(t.tick(), None, "an immediate repeat must be suppressed");
+        assert_eq!(t.tick(), None);
+        assert_eq!(t.suppressed, 2, "suppressed occurrences must be counted for the next line");
     }
 }

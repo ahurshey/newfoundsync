@@ -449,6 +449,9 @@ let vq = []; // DECODED render queue [{frame, targetPerf}] — small, kept just 
 let maxEvq = 400; // encoded queue cap (recomputed from fps + bufferMs)
 let needDecodeKey = false; // after an encoded-queue overflow, resync decode at a keyframe
 let aFrames = 0;
+// Frames that got PAST the playability guard in onAudioData, i.e. actually scheduled for output. The
+// stall detector keys off this rather than aFrames, which also counts frames decoded and discarded.
+let aPlayable = 0;
 let vFrames = 0;
 let noVideoFallbackTimer = null; // video advertised but no frame arrives → fall back to the audio viz
 let vDims = "";
@@ -620,6 +623,7 @@ function onStart() {
   started = true;
   stopping = false;
   everPlayed = false; // a fresh, user-initiated connect → the buffering bar may show again
+  resetAudioStallClock(); // honour the grace period from NOW, not from a previous session
   videoAccel = "no-preference"; // re-evaluate decoder accel each fresh start (don't stay stuck on software)
   vDecErrStreak = 0;
   vGoodRun = 0;
@@ -1175,6 +1179,29 @@ function onConfig(text) {
   setupDecoders(c).catch((e) => showWarn("⚠ Decoder setup failed: " + e.message));
 }
 
+// The audio decoder config from the last setupDecoders(), kept so a decode error can rebuild the
+// decoder WITHOUT re-running setupDecoders — that function also drives video UI side effects
+// (noVideoFallbackTimer, stage/visualizer swaps, the fullscreen button) which must not fire again on
+// an audio hiccup.
+let audioCfg = null;
+
+/// (Re)create the audio decoder from `audioCfg`. Returns true if it's configured and ready.
+function buildAudioDecoder() {
+  if (!audioCfg) return false;
+  try {
+    if (audioDecoder && audioDecoder.state !== "closed") audioDecoder.close();
+  } catch (e) {}
+  try {
+    audioDecoder = new AudioDecoder({ output: onAudioData, error: (e) => onDecErr("audio", e) });
+    audioDecoder.configure(audioCfg);
+    return true;
+  } catch (e) {
+    console.error("audio: could not build the decoder", e);
+    audioDecoder = null;
+    return false;
+  }
+}
+
 async function setupDecoders(c) {
   const epoch = connEpoch; // capture; after any await, bail if a reconnect/stream-switch bumped it (stale)
   // ---- audio ----
@@ -1192,8 +1219,8 @@ async function setupDecoders(c) {
   }
   if (epoch !== connEpoch) return; // a reconnect/stream-switch happened during the support await → stale
   if (audioDecoder) return; // already set up on this connection
-  audioDecoder = new AudioDecoder({ output: onAudioData, error: (e) => onDecErr("audio", e) });
-  audioDecoder.configure(acfg);
+  audioCfg = acfg; // remembered so onDecErr can rebuild without re-running this whole function
+  buildAudioDecoder();
 
   // ---- video: coarse support probe only; real configure waits for the keyframe ----
   if (c.video && typeof window.VideoDecoder === "undefined") {
@@ -1240,8 +1267,40 @@ async function setupDecoders(c) {
 let vDecErrStreak = 0;
 let vGoodRun = 0; // consecutive good frames since the last error (gates clearing the streak)
 let videoAvccMode = false; // true when decoding a browser cast's H.264 via AVCC + description (vs raw in-band AV1 OBU / VP9 frames from a native server source)
+let aDecErrStreak = 0; // audio decode errors since the last sustained good run
+let aGoodRun = 0; // consecutive decoded frames since the last error (gates clearing the streak)
+// ~1s of clean 20ms frames before we call the decoder recovered. Short enough to forgive a one-off
+// glitch, long enough that an every-other-frame failure still accumulates toward the warning.
+const A_GOOD_RUN_TO_CLEAR = 50;
 function onDecErr(kind, e) {
   console.error(kind + " decode error", e);
+  if (kind === "audio") {
+    // Audio is the whole point of this product, and this path used to do NOTHING: a single decode
+    // error left a dead decoder attached to a live socket, so the device went silent forever while
+    // its own UI still said "playing" — unreportable, and indistinguishable from the client hanging.
+    // The video path was clearly hardened after field pain; this never was.
+    aDecErrStreak++;
+    aGoodRun = 0; // a fresh error breaks any in-progress recovery run
+    const rebuilt = buildAudioDecoder();
+    if (rebuilt) {
+      // Deliberately NOT re-anchoring on a single error. reanchorAudio() calls stopAudioSources(),
+      // which cancels the ENTIRE scheduled playout lead — turning one lost 20 ms frame into a silence
+      // gap of roughly the whole buffer depth (seconds). The already-scheduled audio keeps playing and
+      // each new frame schedules from its own PTS, so playout self-corrects. Only re-anchor once errors
+      // are persistent, where the playhead really may be unusable.
+      if (aDecErrStreak >= 3) reanchorAudio();
+      console.warn("audio: decoder rebuilt after error #" + aDecErrStreak);
+    }
+    // Only complain once the problem is clearly persistent — a lone glitch that recovers silently
+    // shouldn't put a scary banner on screen.
+    if (!rebuilt || aDecErrStreak >= 3) {
+      showWarn(
+        "⚠ Audio keeps failing to decode on this device. It may not support this codec — try " +
+          "reloading, and if it persists check the server's audio codec."
+      );
+    }
+    return;
+  }
   if (kind === "video") {
     // Most video decode errors are recoverable: drop state and re-wait for a keyframe.
     gotParams = false;
@@ -1501,10 +1560,18 @@ function reanchorAudio() {
 
 function onAudioData(ad) {
   aFrames++;
+  // Clear the error streak only after a SUSTAINED good run, mirroring the video path's vGoodRun. A
+  // single decoded frame is not proof of recovery: a decoder failing every other frame would reset the
+  // streak forever and never reach the warning threshold — an audibly broken device that never says so.
+  if (++aGoodRun >= A_GOOD_RUN_TO_CLEAR) aDecErrStreak = 0;
   if (!ac || ac.state !== "running" || offsetNs === null) {
     ad.close();
     return;
   }
+  // Counted AFTER the playability guard: a frame decoded and immediately discarded (context suspended,
+  // no clock yet) is not audible, so counting it above would let the stall detector call real silence
+  // "playing" — the exact lie this is here to stop.
+  aPlayable++;
   if (!aligned && (outLatMs === 0 || aFrames % 250 === 0)) refreshOutLat(); // seed on first real frame + keep fresh
   const dur = ad.numberOfFrames / ad.sampleRate; // seconds this frame occupies
   // For an UN-aligned device, pull the AUDIO anchor earlier by the reported output-buffer latency so
@@ -1672,6 +1739,38 @@ function showBuffering(indeterminate, pct, text) {
   }
 }
 
+// How long without a decoded audio frame counts as stalled. Frames arrive every 20 ms, so seconds of
+// nothing is unambiguous — generous enough that a brief Wi-Fi hiccup or a tab throttle won't trip it.
+const AUDIO_STALL_MS = 3000;
+let lastPlayable = 0;
+let lastPlayableAtMs = 0;
+
+/// Restart the stall clock. Called on Start/Stop so the grace period is honoured from that moment —
+/// otherwise the first evaluation after a gap (a Stop/Start, or a backgrounded tab whose timers were
+/// throttled) compares against a timestamp from minutes ago and flashes "no audio" on a healthy stream.
+function resetAudioStallClock() {
+  lastPlayable = aPlayable;
+  lastPlayableAtMs = performance.now();
+}
+
+/// True when playback claims to be running but no PLAYABLE audio frame has appeared for
+/// AUDIO_STALL_MS. Keyed on `aPlayable` (frames that got past the playability guard), not `aFrames`:
+/// frames that decode and are immediately discarded are not sound, and counting them would let this
+/// report "playing" over real silence.
+function audioStalled() {
+  const now = performance.now();
+  if (aPlayable !== lastPlayable) {
+    lastPlayable = aPlayable;
+    lastPlayableAtMs = now;
+    return false;
+  }
+  if (lastPlayableAtMs === 0) {
+    lastPlayableAtMs = now; // first observation — start the clock, don't accuse yet
+    return false;
+  }
+  return now - lastPlayableAtMs > AUDIO_STALL_MS;
+}
+
 function updateStats() {
   if (offsetNs !== null && ac) {
     if (firstPlayoutAc !== null && ac.currentTime < firstPlayoutAc - 0.05) {
@@ -1680,6 +1779,13 @@ function updateStats() {
       // re-focus / reconnect (re-anchor) once we've played at least once this session.
       showBuffering(everPlayed ? null : false);
       setState("buffering " + Math.max(0, Math.ceil(remain)) + "s", "warn");
+    } else if (audioStalled()) {
+      // Don't claim "playing" when no audio frame has decoded for seconds. The pill saying "playing"
+      // over silence is the single most misleading state this client can show: it sends the user
+      // hunting the network or their speakers while the real fault is here.
+      everPlayed = true;
+      showBuffering(null);
+      setState("no audio", "warn");
     } else {
       everPlayed = true;
       showBuffering(null);

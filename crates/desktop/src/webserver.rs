@@ -34,6 +34,9 @@ use crate::media::{Frame, Media};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
+/// The calibration DSP, loaded by index.html BEFORE app.js. Part of the shell (and therefore of
+/// `build_tag`) so changing the signal math rotates the tag and stale clients self-heal.
+const NFS_DSP_JS: &str = include_str!("../web/nfs-dsp.js");
 const SERVICE_WORKER: &str = include_str!("../web/sw.js");
 const MANIFEST: &str = include_str!("../web/manifest.webmanifest");
 
@@ -44,17 +47,20 @@ const MANIFEST: &str = include_str!("../web/manifest.webmanifest");
 enum Shell {
     Index,
     AppJs,
+    Dsp,
     ServiceWorker,
     Manifest,
 }
 
 impl Shell {
-    const ALL: [Shell; 4] = [Shell::Index, Shell::AppJs, Shell::ServiceWorker, Shell::Manifest];
+    const ALL: [Shell; 5] =
+        [Shell::Index, Shell::AppJs, Shell::Dsp, Shell::ServiceWorker, Shell::Manifest];
 
     fn file_name(self) -> &'static str {
         match self {
             Shell::Index => "index.html",
             Shell::AppJs => "app.js",
+            Shell::Dsp => "nfs-dsp.js",
             Shell::ServiceWorker => "sw.js",
             Shell::Manifest => "manifest.webmanifest",
         }
@@ -65,6 +71,7 @@ impl Shell {
         match self {
             Shell::Index => INDEX_HTML,
             Shell::AppJs => APP_JS,
+            Shell::Dsp => NFS_DSP_JS,
             Shell::ServiceWorker => SERVICE_WORKER,
             Shell::Manifest => MANIFEST,
         }
@@ -169,6 +176,7 @@ fn shell_body(which: Shell) -> std::borrow::Cow<'static, str> {
     match which {
         Shell::Index => once!(INDEX_S),
         Shell::AppJs => once!(APP_S),
+        Shell::Dsp => once!(DSP_S),
         Shell::ServiceWorker => once!(SW_S),
         Shell::Manifest => once!(MANIFEST_S),
     }
@@ -179,6 +187,9 @@ fn index_body() -> std::borrow::Cow<'static, str> {
 }
 fn app_js_body() -> std::borrow::Cow<'static, str> {
     shell_body(Shell::AppJs)
+}
+fn nfs_dsp_body() -> std::borrow::Cow<'static, str> {
+    shell_body(Shell::Dsp)
 }
 /// The service worker. Goes through the same stamping path as the other shell files for uniformity,
 /// but note that `sw.js` no longer *contains* `__NFS_BUILD__` — it is a self-destruct stub that caches
@@ -448,6 +459,7 @@ pub async fn run(
         .route("/", get(index))
         .route("/status", get(status)) // headless-friendly live view of connected clients
         .route("/app.js", get(app_js))
+        .route("/nfs-dsp.js", get(nfs_dsp)) // calibration DSP; index.html loads it before app.js
         .route("/version", get(version)) // content build tag — the client self-heals a stale cached shell
         .route("/health", get(health)) // build identity + pipeline liveness (JSON, for diagnosis)
         .route("/sw.js", get(service_worker))
@@ -511,6 +523,16 @@ async fn app_js() -> impl IntoResponse {
             (header::CACHE_CONTROL, "no-cache"),
         ],
         app_js_body(),
+    )
+}
+
+async fn nfs_dsp() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        nfs_dsp_body(),
     )
 }
 

@@ -122,6 +122,13 @@ jobs:
           npm ci
           npx playwright install --with-deps chromium
 
+      # The sync/calibration DSP, unit tested without a browser. Runs in milliseconds and is the only
+      # thing that catches a silent signal bug — the kind that yields a client which connects, plays,
+      # and lands at the WRONG INSTANT while every other test stays green. Cheap, so run it first.
+      - name: DSP unit tests (node --test)
+        working-directory: e2e
+        run: npm run test:unit
+
       # playwright.config.js auto-boots ../target/release/newfoundsync
       # (--headless --insecure-http --capture web) and tears it down after.
       - name: Browser E2E (chromium)

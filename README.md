@@ -343,7 +343,7 @@ serve its own embedded client.
 
 ## Tests
 
-Two suites, both run by CI on pushes to `main` and on PRs against it
+Three suites, all run by CI on pushes to `main` and on PRs against it
 (`.github/workflows/ci.yml`):
 
 ```bash
@@ -351,8 +351,25 @@ cargo test --workspace --no-default-features    # sync core, codec, video config
 ```
 
 ```bash
+cd e2e && npm run test:unit                     # the calibration DSP, no browser, milliseconds
+```
+
+```bash
 cd e2e && npm ci && npx playwright install chromium && npx playwright test --project=chromium
 ```
+
+The DSP suite is the one that catches a **silent** sync bug. The signal math lives in
+`crates/desktop/web/nfs-dsp.js` — extracted from `app.js` precisely so it can be asserted without a
+browser — and the tests pin the properties correlation depends on: the code is deterministic per seed
+(both devices must generate the identical signal), peak-normalized, genuinely periodic, band-limited,
+and the resampler doesn't skew a ramp. A flipped filter sign fails two of them immediately; before,
+the only thing that caught it was a human standing between two speakers.
+
+One test earns special mention: `worker-dsp-parity.test.js` executes the DSP source that `app.js`
+actually injects into the calibration worker (via `.toString()`) inside a bare VM sandbox, and asserts
+byte-identical output to the module. That's what guarantees the signal the reference *plays* and the
+template the follower *correlates* can never drift apart — and it fails loudly if any of those
+functions ever starts depending on module scope, which would break only in the worker.
 
 The browser suite boots the **real** server binary headless on localhost and drives Chromium
 against it, so it covers the shell/reload/service-worker lifecycle that has historically been the

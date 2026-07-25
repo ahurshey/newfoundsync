@@ -436,6 +436,9 @@ window.__NFS_BUILD = "__NFS_BUILD__";
       </div>
     </div>
   </div>
+  <!-- Calibration DSP first: app.js calls these as globals (and serializes them into the DSP worker),
+       so this must load BEFORE it. Not deferred/async for the same reason. -->
+  <script src="/nfs-dsp.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

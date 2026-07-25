@@ -5,6 +5,7 @@
   "description": "Browser end-to-end / full-loop tests for the Newfoundsync web client (Playwright). Boots the real server headless and drives the actual client — the integration coverage that Rust unit tests can't reach.",
   "scripts": {
     "test": "playwright test",
+    "test:unit": "node --test unit/dsp.test.js unit/worker-dsp-parity.test.js",
     "test:chromium": "playwright test --project=chromium",
     "test:firefox": "playwright test --project=firefox",
     "test:webkit": "playwright test --project=webkit",

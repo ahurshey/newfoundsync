@@ -1943,81 +1943,15 @@ function fillChirp(out, rate, amp, f0, f1) {
 // BPSK code whose peak would rotate with the unknown channel carrier phase). Played looped
 // and clock-aligned by the reference; the follower matched-filters one identical period.
 //
-// These four helpers are the SINGLE source of truth: they run on the main thread (to build the
-// reference's AudioBuffer) AND are injected verbatim into the DSP worker (to build the template),
-// via `.toString()` below — so the played signal and the template are guaranteed identical.
-function calCodePrng(seed, n) {
-  // mulberry32 → ±1 chips. Deterministic: same seed ⇒ same sequence on both devices.
-  let a = seed >>> 0;
-  const out = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    const u = ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    out[i] = u < 0.5 ? -1 : 1;
-  }
-  return out;
-}
-function calBiquad(x, c) {
-  // Direct-form-I biquad; c = [b0,b1,b2,a1,a2] (a0 normalized to 1).
-  const b0 = c[0], b1 = c[1], b2 = c[2], a1 = c[3], a2 = c[4];
-  const y = new Float32Array(x.length);
-  let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
-  for (let i = 0; i < x.length; i++) {
-    const xi = x[i];
-    const yi = b0 * xi + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-    x2 = x1; x1 = xi; y2 = y1; y1 = yi;
-    y[i] = yi;
-  }
-  return y;
-}
-function calBiquadLP(rate, fc) {
-  const w = (2 * Math.PI * fc) / rate, cs = Math.cos(w), sn = Math.sin(w);
-  const alpha = sn / (2 * Math.SQRT1_2), a0 = 1 + alpha;
-  return [(1 - cs) / 2 / a0, (1 - cs) / a0, (1 - cs) / 2 / a0, (-2 * cs) / a0, (1 - alpha) / a0];
-}
-function calBiquadHP(rate, fc) {
-  const w = (2 * Math.PI * fc) / rate, cs = Math.cos(w), sn = Math.sin(w);
-  const alpha = sn / (2 * Math.SQRT1_2), a0 = 1 + alpha;
-  return [(1 + cs) / 2 / a0, -(1 + cs) / a0, (1 + cs) / 2 / a0, (-2 * cs) / a0, (1 - alpha) / a0];
-}
-// One steady-state period of the band-limited code at `rate`, peak-normalized to 1. Filtering
-// the doubled sequence and taking the SECOND copy removes the filter's start transient, so the
-// result is genuinely periodic (correlating a window that straddles a period boundary still locks).
-function calBuildCode(seed, n, rate, f0, f1) {
-  const raw = calCodePrng(seed, n);
-  const dbl = new Float32Array(2 * n);
-  dbl.set(raw, 0);
-  dbl.set(raw, n);
-  let y = calBiquad(dbl, calBiquadHP(rate, f0));
-  y = calBiquad(y, calBiquadLP(rate, f1));
-  const out = new Float32Array(n);
-  let peak = 1e-9;
-  for (let i = 0; i < n; i++) {
-    const v = y[n + i];
-    out[i] = v;
-    const a = v < 0 ? -v : v;
-    if (a > peak) peak = a;
-  }
-  const g = 1 / peak;
-  for (let i = 0; i < n; i++) out[i] *= g;
-  return out;
-}
-// General linear resample (up or down) — used to render the 16 kHz canonical code to the
-// reference's AudioContext rate for playback. (The worker keeps the 16 kHz canonical as-is.)
-function calResample(x, inRate, outRate) {
-  if (inRate === outRate) return x;
-  const ratio = inRate / outRate;
-  const n = Math.max(1, Math.round(x.length / ratio));
-  const out = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    const pos = i * ratio, i0 = pos | 0, frac = pos - i0;
-    const a = x[i0] || 0, b = (i0 + 1 < x.length ? x[i0 + 1] : x[i0]) || 0;
-    out[i] = a + (b - a) * frac;
-  }
-  return out;
-}
+// The calibration DSP (calCodePrng / calBiquad / calBiquadLP / calBiquadHP / calBuildCode /
+// calResample) now lives in nfs-dsp.js, loaded by index.html as a plain <script> BEFORE this file, so
+// the functions are globals here and every call site below is unchanged. It was moved out to get it
+// under unit test without a browser (e2e/unit/) — it is the code where a silent sign error produces a
+// client that plays confidently at the wrong instant.
+//
+// It remains the SINGLE source of truth for the signal: app.js still `.toString()`s these very
+// function objects into the DSP worker below, so the reference's played signal and the follower's
+// correlation template cannot drift apart.
 // Build the reference's playback AudioBuffer: the 16 kHz canonical code, resampled to the
 // context rate and scaled. (The follower correlates the mic — resampled back to 16 kHz —
 // against the same 16 kHz canonical, so both sides share one definition of the signal.)

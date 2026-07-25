@@ -97,6 +97,63 @@ test.describe('persisted-state startup (nfs_trim TDZ regression)', () => {
     ).toBe(0);
   });
 
+  // Every key the client persists, with a value chosen to be hostile for that key's parser. Derived by
+  // grepping app.js + index.html for getItem, so this list IS the full persisted surface.
+  //
+  // The point: the TDZ crash shipped because a persisted value could abort startup, and every spec at
+  // the time began from clean storage. Covering only the two keys that caused THAT bug would repeat the
+  // same mistake with a smaller blast radius — a returning device carries all eleven.
+  const HOSTILE = {
+    nfs_trim: 'Infinity',
+    nfs_aligned: 'maybe',
+    nfs_vol: '-999',
+    nfs_theme: '{}',
+    nfs_zoom: 'NaN',
+    nfs_viz: 'null',
+    nfs_cid: '',
+    nfs_cname: '"><script>alert(1)</script>',
+    nfs_named: '0',
+    nfs_calib_coded: 'undefined',
+    nfs_heal_n: '99',
+  };
+
+  test('startup survives EVERY persisted key holding a hostile value (chromium)', async ({ page, browserName }) => {
+    test.skip(browserName !== 'chromium', 'chromium');
+    const errors = [];
+    page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
+
+    await page.addInitScript((vals) => {
+      for (const [k, v] of Object.entries(vals)) {
+        try {
+          localStorage.setItem(k, /** @type {string} */ (v));
+        } catch (e) {
+          /* ignore */
+        }
+      }
+      // nfs_heal_n lives in sessionStorage; seed it near the cap to prove a high count can't strand us.
+      try { sessionStorage.setItem('nfs_heal_n', '99'); } catch (e) { /* ignore */ }
+    }, HOSTILE);
+
+    await page.goto('/', { waitUntil: 'load' });
+    await expect(page.locator('#start'), 'Start gate must render despite hostile persisted state').toBeVisible();
+    expect(errors, 'no persisted value may throw during startup').toEqual([]);
+    expect(
+      (await health(page)).ready,
+      'app.js must FINISH init with every key holding a hostile value'
+    ).toBeTruthy();
+
+    // And Start must still work — the specific thing the TDZ crash broke.
+    await page.locator('#start').click();
+    try { await page.locator('#nameskip').click({ timeout: 3000 }); } catch (e) { /* modal may not show */ }
+    await expect(page.locator('#start'), 'Start did nothing → init aborted somewhere').toBeHidden();
+
+    // The injected script tag in nfs_cname must never have executed as markup.
+    expect(
+      await page.evaluate(() => document.querySelectorAll('script[src=""]').length),
+      'a persisted device name must never be injected as HTML'
+    ).toBe(0);
+  });
+
   test('?reset clears persisted trim/alignment + SW + caches (chromium)', async ({ page, browserName }) => {
     test.skip(browserName !== 'chromium', 'chromium');
     // Seed via a normal load (NOT addInitScript, which would re-seed after the reset's redirect).

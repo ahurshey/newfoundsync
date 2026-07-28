@@ -16,9 +16,28 @@ pub mod system;
 #[cfg(target_os = "linux")]
 pub mod pulse;
 
+/// Appended to `Media::capture_device` when the capture source is a dummy/null sink.
+///
+/// Measured, not assumed: a dummy sink's monitor DOES carry whatever applications play into it
+/// (a 440 Hz tone played to `auto_null` came back off `auto_null.monitor` at full amplitude). So
+/// this is not a promise of silence — it is a warning that the machine has no real output device.
+/// Nothing is audible locally, and the stream carries only what apps still push into the dummy,
+/// which is nothing at all whenever they stop.
+///
+/// Defined here rather than in `pulse` (its only producer) because the GUI is cross-platform and
+/// must recognise the tag to raise its banner; two copies of the literal would drift apart and the
+/// banner would quietly stop appearing.
+pub const DUMMY_TAG: &str = "⚠ DUMMY OUTPUT — no real audio device on this machine";
+
 #[cfg(target_os = "windows")]
 pub mod process;
 #[cfg(target_os = "windows")]
+pub mod sessions;
+// The Linux app picker deliberately answers to the same module path, so `gui.rs` imports
+// `capture::sessions::{AudioApp, list_sources}` once and gets the right implementation. The two
+// are NOT interchangeable in meaning — see linux_sessions.rs for what differs.
+#[cfg(target_os = "linux")]
+#[path = "linux_sessions.rs"]
 pub mod sessions;
 
 #[cfg(not(target_os = "linux"))]

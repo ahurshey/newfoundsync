@@ -532,11 +532,25 @@ impl AudioCapture {
             CaptureSource::WebUplink => unreachable!("WebUplink has no local capture"),
 
             // Linux: capture the default sink's MONITOR via PulseAudio/PipeWire (the system output,
-            // never the mic). System / all-apps / per-app all map here (per-app is Windows-only).
+            // never the mic). System and all-apps are the same capture here — PulseAudio has no
+            // "everything except me" filter, and we produce no output of our own to exclude.
             #[cfg(target_os = "linux")]
-            CaptureSource::System | CaptureSource::AllExceptSelf | CaptureSource::App { .. } => {
+            CaptureSource::System | CaptureSource::AllExceptSelf => {
                 let c = crate::capture::pulse::PulseCapture::start(on_frame)
                     .context("start PulseAudio/PipeWire monitor capture")?;
+                let name = c.device_name.clone();
+                Ok((AudioCapture::Pulse(c), name))
+            }
+            // Linux per-app: narrow a monitor capture to one application's stream. Until this arm
+            // existed, App{..} fell into the whole-system arm above and the pid was DISCARDED —
+            // capture silently broadened to everything, while the UI still named the chosen app.
+            // If per-app cannot be honoured we now fail loudly instead, because the alternative is
+            // broadcasting a machine's entire audio to the LAN under a label that says otherwise.
+            #[cfg(target_os = "linux")]
+            CaptureSource::App { pid } => {
+                tracing::info!("[capture] starting audio source = SINGLE APP: pid={pid} (PulseAudio sink-input tap)");
+                let c = crate::capture::pulse::PulseCapture::start_app(pid, on_frame)
+                    .context("start per-application PulseAudio/PipeWire capture")?;
                 let name = c.device_name.clone();
                 Ok((AudioCapture::Pulse(c), name))
             }

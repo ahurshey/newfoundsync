@@ -30,7 +30,10 @@ use newfoundsync_core::{config, net};
 use crate::media::{self, CaptureSource, Media, MediaOptions, VideoTarget};
 use crate::webserver::{self, ClientRegistry, StreamState};
 
-#[cfg(target_os = "windows")]
+// Both platforms now supply `sessions::{AudioApp, list_sources}` — Windows from a window/session
+// enumeration, Linux from the live PulseAudio sink-input list. Same types, different semantics
+// (see capture/linux_sessions.rs); the picker below is written to tolerate both.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use crate::capture::sessions::{self, AudioApp};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -230,17 +233,20 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         last_logged_size: None,
         calibrating: false,
         status,
+        capture_is_dummy: false,
         starting,
         cmd_tx,
         codec: init.codec,
         bitrate: init.bitrate,
         source,
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         apps: Vec::new(),
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         apps_rx: None,
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         refreshing: false,
+        #[cfg(target_os = "linux")]
+        last_app_scan: None,
         selected_pid,
         selected_name: String::new(),
         video_kind,
@@ -260,7 +266,7 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         port_msg: String::new(),
         did_initial_zoom: false,
     };
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     app.refresh_apps();
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -470,11 +476,28 @@ fn open_url(url: &str) {
 
 fn serving_text(m: &Media) -> String {
     format!(
-        "Serving: {}{}",
+        "{SERVING_PREFIX}{}{}",
         m.capture_device,
         if m.config.video { "  + screen" } else { "" }
     )
 }
+
+/// Should the "streaming silence" banner be showing?
+///
+/// The one status string carries two kinds of message: the durable serving line, and transient
+/// chatter ("Starting…", "Pick an app first, then Apply."). Recomputing the verdict from whatever
+/// happens to be in `status` would blank a live silence warning the moment any of that chatter
+/// lands — the warning would flicker away exactly when the operator went looking for it. So only a
+/// real serving line is allowed to move the verdict; everything else leaves it latched.
+fn dummy_verdict(latched: bool, status: &str) -> bool {
+    if status.starts_with(SERVING_PREFIX) {
+        status.contains(crate::capture::DUMMY_TAG)
+    } else {
+        latched
+    }
+}
+
+const SERVING_PREFIX: &str = "Serving: ";
 
 fn res_to_idx(r: Resolution) -> usize {
     match r {
@@ -575,19 +598,29 @@ struct ServerApp {
     /// True while a server-orchestrated "Calibrate all" run is active (Phase B).
     calibrating: bool,
     status: Arc<Mutex<String>>,
+    /// Latched from the serving line: the capture device is a dummy/null sink, so we are streaming
+    /// silence. Drives the AUDIO SOURCE warning banner. See [`dummy_verdict`] for why it's latched
+    /// rather than recomputed from `status` every frame.
+    capture_is_dummy: bool,
     starting: Arc<AtomicBool>,
     cmd_tx: mpsc::Sender<MediaOptions>,
     codec: CodecKind,
     bitrate: i32,
     source: SourceKind,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     apps: Vec<AudioApp>,
     // Async source enumeration: refresh_apps() spawns a worker and stashes the receiver here;
     // poll_refresh() (called each frame) applies the result. Never blocks the GUI thread.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     apps_rx: Option<mpsc::Receiver<Vec<AudioApp>>>,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     refreshing: bool,
+    /// When the Linux app list was last re-enumerated. Windows windows persist, so a manual
+    /// refresh is fine there; a Linux list is a snapshot of what is *playing this instant*, so it
+    /// has to re-scan on a timer or it will show apps that already stopped and miss ones that
+    /// just started.
+    #[cfg(target_os = "linux")]
+    last_app_scan: Option<std::time::Instant>,
     selected_pid: Option<u32>,
     selected_name: String,
     // VIDEO SOURCE: off / whole screen / a specific window — its own picker, like audio.
@@ -779,7 +812,7 @@ impl ServerApp {
     /// `list_sources` internally spawns an MTA thread and joins it, so joining it on the
     /// GUI/STA thread would freeze the window (and could deadlock against the worker's COM
     /// teardown). The result is applied later by `poll_refresh`.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn refresh_apps(&mut self) {
         if self.refreshing {
             return; // one already in flight
@@ -799,7 +832,7 @@ impl ServerApp {
     }
 
     /// Apply a finished refresh, if one is ready. Called once per frame; never blocks.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn poll_refresh(&mut self) {
         let Some(rx) = &self.apps_rx else { return };
         match rx.try_recv() {
@@ -830,6 +863,10 @@ impl ServerApp {
                 // Reconcile the VIDEO selection — match the exact window (hwnd) first so a
                 // multi-window app keeps the one picked; fall back to pid. The .map() ends the
                 // borrow of self.apps before we mutate self.
+                //
+                // Windows-only: per-window video capture is WGC, and Linux `AudioApp`s always
+                // carry `hwnd: None`, so there is nothing here for Linux to reconcile.
+                #[cfg(target_os = "windows")]
                 if let Some(pid) = self.video_pid {
                     let h = self.video_hwnd;
                     let found = h
@@ -1313,6 +1350,29 @@ impl ServerApp {
             #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             const SYSTEM_LABEL: &str = "Full system output";
             eyebrow(ui, "AUDIO SOURCE");
+            // Silence is the one failure the UI cannot show by staying quiet: every control below
+            // looks correct while the stream carries nothing. The device name in the footer already
+            // says so, but that line is small, far from here, and easy to miss — so say it in the
+            // panel the operator is actually reading when they wonder why there's no sound.
+            {
+                let st = self.status.lock().unwrap().clone();
+                self.capture_is_dummy = dummy_verdict(self.capture_is_dummy, &st);
+            }
+            if self.capture_is_dummy {
+                ui.label(
+                    egui::RichText::new(
+                        "⚠  No real audio output device — using the Dummy Output.\n\
+                         Nothing is audible on this machine, and this stream carries only what\n\
+                         apps still play into the dummy — silence whenever nothing does.\n\
+                         Every card profile is off, or there's no sound hardware (usual in a VM).\n\
+                         If `pactl list cards` shows a card:\n\
+                         pactl set-card-profile <card> output:analog-stereo   — then press Apply.",
+                    )
+                    .size(11.5)
+                    .color(c_err()),
+                );
+                ui.add_space(6.0);
+            }
             // Coupling: choosing a LOCAL audio source drops a cast-video selection (you can't relay
             // the caster's screen while capturing local audio — the uplink is one source).
             if ui
@@ -1326,12 +1386,20 @@ impl ServerApp {
             {
                 self.video_kind = VideoSourceKind::Off;
             }
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             {
+                // The radio's wording differs per platform because the underlying thing differs.
+                // Windows lists windows and audio sessions, so "one window / app" is honest. Linux
+                // can only see streams that are playing, so promising "window" there would be a
+                // lie the operator discovers only after picking something.
+                #[cfg(target_os = "windows")]
+                const PICK_LABEL: &str = "Just one window / app:";
+                #[cfg(target_os = "linux")]
+                const PICK_LABEL: &str = "Just one app (must be playing):";
                 let apps = self.apps.clone();
                 ui.horizontal(|ui| {
                     if ui
-                        .radio_value(&mut self.source, SourceKind::App, "Just one window / app:")
+                        .radio_value(&mut self.source, SourceKind::App, PICK_LABEL)
                         .clicked()
                         && self.video_kind == VideoSourceKind::WebCast
                     {
@@ -1359,7 +1427,13 @@ impl ServerApp {
                                 }
                             }
                             if apps.is_empty() {
+                                // The empty state has to explain itself on Linux: an empty list is
+                                // the NORMAL state when nothing happens to be playing, not a
+                                // failure to enumerate, and "click Refresh" would be useless advice.
+                                #[cfg(target_os = "windows")]
                                 ui.label("(no windows / apps found — click Refresh)");
+                                #[cfg(target_os = "linux")]
+                                ui.label("(nothing is playing audio right now — start playback and it appears here)");
                             }
                         });
                     let label = if self.refreshing { "⟳ Refreshing…" } else { "⟳ Refresh" };
@@ -1368,7 +1442,18 @@ impl ServerApp {
                     }
                 });
             }
-            #[cfg(not(target_os = "windows"))]
+            // Linux gets the picker (audio only); per-WINDOW capture stays Windows-only because
+            // window-scoped audio has no meaning on PipeWire — audio belongs to a process's
+            // stream, and nothing maps a window to one.
+            #[cfg(target_os = "linux")]
+            ui.label(
+                egui::RichText::new(
+                    "Per-window capture is Windows-only; on Linux audio belongs to an app, not a window.",
+                )
+                .size(11.0)
+                .color(c_dim()),
+            );
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             ui.label(
                 egui::RichText::new(
                     "Per-app / single-window capture is Windows-only — on this OS use All apps or Full system output.",
@@ -1675,11 +1760,26 @@ impl eframe::App for ServerApp {
         if self.applied.is_none() {
             self.applied = Some(self.current_config());
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             self.poll_refresh();
             if self.refreshing {
                 ui.ctx().request_repaint_after(Duration::from_millis(50)); // pick up the result promptly
+            }
+            // Linux only: keep the app list alive while the operator is choosing from it. Entries
+            // exist only while their app is playing, so a click-to-refresh list would routinely be
+            // wrong by the time it is read — you would press play and nothing would appear. Scan
+            // only while the per-app radio is the selection, so the idle GUI stays idle.
+            #[cfg(target_os = "linux")]
+            if self.source == SourceKind::App {
+                let due = self
+                    .last_app_scan
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
+                if due && !self.refreshing {
+                    self.last_app_scan = Some(std::time::Instant::now());
+                    self.refresh_apps();
+                }
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
             }
         }
         let busy = self.starting.load(Ordering::Relaxed);
@@ -1818,5 +1918,48 @@ impl eframe::App for ServerApp {
         // Truncate (ellipsize) — a long `Couldn't …` anyhow chain must stay one line, not wrap
         // off the bottom of the (non-scrolling) window.
         ui.add(egui::Label::new(egui::RichText::new(st).monospace().size(13.0).color(col)).truncate());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dummy_verdict, SERVING_PREFIX};
+    use crate::capture::DUMMY_TAG;
+
+    #[test]
+    fn raises_the_banner_on_a_dummy_serving_line() {
+        let st = format!("{SERVING_PREFIX}auto_null.monitor  {DUMMY_TAG}");
+        assert!(dummy_verdict(false, &st));
+    }
+
+    #[test]
+    fn stays_quiet_for_a_real_device() {
+        let st = format!("{SERVING_PREFIX}alsa_output.pci-0000_00_1f.3.analog-stereo.monitor");
+        assert!(!dummy_verdict(false, &st));
+        // …and a real device CLEARS a previously latched warning (the self-heal / an Apply worked).
+        assert!(!dummy_verdict(true, &st));
+    }
+
+    #[test]
+    fn transient_chatter_does_not_blank_a_live_warning() {
+        // The bug this latch exists to prevent: the operator hits Apply, a validation message
+        // overwrites the serving line, and the silence warning vanishes while still true.
+        for chatter in [
+            "Starting…",
+            "Pick an app first, then Apply.",
+            "Couldn't switch: no such device",
+            "⚠ Audio source unavailable (x). Relaying web casts — pick a source and Apply.",
+        ] {
+            assert!(dummy_verdict(true, chatter), "{chatter} wrongly cleared the warning");
+            assert!(!dummy_verdict(false, chatter), "{chatter} wrongly raised the warning");
+        }
+    }
+
+    #[test]
+    fn the_tag_the_banner_matches_is_the_tag_the_capture_layer_emits() {
+        // Guards the cross-platform seam: pulse.rs builds the device string, gui.rs greps it. If
+        // someone edits one literal, `DUMMY_TAG` is the single definition that keeps them agreeing.
+        assert!(DUMMY_TAG.contains("DUMMY OUTPUT"));
+        assert!(format!("{SERVING_PREFIX}auto_null.monitor  {DUMMY_TAG}").contains(DUMMY_TAG));
     }
 }

@@ -406,12 +406,12 @@ tested**: the clock-offset selection, the PI servo, and the calibration correlat
 `app.js`, where the browser suite only asserts that playback *starts*, not that it lands at the
 right instant. Sync regressions are still caught by a human standing between two speakers.
 
-**Since shipped:** the Linux server (PipeWire/PulseAudio monitor capture, `.deb` packaging), the
-PI rate servo, web-client casting (a browser becomes the source), and the `/health` diagnostic
-endpoint.
+**Since shipped:** the Linux server (PipeWire/PulseAudio monitor capture — whole-system *or* a
+single application — plus `.deb`, `.rpm` and Flatpak packaging), the PI rate servo, web-client
+casting (a browser becomes the source), and the `/health` diagnostic endpoint.
 
 **Planned:** native Linux *screen* capture via the PipeWire ScreenCast portal, VA-API GPU encode,
-Flatpak packaging, FEC for lossy Wi-Fi, and system-tray minimize.
+FEC for lossy Wi-Fi, and system-tray minimize.
 
 This is a **trusted-LAN** tool: the TLS cert exists only to satisfy the browser's
 secure-context requirement (self-signed, accept-once). No accounts, no cloud, no

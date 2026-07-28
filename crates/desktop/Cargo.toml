@@ -1,6 +1,6 @@
 [package]
 name = "newfoundsync"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Lightweight LAN audio sharing with tight multiroom sync (desktop)"
@@ -143,3 +143,59 @@ assets = [
     ["../../branding/icon-256.png", "usr/share/icons/hicolor/256x256/apps/ca.newfoundsync.Newfoundsync.png", "644"],
     ["../../branding/icon-512.png", "usr/share/icons/hicolor/512x512/apps/ca.newfoundsync.Newfoundsync.png", "644"],
 ]
+
+# --- RPM packaging (Fedora / RHEL) --------------------------------------------------------------
+# Mirrors the Debian setup above: the base package is the HEADLESS server, the `gui` variant is the
+# desktop app. Build them ON a Fedora box (`cargo install cargo-generate-rpm`) from the repo root:
+#   cargo build --release -p newfoundsync --no-default-features && cargo generate-rpm -p crates/desktop
+#   cargo build --release -p newfoundsync && cargo generate-rpm -p crates/desktop --variant gui
+# (cargo-generate-rpm's -p is a PATH to the package dir -- it opens "<-p>/Cargo.toml" -- even though
+# its --help calls it a crate name. Passing the crate name fails with "newfoundsync/Cargo.toml".)
+# Asset `source` paths are relative to the invocation directory (the workspace root), which is why
+# they are spelled differently from cargo-deb's package-relative ones.
+#
+# auto-req is left on: rpmbuild's find-requires reads the ELF and pins the real sonames
+# (libpulse, libopus, glibc). Note it shares the .deb's blind spot — eframe/wgpu dlopen the
+# Wayland/X11/Vulkan libraries, so they cannot be discovered from the binary and are listed by
+# hand under the gui variant's `requires`.
+[package.metadata.generate-rpm]
+summary = "Lightweight LAN audio sharing with tight multiroom sync (headless server)"
+assets = [
+    { source = "target/release/newfoundsync", dest = "/usr/bin/newfoundsync", mode = "755" },
+    { source = "crates/desktop/packaging/newfoundsync.service", dest = "/usr/lib/systemd/system/newfoundsync.service", mode = "644" },
+]
+
+[package.metadata.generate-rpm.conflicts]
+newfoundsync-gui = "*"
+
+# The DESKTOP package. No systemd unit — a login-session GUI has no business being a system
+# service. Both packages own /usr/bin/newfoundsync, hence Conflicts + Obsoletes so installing one
+# displaces the other instead of fighting over the path.
+[package.metadata.generate-rpm.variants.gui]
+name = "newfoundsync-gui"
+summary = "Lightweight LAN audio sharing with tight multiroom sync (desktop app)"
+assets = [
+    { source = "target/release/newfoundsync", dest = "/usr/bin/newfoundsync", mode = "755" },
+    { source = "flatpak/ca.newfoundsync.Newfoundsync.desktop", dest = "/usr/share/applications/ca.newfoundsync.Newfoundsync.desktop", mode = "644" },
+    { source = "branding/icon-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/ca.newfoundsync.Newfoundsync.png", mode = "644" },
+    { source = "branding/icon-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/ca.newfoundsync.Newfoundsync.png", mode = "644" },
+    { source = "branding/icon-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/ca.newfoundsync.Newfoundsync.png", mode = "644" },
+]
+
+# Hand-listed because find-requires cannot see a dlopen. Without these the package installs on a
+# fresh box and then fails to open a window — the exact defect the .deb still has.
+[package.metadata.generate-rpm.variants.gui.requires]
+libxkbcommon = "*"
+libwayland-client = "*"
+libX11 = "*"
+libXcursor = "*"
+libXrandr = "*"
+libXi = "*"
+mesa-libGL = "*"
+vulkan-loader = "*"
+
+[package.metadata.generate-rpm.variants.gui.conflicts]
+newfoundsync = "*"
+
+[package.metadata.generate-rpm.variants.gui.obsoletes]
+newfoundsync = "*"

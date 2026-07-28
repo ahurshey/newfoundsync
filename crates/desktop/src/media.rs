@@ -23,7 +23,7 @@ use tokio::sync::broadcast;
 
 use newfoundsync_core::codec::{CodecKind, Encoder};
 use newfoundsync_core::config::mono_now;
-use newfoundsync_core::video::{EncoderBackend, VideoConfig};
+use newfoundsync_core::video::{EncodeDevice, EncoderBackend, VideoConfig};
 
 #[cfg(not(target_os = "linux"))]
 use crate::capture::system::SystemCapture;
@@ -322,6 +322,8 @@ pub struct MediaOptions {
     /// What the screen-video capture grabs (whole monitor or a single window).
     pub video_target: VideoTarget,
     pub encoder: EncoderBackend,
+    /// Where video encodes (GPU / CPU / Auto). Audio is unaffected.
+    pub encode_device: EncodeDevice,
 }
 
 /// Resolve the requested encoder against what this BUILD can actually do, once, before anything
@@ -408,6 +410,7 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
                     vcfg,
                     opts.video_target,
                     opts.encoder,
+                    opts.encode_device,
                     lead_ns,
                     video_tx.clone(),
                     health.clone(),
@@ -618,6 +621,7 @@ impl VideoProducer {
         cfg: VideoConfig,
         target: VideoTarget,
         encoder_backend: EncoderBackend,
+        encode_device: EncodeDevice,
         lead_ns: i64,
         tx: broadcast::Sender<Frame>,
         health: Arc<MediaHealth>,
@@ -701,7 +705,7 @@ impl VideoProducer {
                         if let Some(frame) = &last {
                             // Lazily build the system-memory encoder on the first slot frame.
                             if encoder.is_none() {
-                                match VideoEncoder::new(encoder_backend, dw, dh, fps, bitrate) {
+                                match VideoEncoder::new(encoder_backend, encode_device, dw, dh, fps, bitrate) {
                                     Ok(e) => {
                                         tracing::info!(backend = e.backend_label(), "video encoder ready");
                                         encoder = Some(e);

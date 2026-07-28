@@ -31,7 +31,7 @@ use tokio::sync::watch;
 use newfoundsync_core::codec::CodecKind;
 use newfoundsync_core::config;
 use newfoundsync_core::net;
-use newfoundsync_core::video::{EncoderBackend, Fps, Resolution, VideoConfig};
+use newfoundsync_core::video::{EncodeDevice, EncoderBackend, Fps, Resolution, VideoConfig};
 
 use media::{CaptureSource, MediaOptions};
 use webserver::StreamState;
@@ -80,6 +80,10 @@ struct Cli {
     /// Video codec: av1 (royalty-free default; GPU AV1 or CPU SVT-AV1) | vp9 (royalty-free CPU fallback).
     #[arg(long, default_value = "av1")]
     encoder: String,
+    /// Where video encodes: auto (GPU if available, else CPU) | gpu (fail if unavailable) | cpu.
+    /// Audio is unaffected. Separate from --encoder, which picks the CODEC.
+    #[arg(long, default_value = "auto")]
+    encode_device: String,
     /// Audio source: allapps (survives mute) | system | app | web (a web client casts up to here).
     #[arg(long, default_value = "allapps")]
     capture: String,
@@ -123,6 +127,23 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("unknown codec '{}' (use opus or pcm)", cli.codec))?;
     let encoder = EncoderBackend::parse(&cli.encoder)
         .ok_or_else(|| anyhow!("unknown encoder '{}' (use av1 or vp9)", cli.encoder))?;
+    // `--encoder` has long accepted device-flavoured words (gpu/cpu/hw/auto/...) as aliases for
+    // av1. They are kept working so nobody's script breaks, but they never selected a device and
+    // still don't -- someone who wrote `--encoder cpu` to keep video off the GPU has been getting
+    // GPU encoding this whole time, with nothing in the log to say so. Now there is.
+    if matches!(
+        cli.encoder.to_ascii_lowercase().as_str(),
+        "auto" | "hardware" | "hw" | "gpu" | "cpu" | "software" | "sw"
+    ) {
+        let token = cli.encoder.to_ascii_lowercase();
+        tracing::warn!(
+            "--encoder {token} names the CODEC and is only an alias for av1 — it has never \
+             selected GPU vs CPU. Use --encode-device {token} instead."
+        );
+    }
+    let encode_device = EncodeDevice::parse(&cli.encode_device).ok_or_else(|| {
+        anyhow!("unknown encode device '{}' (use auto, gpu or cpu)", cli.encode_device)
+    })?;
     let capture_source = match cli.capture.as_str() {
         "allapps" | "exclude" | "all" => CaptureSource::AllExceptSelf,
         "system" => CaptureSource::System,
@@ -162,6 +183,7 @@ fn main() -> Result<()> {
                 capture_source,
                 video,
                 encoder,
+                encode_device,
                 buffer_ms,
                 codec,
                 bitrate: cli.bitrate,
@@ -177,6 +199,7 @@ fn main() -> Result<()> {
         capture_source,
         video,
         encoder,
+        encode_device,
         codec,
         cli.bitrate,
         buffer_ms,
@@ -191,6 +214,7 @@ fn run_headless(
     capture_source: CaptureSource,
     video: Option<VideoConfig>,
     encoder: EncoderBackend,
+    encode_device: EncodeDevice,
     codec: CodecKind,
     bitrate: i32,
     buffer_ms: i64,
@@ -207,6 +231,7 @@ fn run_headless(
         video,
         video_target: media::VideoTarget::PrimaryMonitor, // headless: whole monitor (no window picker)
         encoder,
+        encode_device,
     })?;
 
     let host = net::primary_lan_ipv4()

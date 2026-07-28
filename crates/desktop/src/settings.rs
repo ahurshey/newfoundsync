@@ -70,3 +70,14 @@ pub fn load_port() -> Option<u16> {
 pub fn save_port(port: u16) -> Result<(), String> {
     save_key("port", &port.to_string())
 }
+
+/// The saved video encode device (Auto / GPU / CPU), if one was previously stored.
+/// `None` ⇒ caller uses [`EncodeDevice::Auto`], which is the historical behaviour.
+pub fn load_encode_device() -> Option<newfoundsync_core::video::EncodeDevice> {
+    load_all().get("encode_device").and_then(|v| newfoundsync_core::video::EncodeDevice::parse(v))
+}
+
+/// Persist the chosen video encode device (preserving other settings).
+pub fn save_encode_device(d: newfoundsync_core::video::EncodeDevice) -> Result<(), String> {
+    save_key("encode_device", d.as_str())
+}

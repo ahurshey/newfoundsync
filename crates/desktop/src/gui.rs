@@ -24,7 +24,7 @@ use eframe::egui;
 use tokio::sync::watch;
 
 use newfoundsync_core::codec::CodecKind;
-use newfoundsync_core::video::{EncoderBackend, Fps, Resolution, VideoConfig};
+use newfoundsync_core::video::{EncodeDevice, EncoderBackend, Fps, Resolution, VideoConfig};
 use newfoundsync_core::{config, net};
 
 use crate::media::{self, CaptureSource, Media, MediaOptions, VideoTarget};
@@ -73,6 +73,7 @@ pub struct InitialConfig {
     pub capture_source: CaptureSource,
     pub video: Option<VideoConfig>,
     pub encoder: EncoderBackend,
+    pub encode_device: EncodeDevice,
     pub buffer_ms: i64,
     pub codec: CodecKind,
     pub bitrate: i32,
@@ -90,6 +91,7 @@ impl InitialConfig {
             video: self.video,
             video_target: VideoTarget::PrimaryMonitor, // CLI/initial stream starts on the monitor
             encoder: self.encoder,
+            encode_device: self.encode_device,
         }
     }
 }
@@ -259,6 +261,9 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         res_idx,
         fps60,
         enc_idx,
+        // A saved choice wins over the CLI default: the GUI's picker is the thing the operator
+        // last touched, and it is the only way to set this without editing a shortcut.
+        encode_device: crate::settings::load_encode_device().unwrap_or(init.encode_device),
         video_quality_pct: init.video.map(|v| v.quality_pct).unwrap_or(100),
         buffer_ms: init.buffer_ms as i32,
         port,
@@ -550,6 +555,7 @@ struct AppliedConfig {
     res_idx: usize,
     fps60: bool,
     enc_idx: usize,
+    encode_device: EncodeDevice,
     video_quality_pct: u16,
     buffer_ms: i32,
     codec: CodecKind,
@@ -634,6 +640,9 @@ struct ServerApp {
     res_idx: usize,
     fps60: bool,
     enc_idx: usize,
+    /// Where video encodes. Persisted, so a machine with a flaky hardware encoder stays on CPU
+    /// across restarts instead of being re-bitten every launch.
+    encode_device: EncodeDevice,
     video_quality_pct: u16, // video quality as % of baseline bitrate (slider; 100 = default)
     buffer_ms: i32,
     /// The HTTP port the server is CURRENTLY bound to (fixed for this run; used in the URL/QR).
@@ -765,6 +774,7 @@ impl ServerApp {
             res_idx: self.res_idx,
             fps60: self.fps60,
             enc_idx: self.enc_idx,
+            encode_device: self.encode_device,
             video_quality_pct: self.video_quality_pct,
             // Record the value apply() actually sends (clamped), so the dirty comparison and
             // the applied baseline agree even if buffer_ms was seeded out of range from the CLI.
@@ -955,6 +965,7 @@ impl ServerApp {
             video,
             video_target,
             encoder,
+            encode_device: self.encode_device,
         };
         self.starting.store(true, Ordering::Relaxed);
         *self.status.lock().unwrap() = "Starting…".into();
@@ -1620,6 +1631,56 @@ impl ServerApp {
                                         );
                                 }
                             });
+                    });
+                    // WHERE video encodes, as opposed to WHICH codec above. Worth exposing because
+                    // the right answer is machine-specific and neither choice is universally
+                    // better: the GPU encoder costs almost no CPU but some hardware encoders are
+                    // lower quality per bitrate (or, on this project's own bug reports, flaky),
+                    // while SVT-AV1 gives up CPU headroom that a busy server may not have.
+                    ui.horizontal(|ui| {
+                        ui.label("Encode on:").on_hover_text(
+                            "Auto tries the GPU and quietly falls back to CPU — what this has \
+                             always done. GPU only refuses to start video if the GPU has no usable \
+                             AV1 encoder, instead of spending the CPU you were trying to protect. \
+                             CPU only never touches the GPU, which is the way out of a flaky \
+                             hardware encoder.",
+                        );
+                        // Windows-only: no GPU encode path exists elsewhere, so offering the choice
+                        // would be offering two spellings of "CPU" plus one that always fails.
+                        #[cfg(target_os = "windows")]
+                        egui::ComboBox::from_id_salt("encode_device")
+                            .selected_text(match self.encode_device {
+                                EncodeDevice::Auto => "Auto · GPU, else CPU",
+                                EncodeDevice::Gpu => "GPU only",
+                                EncodeDevice::Cpu => "CPU only",
+                            })
+                            .show_ui(ui, |ui| {
+                                for (d, label) in [
+                                    (EncodeDevice::Auto, "Auto · GPU, else CPU"),
+                                    (EncodeDevice::Gpu, "GPU only · fail if unavailable"),
+                                    (EncodeDevice::Cpu, "CPU only · never use the GPU"),
+                                ] {
+                                    if ui
+                                        .selectable_value(&mut self.encode_device, d, label)
+                                        .clicked()
+                                    {
+                                        // Persist immediately rather than on Apply. Apply rebuilds
+                                        // the stream and reconnects every listener; the operator
+                                        // reaching for this is usually mid-diagnosis of a bad
+                                        // encoder and shouldn't lose the setting to a crash before
+                                        // they get around to applying it.
+                                        if let Err(e) = crate::settings::save_encode_device(d) {
+                                            tracing::warn!("couldn't save encode device: {e}");
+                                        }
+                                    }
+                                }
+                            });
+                        #[cfg(not(target_os = "windows"))]
+                        ui.label(
+                            egui::RichText::new("CPU (SVT-AV1) — GPU encoding is Windows-only")
+                                .size(11.0)
+                                .color(c_dim()),
+                        );
                     });
                     ui.horizontal(|ui| {
                         ui.label("Quality:");

@@ -20,7 +20,7 @@ use rayon::prelude::*;
 use shiguredo_svt_av1::{ColorFormat, EncodeOptions, Encoder as SvtAv1Enc, EncoderConfig, FrameData, RcMode};
 use std::num::NonZeroUsize;
 
-use newfoundsync_core::video::EncoderBackend;
+use newfoundsync_core::video::{EncodeDevice, EncoderBackend};
 
 /// Software AV1 encoder (SVT-AV1) fed BGRA frames. AV1 is royalty-free, so this is the
 /// distribution-default codec when no hardware AV1 encoder is present. CPU-only here;
@@ -168,11 +168,22 @@ impl VideoEncoder {
     /// royalty-free fallback; HEVC/H.264 native encode were removed.
     pub fn new(
         backend: EncoderBackend,
+        device: EncodeDevice,
         width: u32,
         height: u32,
         fps: u32,
         bitrate_kbps: u32,
     ) -> Result<VideoEncoder> {
+        // VP9 encodes on the CPU only (libvpx; no hardware VP9 encoder is wired up on any
+        // platform here), so "GPU only" plus VP9 is a contradiction rather than a preference.
+        // Checked before the VP9 arm below, which returns early and would otherwise hand back a
+        // software encoder to someone who explicitly forbade one.
+        if backend == EncoderBackend::Vp9 && device == EncodeDevice::Gpu {
+            anyhow::bail!(
+                "GPU-only video encoding was requested with the VP9 codec, but VP9 encodes on the \
+                 CPU only. Use AV1 for GPU encoding, or set the encode device to Auto or CPU."
+            );
+        }
         if backend == EncoderBackend::Vp9 {
             #[cfg(feature = "vp9")]
             {
@@ -191,17 +202,44 @@ impl VideoEncoder {
                  `vp9` feature); using AV1 instead. Rebuild with --features vp9 for VP9."
             );
         }
-        // AV1 (royalty-free, default). Prefer a hardware AV1 encoder (Media Foundation) where the GPU
-        // has one; otherwise fall back to software SVT-AV1. Same "av01" stream either way.
+        // AV1 (royalty-free, default). Same "av01" stream whichever device encodes it — `device`
+        // only decides WHERE, and what happens when that isn't possible.
         #[cfg(target_os = "windows")]
-        {
+        if device != EncodeDevice::Cpu {
             match crate::video::mf_encoder::MfEncoder::new_av1(width, height, fps, bitrate_kbps) {
                 Ok(hw) => {
                     tracing::info!("video: GPU AV1 (Media Foundation) encoder active");
                     return Ok(VideoEncoder::Av1Gpu(hw));
                 }
+                // Asked for the GPU specifically? Then say no, rather than quietly handing back the
+                // software encoder. Someone selecting "GPU only" is usually protecting a CPU budget
+                // — a silent fallback spends exactly the resource they were guarding, and looks
+                // identical to success in the UI. Auto is the mode that exists to paper over this.
+                Err(e) if device == EncodeDevice::Gpu => {
+                    return Err(e).context(
+                        "GPU-only video encoding was requested but this machine has no usable \
+                         hardware AV1 encoder. Switch the encode device to Auto or CPU, or turn \
+                         video off",
+                    );
+                }
                 Err(e) => tracing::info!("video: no GPU AV1 encoder ({e:#}); using software SVT-AV1"),
             }
+        }
+        // Non-Windows has no GPU encoder at all, so "GPU only" cannot be honoured anywhere.
+        //
+        // Unreachable as of today — local video capture is Windows-only, so media.rs drops video
+        // before a Linux run ever builds an encoder ("video capture is Windows-only for now;
+        // serving audio only"). Kept because it is the correct answer the moment that changes: the
+        // PipeWire ScreenCast capture on the roadmap would otherwise reach the software encoder
+        // below and quietly ignore an explicit GPU-only request.
+        #[cfg(not(target_os = "windows"))]
+        if device == EncodeDevice::Gpu {
+            // Fully qualified: `bail!` is used only in this cfg-gated arm, so importing it would be
+            // an unused-import warning on Windows — where this block does not compile at all.
+            anyhow::bail!(
+                "GPU-only video encoding was requested, but hardware encoding is Windows-only in \
+                 this build. Use Auto or CPU."
+            );
         }
         let e = Av1Encoder::new(width, height, fps, bitrate_kbps)
             .context("software AV1 (SVT-AV1) encoder")?;

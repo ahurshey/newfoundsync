@@ -144,6 +144,58 @@ impl EncoderBackend {
     }
 }
 
+/// WHERE the video encoder runs — a separate axis from [`EncoderBackend`], which says *which
+/// codec*. The two are orthogonal: GPU AV1 and CPU AV1 emit the same `av01` stream and advertise
+/// the byte-identical codec string, so this never reaches the client.
+///
+/// Kept as its own enum rather than as extra `EncoderBackend` variants on purpose. That enum is
+/// indexed positionally (`ALL` is a fixed-size array, and the GUI tests the picker with a literal
+/// index), and each variant is assumed to map 1:1 onto a codec string — an `Av1Gpu`/`Av1Cpu` split
+/// would quietly break all three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum EncodeDevice {
+    /// Try the GPU, fall back to CPU. The historical behaviour, and still the default: nobody who
+    /// leaves this alone sees any change.
+    #[default]
+    Auto,
+    /// GPU only. Never builds a software encoder — if the GPU has no usable AV1 encoder, video
+    /// fails instead of silently costing you the CPU you were trying to protect.
+    Gpu,
+    /// CPU only. Never touches the GPU, so a flaky or busy hardware encoder can't be reached at all.
+    Cpu,
+}
+
+impl EncodeDevice {
+    pub const ALL: [EncodeDevice; 3] = [EncodeDevice::Auto, EncodeDevice::Gpu, EncodeDevice::Cpu];
+
+    /// Named by the failure contract, not the hardware — "GPU only" vs "Auto" differ precisely in
+    /// what happens when the GPU can't do it, and that is the whole reason to expose the choice.
+    pub fn label(self) -> &'static str {
+        match self {
+            EncodeDevice::Auto => "Auto — GPU if available, else CPU",
+            EncodeDevice::Gpu => "GPU only — fail if unavailable",
+            EncodeDevice::Cpu => "CPU only — never use the GPU",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EncodeDevice::Auto => "auto",
+            EncodeDevice::Gpu => "gpu",
+            EncodeDevice::Cpu => "cpu",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" | "default" => Some(EncodeDevice::Auto),
+            "gpu" | "hardware" | "hw" => Some(EncodeDevice::Gpu),
+            "cpu" | "software" | "sw" => Some(EncodeDevice::Cpu),
+            _ => None,
+        }
+    }
+}
+
 impl Default for EncoderBackend {
     fn default() -> Self {
         EncoderBackend::Av1
@@ -312,5 +364,51 @@ mod tests {
         assert_eq!(vp9_codec_string(Resolution::P1440, 60), "vp09.00.50.08");
         assert_eq!(vp9_codec_string(Resolution::P2160, 30), "vp09.00.50.08");
         assert_eq!(vp9_codec_string(Resolution::P2160, 60), "vp09.00.51.08");
+    }
+}
+
+#[cfg(test)]
+mod encode_device_tests {
+    use super::{EncodeDevice, EncoderBackend};
+
+    #[test]
+    fn parses_the_spellings_an_operator_would_actually_type() {
+        for s in ["auto", "AUTO", "default"] {
+            assert_eq!(EncodeDevice::parse(s), Some(EncodeDevice::Auto), "{s}");
+        }
+        for s in ["gpu", "GPU", "hardware", "hw"] {
+            assert_eq!(EncodeDevice::parse(s), Some(EncodeDevice::Gpu), "{s}");
+        }
+        for s in ["cpu", "CPU", "software", "sw"] {
+            assert_eq!(EncodeDevice::parse(s), Some(EncodeDevice::Cpu), "{s}");
+        }
+        assert_eq!(EncodeDevice::parse("vulkan"), None);
+        assert_eq!(EncodeDevice::parse(""), None);
+    }
+
+    #[test]
+    fn defaults_to_auto_so_upgrading_changes_nothing() {
+        // Auto is exactly the historical try-GPU-then-fall-back. If this ever stops being the
+        // default, every existing install silently changes behaviour on upgrade.
+        assert_eq!(EncodeDevice::default(), EncodeDevice::Auto);
+    }
+
+    #[test]
+    fn round_trips_through_as_str() {
+        for d in EncodeDevice::ALL {
+            assert_eq!(EncodeDevice::parse(d.as_str()), Some(d), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn device_and_codec_stay_separate_axes() {
+        // The whole point of a second enum: EncoderBackend must NOT grow device variants. Its ALL
+        // is a fixed-size array and the GUI indexes the codec picker positionally, so a third
+        // variant would silently shift that mapping.
+        assert_eq!(EncoderBackend::ALL.len(), 2);
+        // And the device-flavoured words still parse as the AV1 codec, so old --encoder scripts
+        // keep working (main.rs warns that they never selected a device).
+        assert_eq!(EncoderBackend::parse("gpu"), Some(EncoderBackend::Av1));
+        assert_eq!(EncoderBackend::parse("cpu"), Some(EncoderBackend::Av1));
     }
 }

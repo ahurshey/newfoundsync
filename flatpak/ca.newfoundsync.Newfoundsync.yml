@@ -42,3 +42,15 @@ modules:
     sources:
       - type: dir
         path: ..
+        # Without these skips the source copy drags in the whole working tree — `target/` alone is
+        # multi-gigabyte, and a Windows-built `target/` is useless here anyway. Copying it doesn't just
+        # waste time and disk: flatpak-builder hashes the source dir, so any local rebuild would
+        # invalidate the cache every time.
+        skip:
+          - target
+          - .git
+          - vcpkg_installed
+          - e2e/node_modules
+          - e2e/playwright-report
+          - e2e/test-results
+          - dist

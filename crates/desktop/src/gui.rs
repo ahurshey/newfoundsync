@@ -227,6 +227,7 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         applied: None,
         qr_tex: None,
         stream_live: false,
+        last_logged_size: None,
         calibrating: false,
         status,
         starting,
@@ -264,7 +265,20 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1024.0, 576.0]) // 16:9 — wide two-column control panel
-        .with_min_inner_size([880.0, 495.0])
+        // MIND THE UNITS — confusing them is exactly why this window used to refuse to get small.
+        // These are winit LOGICAL pixels, which the OS display scale multiplies, while egui lays out
+        // in POINTS where points = logical / zoom_factor (UI_ZOOM_BASE = 0.6). So the current
+        // [640, 240] is 1067 x 400 points of layout, and on a 300%-scaled display a 1920 x 720
+        // physical-pixel floor. The old [880, 495] was 2640 x 1485 physical there — most of a 4K
+        // screen, from a number that reads like it should be small.
+        //
+        // Width matters as much as height: dragging a CORNER stops the moment EITHER axis hits its
+        // floor, so an over-wide minimum makes the whole window feel immovable even while the height
+        // still has room — which is how this actually presented. The floor is kept wide enough for the
+        // client mixer row (icon + Vol slider + % + Sync slider + ms), which does not scroll
+        // horizontally; both body columns scroll vertically and the QR shrinks, so going below the
+        // content's natural height just scrolls instead of clipping.
+        .with_min_inner_size([640.0, 240.0])
         .with_title("Newfoundsync server");
     // Brand the window/taskbar with the Newfoundland badge.
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../../../branding/icon-256.png")) {
@@ -356,6 +370,11 @@ fn theme_visuals() -> egui::Visuals {
 /// opens here, and the −/+ control and the percentage readout are all relative to this baseline,
 /// so 100% means "the size this app is tuned for" rather than the raw 1.0 device scale.
 const UI_ZOOM_BASE: f32 = 0.6;
+
+/// Horizontal inset between the window edge and the panels, in points. Deliberately small — the goal
+/// is just to stop the cards touching the frame (and to stop the leftmost glyphs being clipped), not
+/// to add a wide gutter that eats space we spent effort reclaiming.
+const EDGE_PAD: f32 = 10.0;
 
 /// Apply the theme + desktop-tuned spacing/fonts/zoom once at startup.
 fn setup_style(ctx: &egui::Context) {
@@ -551,6 +570,8 @@ struct ServerApp {
     /// transient status string (which a failed switch / "pick first" validation overwrites while
     /// the previous stream keeps serving).
     stream_live: bool,
+    /// Last window size we logged, so the geometry diagnostic prints on change rather than per frame.
+    last_logged_size: Option<(i32, i32)>,
     /// True while a server-orchestrated "Calibrate all" run is active (Phase B).
     calibrating: bool,
     status: Arc<Mutex<String>>,
@@ -969,7 +990,15 @@ impl ServerApp {
             ui.add_space(16.0);
             ui.vertical(|ui| {
                 if let Some(tex) = qr {
-                    ui.image(egui::load::SizedTexture::new(tex.id(), tex.size_vec2()));
+                    // The QR is the largest fixed block in the window, and drawn at its natural
+                    // texture size it never yielded an inch — so in a short window it was pure
+                    // reserved space pushing everything else down. Cap it to a slice of the height
+                    // that's actually available, with a floor that keeps it scannable.
+                    const QR_MIN: f32 = 96.0;
+                    const QR_SHARE: f32 = 0.34; // of the panel height, so it yields first
+                    let natural = tex.size_vec2().x;
+                    let side = natural.min((ui.available_height() * QR_SHARE).max(QR_MIN));
+                    ui.image(egui::load::SizedTexture::new(tex.id(), egui::vec2(side, side)));
                 }
                 // Cert help folded into a hover (was a standalone "First time on a device?" line) to
                 // reclaim vertical space — hover "Scan to connect" for the one-time-cert explanation.
@@ -983,7 +1012,7 @@ impl ServerApp {
         });
     }
 
-    /// LEFT (hero) column: the connected-clients mixer. Builds the registry snapshot, renders
+    /// CLIENTS column (the right-hand one): the connected-clients mixer. Builds the registry snapshot, renders
     /// master + per-client rows (in their own scroll area), then pushes state + runs the
     /// Calibrate-all flags — all the live, no-Apply controls.
     fn ui_clients(&mut self, ui: &mut egui::Ui, clients_n: usize) {
@@ -1083,10 +1112,21 @@ impl ServerApp {
             });
             ui.add_space(4.0);
             // Per-client rows scroll independently — the one routinely-growing region. Distinct
-            // id_salt from the right column's scroll area so their scroll states don't collide.
+            // id_salt from the config rail's scroll area so their scroll states don't collide.
+            //
+            // auto_shrink is [false, TRUE]: fill the width, but take only the height the rows need.
+            // With `false` on the vertical axis this claimed the whole column, which dragged the
+            // surrounding card frame down with it and left a tall empty bordered box under a short
+            // client list. Shrinking vertically means the card ends just below the last client, and
+            // the scrollbar appears only once the rows genuinely overflow the column (the enclosing
+            // allocate_ui_with_layout caps the available height).
+            //
+            // NB this has nothing to do with how small the WINDOW can be dragged: egui layout never
+            // feeds back into the OS resize floor, which comes solely from `with_min_inner_size`.
+            // (Measured via WM_GETMINMAXINFO — don't go looking in the layout code for that.)
             egui::ScrollArea::vertical()
                 .id_salt("clients")
-                .auto_shrink([false, false])
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for (conn_id, stable_id, name, identified, calib_status, reported_trim) in &snapshot {
                         if !*identified {
@@ -1255,7 +1295,7 @@ impl ServerApp {
         }
     }
 
-    /// RIGHT column, top: the (Apply-gated) audio source picker + quality readout.
+    /// CONFIG RAIL (the left-hand column), top: the (Apply-gated) audio source picker + quality readout.
     fn ui_audio_source(&mut self, ui: &mut egui::Ui) {
         let audio_quality = self.audio_quality_text();
         card(ui, |ui| {
@@ -1373,7 +1413,7 @@ impl ServerApp {
         });
     }
 
-    /// RIGHT column, middle: the (Apply-gated) video source + its quality/encoder disclosure.
+    /// CONFIG RAIL, middle: the (Apply-gated) video source + its quality/encoder disclosure.
     fn ui_video_source(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
             eyebrow(ui, "VIDEO SOURCE");
@@ -1523,7 +1563,7 @@ impl ServerApp {
         });
     }
 
-    /// RIGHT column: the buffer card (the former "Advanced" section, now a plain Apply-gated card).
+    /// CONFIG RAIL: the buffer card (the former "Advanced" section, now a plain Apply-gated card).
     fn ui_buffer(&mut self, ui: &mut egui::Ui) {
         card(ui, |ui| {
             eyebrow(ui, "BUFFER");
@@ -1551,7 +1591,7 @@ impl ServerApp {
         });
     }
 
-    /// RIGHT column, bottom: the single accent surface — the dirty-state Apply button.
+    /// CONFIG RAIL, bottom: the single accent surface — the dirty-state Apply button.
     fn ui_apply(&mut self, ui: &mut egui::Ui, busy: bool, dirty: bool, clients_n: usize) {
         ui.label(
             egui::RichText::new("Source, video & buffer changes take effect when you Apply.")
@@ -1610,6 +1650,18 @@ impl eframe::App for ServerApp {
         ui.ctx()
             .layer_painter(egui::LayerId::background())
             .rect_filled(ui.ctx().screen_rect(), 0.0, c_bg());
+
+        // Breathing room at the window edges.
+        //
+        // eframe's `App::ui` hands us the ROOT ui straight from `run_ui` — unlike a CentralPanel there
+        // is no frame and therefore no margin at all, so every card sat flush against the window edge
+        // and the leftmost glyphs were actually being clipped ("AUDIO SOURCE" rendering as "UDIO
+        // SOURCE"). Inset a padded child and shadow the binding, so everything below lays out inside
+        // the inset with no other changes. Horizontal only: the header already has its own top spacing
+        // and the footer is meant to sit on the bottom edge.
+        let padded = ui.max_rect().shrink2(egui::vec2(EDGE_PAD, 0.0));
+        let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(padded));
+        let ui = &mut ui;
         // Default the UI scale to the design baseline (shown as 100%) on the first frame
         // (deterministic on every display). Users still adjust live with the ± buttons.
         if !self.did_initial_zoom {
@@ -1642,6 +1694,28 @@ impl eframe::App for ServerApp {
         let stream_live = self.stream_live;
         let dirty = self.applied.as_ref() != Some(&self.current_config());
         let qr = self.qr_texture(ui.ctx()); // built once, then cached
+
+        // Window-geometry diagnostic. "It won't resize any smaller" is otherwise unanswerable without
+        // guessing at DPI: the min size is in LOGICAL pixels while everything egui lays out is in
+        // POINTS (scaled by zoom_factor), so the two are easy to confuse. Logged at debug, once per
+        // distinct size, so `RUST_LOG=newfoundsync=debug` shows exactly where the floor is.
+        {
+            let vp = ui.ctx().input(|i| i.viewport().inner_rect);
+            if let Some(r) = vp {
+                let size = (r.width().round() as i32, r.height().round() as i32);
+                if self.last_logged_size != Some(size) {
+                    self.last_logged_size = Some(size);
+                    tracing::debug!(
+                        win_pts_w = size.0,
+                        win_pts_h = size.1,
+                        zoom = ui.ctx().zoom_factor(),
+                        ppp = ui.ctx().pixels_per_point(),
+                        avail_h_pts = ui.available_height(),
+                        "window geometry (points; multiply by ppp for physical pixels)"
+                    );
+                }
+            }
+        }
 
         ui.add_space(2.0);
         // ---- Header band (full width): title + live status pill + zoom ----
@@ -1685,14 +1759,20 @@ impl eframe::App for ServerApp {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        // ---- Body: two columns — config rail (~42%) | clients (hero, ~58%) ----
+        // ---- Body: two columns — config rail | clients (shares set just below) ----
         // Reserve enough for the footer (separator + spacing + one status line) so the columns
         // don't overdraw it — there's no outer ScrollArea to absorb overflow.
         let footer_h = 44.0;
         let body_h = (ui.available_height() - footer_h).max(0.0);
         let full = ui.available_width();
         let gap = 12.0;
-        let left_w = ((full - gap) * 0.42).max(0.0); // config rail (narrower) on the left
+        // Column split. The clients card used to get 58% and the config rail 42%, which was backwards
+        // for the actual content: the rail has long wrapping labels ("All apps — recommended (keeps
+        // playing when Windows is muted)") that want the room, while the client rows are fixed-width
+        // widgets (icon + Vol slider + % + Sync slider + ms) whose sliders do NOT stretch — so the
+        // extra width just became empty card. Giving the rail the larger share narrows the clients
+        // block to roughly what it uses and lets the whole window be narrower.
+        let left_w = ((full - gap) * 0.54).max(0.0);
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
                 egui::vec2(left_w, body_h),
@@ -1718,7 +1798,7 @@ impl eframe::App for ServerApp {
                 egui::vec2(ui.available_width(), body_h),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    // Clients mixer is the hero (wider) column, now on the right.
+                    // Clients mixer — the right-hand column (see the split rationale above).
                     self.ui_clients(ui, clients_n);
                 },
             );

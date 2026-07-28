@@ -1,6 +1,6 @@
 [package]
 name = "newfoundsync"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Lightweight LAN audio sharing with tight multiroom sync (desktop)"
@@ -111,10 +111,35 @@ priority = "optional"
 extended-description = """
 Newfoundsync headless server: serves the embedded web client over HTTPS + WebSocket so LAN \
 browsers clock-sync and play audio in lock-step. Audio source is a PulseAudio/PipeWire monitor \
-(--capture system) or a web-cast uplink (--capture web). Screen video and per-app capture are \
+(--capture system) or a web-cast uplink (--capture web). Screen video and per-window capture are \
 Windows-only; this Linux build is audio + web-cast relay."""
 depends = "$auto"
+conflicts = "newfoundsync-gui"
 assets = [
     ["target/release/newfoundsync", "usr/bin/", "755"],
     ["packaging/newfoundsync.service", "lib/systemd/system/", "644"],
+]
+
+# The DESKTOP package — the egui server window, a menu entry and icons, and no systemd unit
+# (a login-session GUI has no business being a system service). Build it with:
+#   cargo deb -p newfoundsync --variant gui
+# Note the feature difference, which cargo-deb does NOT infer from the variant: the headless
+# package above must be built with `--no-default-features`, this one with defaults (= `gui`).
+# Both ship /usr/bin/newfoundsync, hence the mutual `conflicts` — installing one replaces the
+# other rather than silently fighting over the same path.
+[package.metadata.deb.variants.gui]
+name = "newfoundsync-gui"
+conflicts = "newfoundsync"
+replaces = "newfoundsync"
+extended-description = """
+Newfoundsync desktop server: a small window that picks an audio source, shows a QR code for \
+listeners to scan, and serves the embedded web client over HTTPS + WebSocket so LAN browsers \
+clock-sync and play in lock-step. Audio comes from a PulseAudio/PipeWire monitor — the whole \
+system output, or a single application. Screen video and per-window capture are Windows-only."""
+assets = [
+    ["target/release/newfoundsync", "usr/bin/", "755"],
+    ["../../flatpak/ca.newfoundsync.Newfoundsync.desktop", "usr/share/applications/", "644"],
+    ["../../branding/icon-128.png", "usr/share/icons/hicolor/128x128/apps/ca.newfoundsync.Newfoundsync.png", "644"],
+    ["../../branding/icon-256.png", "usr/share/icons/hicolor/256x256/apps/ca.newfoundsync.Newfoundsync.png", "644"],
+    ["../../branding/icon-512.png", "usr/share/icons/hicolor/512x512/apps/ca.newfoundsync.Newfoundsync.png", "644"],
 ]

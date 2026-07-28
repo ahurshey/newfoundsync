@@ -9,8 +9,8 @@ few seconds, clock-syncs, and plays back in lock-step with everything else.
 Built in Rust. The sync core is ported from the proven
 [`ensemble`](../ensemble) project, with capture ideas from
 [`soundsync`](../soundsync). The server runs on **Windows and Linux** — Linux does audio
-(PipeWire/PulseAudio monitor capture) and web-cast relay; local *screen* capture is still
-Windows-only. The client is any modern browser.
+(PipeWire/PulseAudio monitor capture, whole-system or per-app) and web-cast relay; local *screen*
+capture is still Windows-only. The client is any modern browser.
 
 ```
 ┌──────────────── server (this PC) ────────────────┐        ┌──────── browser client ────────┐
@@ -245,8 +245,11 @@ cargo build --release --features vp9
 > `$env:RUSTFLAGS = "-Ctarget-feature=+crt-static"`. (It linked fine without it in our testing,
 > but a static libvpx can require it on some toolchains.)
 
-> **What runs where.** *Audio* capture works on both: Windows via WASAPI loopback (whole-system or
-> per-app), Linux via a PipeWire/PulseAudio monitor. *Screen video* capture is **Windows-only**
+> **What runs where.** *Audio* capture works on both, whole-system or per-app: Windows via WASAPI
+> loopback, Linux via a PipeWire/PulseAudio monitor (per-app narrows that monitor to one
+> application's stream, so the app keeps playing out the speakers). Per-*window* capture stays
+> Windows-only — on Linux audio belongs to a process, and nothing maps a window to a stream.
+> *Screen video* capture is **Windows-only**
 > (WGC + Media Foundation / SVT-AV1). To get video on Linux, have a browser cast it up —
 > `--capture web --video` (the `--video` flag is required; `--capture web` alone relays audio only,
 > and add `--resolution`/`--fps` to dictate the quality the caster encodes to). The browser client
@@ -390,8 +393,8 @@ file could ship green. VP9/libvpx stays out of CI by being an opt-in feature, so
 
 ## Status
 
-**Works today:** audio capture (WASAPI all-apps / per-app / system on Windows, PipeWire monitor on
-Linux), Opus/PCM, HTTPS+WebSocket streaming to browser clients, NTP clock sync, jitter-buffered
+**Works today:** audio capture (WASAPI all-apps / per-app / system on Windows; PipeWire monitor —
+whole-system or per-app — on Linux), Opus/PCM, HTTPS+WebSocket streaming to browser clients, NTP clock sync, jitter-buffered
 deadline-scheduled playout, the PI rate servo, per-device + master volume, per-device sync trim, mic
 auto-calibration (single + "Calibrate all"), client-reported sync, optional AV1/VP9 screen video
 (Windows) or a browser cast as the source, an egui server GUI with a live client mixer, `/status` +

@@ -1,6 +1,6 @@
 # Newfoundsync — headless server `.deb` (Debian / Ubuntu)
 
-This builds an **audio-only headless server** (no GUI, no screen video — those are Windows-only).
+This builds an **audio-only headless server** (no GUI; no screen video — that is Windows-only).
 The Linux box serves the embedded web client over HTTPS + WebSocket; LAN browsers clock-sync and
 play audio in lock-step. Audio comes from a browser **web-cast uplink** (`--capture web`, the
 default in the bundled systemd unit) or a PulseAudio/PipeWire **monitor** (`--capture system`).
@@ -88,6 +88,7 @@ Open `https://<server-ip>:47000` in a LAN browser and accept the self-signed cer
   (the unit points `HOME` there). If the log shows a cert/settings write error, check that path.
 - **Scope of the Linux port.** Build, install, and run are verified on Ubuntu 26.04 (both the default
   and `--no-default-features` configs), serving audio from a PipeWire/PulseAudio monitor plus
-  web-cast relay. What is *not* here: local **screen capture** and **per-app** audio capture, both
-  still Windows-only. If the build or run errors on your box, paste the output and we'll fix the
+  web-cast relay, including **per-app** audio (a monitor capture narrowed to one application's
+  stream). What is *not* here: local **screen capture** and per-*window* capture, both still
+  Windows-only. If the build or run errors on your box, paste the output and we'll fix the
   platform gate.

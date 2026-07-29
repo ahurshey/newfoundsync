@@ -202,6 +202,12 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
             } else {
                 VideoSourceKind::Screen
             };
+            // `--video` on a platform with no local screen capture would otherwise seed a selection
+            // the picker renders as disabled but apply() still acts on, asking for video the server
+            // then silently drops. Normalize here, at the seed, so the state is unrepresentable —
+            // same rule the VP9 `enc_idx` seed follows just below.
+            #[cfg(not(target_os = "windows"))]
+            let kind = if kind == VideoSourceKind::Screen { VideoSourceKind::Off } else { kind };
             (kind, res_to_idx(v.resolution), v.fps == Fps::F60)
         }
         None => (VideoSourceKind::Off, 1, false),
@@ -1517,6 +1523,12 @@ impl ServerApp {
             // "Web client cast" here (below) = audio + video. Local Screen/Window pairs with a local
             // audio source — selecting one auto-reconciles the other so the pickers never disagree.
             ui.radio_value(&mut self.video_kind, VideoSourceKind::Off, "Off  —  audio only");
+            // Local screen capture is Windows-only (WGC): `video::capture` is not even compiled
+            // elsewhere, and media.rs drops video with a log line nobody reads. Offering the radio
+            // anyway meant picking "Whole screen", pressing Apply, and silently getting audio —
+            // the stream looked healthy and clients simply never saw a picture. Show it, so the
+            // capability is discoverable, but disabled and saying why.
+            #[cfg(target_os = "windows")]
             if ui
                 .radio_value(&mut self.video_kind, VideoSourceKind::Screen, "Whole screen")
                 .clicked()
@@ -1524,6 +1536,16 @@ impl ServerApp {
             {
                 self.source = SourceKind::AllApps; // a local screen can't pair with a cast audio source
             }
+            #[cfg(not(target_os = "windows"))]
+            ui.add_enabled(
+                false,
+                egui::RadioButton::new(false, "Whole screen  —  Windows-only for now"),
+            )
+            .on_disabled_hover_text(
+                "Capturing this machine's screen is only implemented on Windows. To share a \
+                 screen from here, use \"Web client cast\" below and cast from a browser tab \
+                 instead — that path relays real video.",
+            );
             #[cfg(target_os = "windows")]
             {
                 let windows: Vec<AudioApp> =

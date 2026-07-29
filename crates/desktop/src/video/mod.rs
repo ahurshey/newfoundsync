@@ -8,10 +8,16 @@
 // Cross-platform: web-cast H.264 keyframe detection (no encoder / no C deps).
 pub mod relay;
 
-// The native video encoders + screen capture are Windows-only (the only platform with local
-// video capture today). On Linux the server builds audio + web-cast relay only, so these — and
-// their C deps (SVT-AV1, libvpx) — aren't compiled.
-#[cfg(target_os = "windows")]
+// The AV1 encoder. Always compiled on Windows — the only platform with local screen capture, so the
+// only one with frames to encode. Elsewhere it is opt-in behind `video-encode`, because it links
+// SVT-AV1 and the headless Linux server has nothing to feed it: un-gating it unconditionally would
+// add a C library to every .deb/.rpm/Flatpak for a code path that cannot run.
+//
+// The feature exists so the Linux (xdg-desktop-portal/PipeWire) and macOS (ScreenCaptureKit)
+// capture work can be built and CI-checked against a real encoder before any capture backend
+// lands — the encoder was the hidden prerequisite, since gating it on the OS rather than on the
+// capability meant "add screen capture to Linux" silently also meant "port the encoder".
+#[cfg(any(target_os = "windows", feature = "video-encode"))]
 pub mod codec;
 // VP9 links libvpx (a vcpkg-supplied C library), so it is behind the `vp9` feature — a fresh clone
 // builds without any vcpkg setup and gets AV1, which needs none.

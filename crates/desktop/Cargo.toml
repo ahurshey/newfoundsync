@@ -19,6 +19,22 @@ description = "Lightweight LAN audio sharing with tight multiroom sync (desktop)
 default = ["gui"]
 gui = ["dep:eframe", "dep:qrcode"]
 vp9 = ["dep:env-libvpx-sys"]
+# `video-encode` (NOT default): compile the AV1 encoder on non-Windows hosts.
+#
+# On Windows the encoder is always built -- it is the only platform with local screen capture, so
+# there is something to encode. Elsewhere there is nothing to feed it yet, so it is opt-in: it links
+# SVT-AV1, and the headless Linux server package has no reason to carry a video codec it cannot use.
+# This exists so the Linux/macOS capture work can be developed and CI-checked against a real encoder
+# before any capture backend lands. Enabling it on Windows is a no-op (the encoder is already in).
+video-encode = ["dep:shiguredo_svt_av1"]
+# `video-encode-source`: same, but COMPILE SVT-AV1 from source instead of downloading a prebuilt.
+#
+# Needed more often than you would guess. shiguredo_svt_av1's build script derives the prebuilt
+# archive name as `ubuntu-{VERSION_ID}` for every Linux target — it assumes Ubuntu — so on Fedora 44
+# it asks for `libSvtAv1Enc-ubuntu-44_x86_64.tar.gz` and dies on a 404. Same story for any distro
+# without a published build, and for Intel Macs (the macOS prebuilt is arm64-only).
+# Costs a cmake + nasm build dependency, which is exactly why it is not the default.
+video-encode-source = ["video-encode", "shiguredo_svt_av1/source-build"]
 
 [[bin]]
 name = "newfoundsync"
@@ -84,6 +100,12 @@ shiguredo_svt_av1 = "2026.1.0"
 # `vcpkg install --triplet x64-windows-static` + env VPX_LIB_DIR / VPX_INCLUDE_DIR
 # (→ vcpkg_installed/x64-windows-static) / VPX_VERSION=1.13.0 / VPX_STATIC=1. See README.
 env-libvpx-sys = { version = "5.1.3", optional = true }
+
+# Software AV1 for non-Windows hosts, behind the `video-encode` feature (see [features]). Kept in a
+# separate target table from the Windows entry above so Windows gets it unconditionally while every
+# other platform only pulls it — and its C build — when explicitly asked.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+shiguredo_svt_av1 = { version = "2026.1.0", optional = true }
 
 # Linux-only: native PulseAudio/PipeWire capture of the system output's monitor (cpal/ALSA can't
 # see PipeWire `.monitor` sources). libpulse ships in the Freedesktop runtime; the .deb build needs

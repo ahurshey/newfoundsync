@@ -47,6 +47,36 @@ jobs:
       - name: cargo check (default features, incl. gui.rs)
         run: cargo check --workspace --all-targets
 
+  # The AV1 encoder on a NON-Windows host, behind `video-encode`. It is not part of any shipped
+  # Linux artifact yet -- this job exists so the Linux/macOS screen-capture work cannot silently rot
+  # the moment someone touches codec.rs, since nothing else off Windows compiles that module.
+  #
+  # Uses `video-encode-source`, NOT `video-encode`: shiguredo_svt_av1's prebuilt download derives its
+  # archive name as `ubuntu-{VERSION_ID}`, and upstream publishes only 22.04/24.04 -- so on a newer
+  # ubuntu-latest runner the prebuilt path 404s. Building from source needs cmake + nasm + git + a
+  # C++ compiler + libclang (for bindgen); every one of those was discovered by hitting its failure.
+  encoder-check:
+    name: cargo check the AV1 encoder off Windows (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends             build-essential pkg-config libopus-dev libasound2-dev libpulse-dev             cmake nasm git g++ libclang-dev
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: encoder-check
+
+      - name: cargo check (headless + video-encode-source)
+        run: cargo check -p newfoundsync --no-default-features --features video-encode-source
+
   # Compile + test the Windows-only half: WASAPI capture, the MF encoder, WGC capture.
   #
   # VP9/libvpx is behind the non-default `vp9` feature precisely so this job needs no vcpkg. Known and

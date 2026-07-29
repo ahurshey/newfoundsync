@@ -87,3 +87,23 @@ sudo systemctl enable --now newfoundsync    # or run it as a service
   there, which makes it a reasonable way to test on headless hardware.
 - Screen/video capture is Windows-only; on Linux have a browser cast it up
   (`--capture web --video`).
+
+## The AV1 encoder off Windows (`video-encode`) — currently broken on Fedora
+
+On Debian/Ubuntu, `--features video-encode-source` builds the AV1 encoder (see
+`README-debian.md`). **On Fedora and other `lib64` distros it does not link**, and the cause is
+upstream, not here:
+
+```
+out/lib64/libSvtAv1Enc.a          <- where CMake installs it on Fedora
+rustc-link-search=native=out/lib  <- where shiguredo_svt_av1's build.rs looks
+error: could not find native static library `SvtAv1Enc`
+```
+
+`shiguredo_svt_av1`'s build script returns `dst.join("lib")` unconditionally, while CMake's
+GNUInstallDirs resolves to `lib64` on Fedora/RHEL/SUSE. Everything before that step succeeds — the
+deps are `cmake nasm git gcc-c++ clang-devel`, and SVT-AV1 itself compiles fine — so this is purely
+the install-dir mismatch.
+
+Until it is fixed upstream, build the encoder on a Debian-family host. This blocks nothing that
+ships today: the `.rpm`s are audio + web-cast relay and do not include the encoder.

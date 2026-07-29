@@ -92,3 +92,28 @@ Open `https://<server-ip>:47000` in a LAN browser and accept the self-signed cer
   stream). What is *not* here: local **screen capture** and per-*window* capture, both still
   Windows-only. If the build or run errors on your box, paste the output and we'll fix the
   platform gate.
+
+## Building the AV1 encoder off Windows (`video-encode`)
+
+Not needed for the shipped packages — they are audio + web-cast relay, and the encoder has nothing
+to feed it until Linux screen capture lands. It exists so that work can be built and CI-checked
+against a real encoder. On Windows the encoder is always compiled; elsewhere it is opt-in.
+
+```bash
+sudo apt-get install -y cmake nasm git g++ libclang-dev
+cargo build --release -p newfoundsync --no-default-features --features video-encode-source
+```
+
+**Use `video-encode-source`, not `video-encode`.** `shiguredo_svt_av1` derives its prebuilt archive
+name as `ubuntu-{VERSION_ID}` and upstream publishes only 22.04 and 24.04, so on anything newer the
+download 404s:
+
+```
+Downloading prebuilt SVT-AV1 from .../libSvtAv1Enc-ubuntu-26.04_x86_64.tar.gz
+curl: (22) The requested URL returned error: 404
+```
+
+`video-encode-source` compiles SVT-AV1 v4.1.0 instead. Each of those five build deps was found by
+hitting its own failure, so don't trim the list: `git` for the shallow clone, `g++` because CMake
+demands a C++ compiler, `libclang-dev` for bindgen. Verified on Ubuntu 26.04 — adds roughly 3 MB to
+the headless binary (2.7 MB → 5.9 MB).

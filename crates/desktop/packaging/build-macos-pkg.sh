@@ -7,7 +7,7 @@
 # One binary, so the two can never drift out of sync (unlike the .deb/.rpm split, where both
 # packages own /usr/bin/newfoundsync and have to Conflict).
 set -x
-VER=0.0.4
+VER=0.0.5
 SRC="$HOME/nfs-src"
 ROOT=/tmp/nfspkg/root
 APP="$ROOT/Applications/Newfoundsync.app"

@@ -25,5 +25,10 @@ pub mod codec;
 pub mod vp9;
 #[cfg(target_os = "windows")]
 pub mod capture;
+// Linux screen capture presents the same surface (start_primary / slot / closed) under the same
+// module path, so VideoProducer consumes either backend without knowing which it has.
+#[cfg(all(target_os = "linux", feature = "linux-capture"))]
+#[path = "capture_portal.rs"]
+pub mod capture;
 #[cfg(target_os = "windows")]
 pub mod mf_encoder;

@@ -35,6 +35,14 @@ video-encode = ["dep:shiguredo_svt_av1"]
 # without a published build, and for Intel Macs (the macOS prebuilt is arm64-only).
 # Costs a cmake + nasm build dependency, which is exactly why it is not the default.
 video-encode-source = ["video-encode", "shiguredo_svt_av1/source-build"]
+# `linux-capture` (NOT default): real screen capture on Linux via xdg-desktop-portal ScreenCast +
+# PipeWire. Implies the encoder, since captured frames are useless without one — and the SOURCE
+# variant of it, because the prebuilt SVT-AV1 download 404s on every distro we build on.
+#
+# Needs libpipewire-0.3-dev + clang (bindgen) to build, and at RUNTIME a desktop session with a
+# portal backend (xdg-desktop-portal-kde / -gnome). A headless server can never satisfy that, which
+# is why this is opt-in rather than on for the Linux packages.
+linux-capture = ["video-encode-source", "dep:ashpd", "dep:pipewire"]
 
 [[bin]]
 name = "newfoundsync"
@@ -111,6 +119,14 @@ shiguredo_svt_av1 = { version = "2026.1.0", optional = true }
 # see PipeWire `.monitor` sources). libpulse ships in the Freedesktop runtime; the .deb build needs
 # libpulse-dev (Fedora: pulseaudio-libs-devel).
 [target.'cfg(target_os = "linux")'.dependencies]
+# Screen capture behind `linux-capture` (see [features]).
+#
+# The versions are coupled and NOT free to choose: ashpd 0.13.13 depends on pipewire ^0.9, and both
+# pipewire-sys 0.9 and 0.10 declare `links = "pipewire-0.3"`, so asking for 0.10 alongside ashpd is
+# unresolvable ("only one package in the dependency graph may specify the same links value"). Pin to
+# ashpd's own choice.
+ashpd = { version = "0.13.13", default-features = false, features = ["screencast", "pipewire", "tokio"], optional = true }
+pipewire = { version = "0.9", optional = true }
 # libpulse-binding's lib is `libpulse_binding` and libpulse-simple-binding's is
 # `libpulse_simple_binding`; the ecosystem convention aliases them to `pulse` / `psimple`. Rename
 # via `package =` so the `use pulse::…` / `use psimple::…` in capture/pulse.rs resolve.

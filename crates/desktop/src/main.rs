@@ -156,6 +156,24 @@ fn main() -> Result<()> {
         other => return Err(anyhow!("unknown capture '{other}' (use allapps|system|app|web)")),
     };
     let video = if cli.video {
+        // Local screen capture is Windows-only, and a request for it used to be accepted here and
+        // then dropped deep in media.rs with nothing but a warn! — so `--video` appeared to work,
+        // the stream came up "Live", and clients simply never received a picture. Refuse at the
+        // entry point instead, and name the path that DOES relay video on every platform.
+        //
+        // Note the web-uplink exception is real, not a courtesy: the relay is deliberately not
+        // OS-gated (media.rs computes `video_on` as `opts.video.is_some()` for a web uplink versus
+        // `cfg!(windows) && …` otherwise), because a cast carries the browser's own encoded frames
+        // and needs no local capture at all.
+        #[cfg(not(target_os = "windows"))]
+        if !matches!(capture_source, CaptureSource::WebUplink) {
+            return Err(anyhow!(
+                "--video captures this machine's screen, which is Windows-only for now. To share a \
+                 screen from this host, relay a browser's cast instead: \
+                 `--capture web --video` (both flags — `--capture web` alone relays audio only), \
+                 then press Cast in a browser on the machine you want to share."
+            ));
+        }
         let resolution = Resolution::parse(&cli.resolution).ok_or_else(|| {
             anyhow!("unknown resolution '{}' (720p|1080p|1440p|2160p)", cli.resolution)
         })?;

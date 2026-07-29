@@ -195,16 +195,63 @@ fn pick_capture_device(
     Ok((device, cfg))
 }
 
+/// macOS (and any other non-Windows, non-Linux host).
+///
+/// Ask for the default OUTPUT device, exactly like the Windows branch above, and let cpal turn an
+/// input stream on it into a capture of the system mix. On Windows that is WASAPI loopback; on
+/// macOS 14.2+ cpal does it with a **CoreAudio process tap** — `AudioHardwareCreateProcessTap`
+/// behind a private aggregate device (cpal's `host/coreaudio/macos/loopback.rs`). Its trigger is
+/// precisely "an input stream was requested on a device with no inputs", which is why asking for
+/// the output device is the whole implementation.
+///
+/// That means NO third-party driver: no BlackHole, no admin install, no reboot, and no change to
+/// the user's output device. cpal builds the tap with `MuteBehavior::Unmuted`, so the audio still
+/// reaches the speakers while it is being captured.
+///
+/// It must NOT fall back to `default_input_device()`. That is the built-in microphone, so asking
+/// for "system audio" would broadcast the room to the LAN — the same privacy bug fixed on Linux in
+/// the branch above. If no output device can be opened we refuse and explain.
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn pick_capture_device(
     host: &cpal::Host,
 ) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
+    use cpal::traits::DeviceTrait as _;
+
+    if let Some(device) = host.default_output_device() {
+        let cfg = device
+            .default_output_config()
+            .context("query default output (mix) format for the process tap")?;
+        tracing::info!("[capture] macOS system-audio tap on output device: {device}");
+        return Ok((device, cfg));
+    }
+
+    // No default output at all. Before giving up, accept an explicitly installed virtual loopback
+    // device — it keeps working on macOS older than the process-tap API for anyone who already
+    // owns BlackHole or Loopback. Matched on the known product names only: the alternative is
+    // grabbing whatever input happens to be default, and a false positive there is a privacy leak
+    // rather than an inconvenience.
+    const LOOPBACK_HINTS: [&str; 5] =
+        ["blackhole", "loopback", "soundflower", "vb-cable", "existential"];
     let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("no default input device"))?;
+        .input_devices()
+        .ok()
+        .and_then(|mut it| {
+            it.find(|d| {
+                let name = d.to_string().to_lowercase();
+                LOOPBACK_HINTS.iter().any(|h| name.contains(h))
+            })
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "no audio output device to capture — refusing to fall back to the microphone. \
+                 Check that this Mac has an active output device, or use `--capture web` to relay \
+                 a browser cast instead."
+            )
+        })?;
+    tracing::info!("[capture] macOS virtual loopback device: {device}");
     let cfg = device
         .default_input_config()
-        .context("query default input format")?;
+        .context("query loopback input format")?;
     Ok((device, cfg))
 }
 

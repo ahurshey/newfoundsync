@@ -1,16 +1,16 @@
 # Newfoundsync
 
 **Lightweight LAN audio (and optional screen) sharing to any browser, with tight,
-Sonos-like multi-room sync.** One PC (Windows or Linux) — the **server** — captures its sound
+Sonos-like multi-room sync.** One PC (Windows, Linux or macOS) — the **server** — captures its sound
 and serves a small web app over your local network. Every other device (phone,
 tablet, laptop, TV browser) just **opens a URL** — nothing to install — buffers a
 few seconds, clock-syncs, and plays back in lock-step with everything else.
 
 Built in Rust. The sync core is ported from the proven
 [`ensemble`](../ensemble) project, with capture ideas from
-[`soundsync`](../soundsync). The server runs on **Windows and Linux** — Linux does audio
-(PipeWire/PulseAudio monitor capture, whole-system or per-app) and web-cast relay; local *screen*
-capture is still Windows-only. The client is any modern browser.
+[`soundsync`](../soundsync). The server runs on **Windows, Linux and macOS** — Linux does audio
+(PipeWire/PulseAudio monitor capture, whole-system or per-app) and web-cast relay; macOS does audio
+via a CoreAudio process tap (no driver, no BlackHole); local *screen* capture is still Windows-only. The client is any modern browser.
 
 ```
 ┌──────────────── server (this PC) ────────────────┐        ┌──────── browser client ────────┐

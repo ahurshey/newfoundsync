@@ -156,22 +156,22 @@ fn main() -> Result<()> {
         other => return Err(anyhow!("unknown capture '{other}' (use allapps|system|app|web)")),
     };
     let video = if cli.video {
-        // Local screen capture is Windows-only, and a request for it used to be accepted here and
-        // then dropped deep in media.rs with nothing but a warn! — so `--video` appeared to work,
-        // the stream came up "Live", and clients simply never received a picture. Refuse at the
-        // entry point instead, and name the path that DOES relay video on every platform.
+        // A request for local screen capture used to be accepted here and then dropped deep in
+        // media.rs with nothing but a warn! — so `--video` appeared to work, the stream came up
+        // "Live", and clients simply never received a picture. Refuse at the entry point instead,
+        // and name what to do about it.
         //
-        // Note the web-uplink exception is real, not a courtesy: the relay is deliberately not
-        // OS-gated (media.rs computes `video_on` as `opts.video.is_some()` for a web uplink versus
-        // `cfg!(windows) && …` otherwise), because a cast carries the browser's own encoded frames
-        // and needs no local capture at all.
-        #[cfg(not(target_os = "windows"))]
+        // Keyed on whether this BUILD has a capture backend, not on the OS: Windows always has one
+        // (WGC), Linux has one with --features linux-capture (portal + PipeWire), and anything else
+        // has none. Gating on the OS would refuse a Linux build that can in fact capture.
+        //
+        // The web-uplink exception is real, not a courtesy: the relay is deliberately not gated at
+        // all (media.rs computes `video_on` as `opts.video.is_some()` for a web uplink), because a
+        // cast carries the browser's own encoded frames and needs no local capture.
+        #[cfg(not(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture"))))]
         if !matches!(capture_source, CaptureSource::WebUplink) {
             return Err(anyhow!(
-                "--video captures this machine's screen, which is Windows-only for now. To share a \
-                 screen from this host, relay a browser's cast instead: \
-                 `--capture web --video` (both flags — `--capture web` alone relays audio only), \
-                 then press Cast in a browser on the machine you want to share."
+                "--video captures this machine's screen, and this build has no capture backend \n                 for it. On Linux, rebuild with --features linux-capture (needs a desktop \n                 session with an xdg-desktop-portal backend). Otherwise relay a browser's cast: \n                 `--capture web --video` (both flags -- `--capture web` alone relays audio only)."
             ));
         }
         let resolution = Resolution::parse(&cli.resolution).ok_or_else(|| {

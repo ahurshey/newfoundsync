@@ -245,7 +245,7 @@ pub struct Media {
     pub audio_tx: broadcast::Sender<Frame>,
     pub video_tx: broadcast::Sender<Frame>,
     _audio_capture: AudioCapture,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture")))]
     _video: Option<VideoProducer>,
     pub capture_device: String,
     /// Present only for [`CaptureSource::WebUplink`]: the web layer pushes a casting
@@ -399,8 +399,8 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         AudioCapture::start(opts.capture_source, on_frame)?
     };
 
-    // --- video producer (Windows; skipped for web uplink — Phase 1 is audio-only) ---
-    #[cfg(target_os = "windows")]
+    // --- local video producer (skipped for a web uplink, which relays the caster's own frames) ---
+    #[cfg(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture")))]
     let video = if web_uplink {
         None
     } else {
@@ -420,9 +420,14 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
             None => None,
         }
     };
-    #[cfg(not(target_os = "windows"))]
+    // No local capture backend in THIS build. The CLI refuses --video up front and the GUI greys
+    // the option out, so reaching here means something bypassed both -- keep the warning as a
+    // backstop rather than silently serving audio.
+    #[cfg(not(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture"))))]
     if opts.video.is_some() && !web_uplink {
-        tracing::warn!("video capture is Windows-only for now; serving audio only");
+        tracing::warn!(
+            "this build has no local screen-capture backend; serving audio only (Linux needs \n             --features linux-capture)"
+        );
     }
 
     // Video is on for a local Windows capture with a VideoConfig, OR for a web uplink whose
@@ -431,7 +436,8 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
     let video_on = if web_uplink {
         opts.video.is_some()
     } else {
-        cfg!(target_os = "windows") && opts.video.is_some()
+        cfg!(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture")))
+            && opts.video.is_some()
     };
     let (fw, fps) = match opts.video {
         Some(v) => (v.resolution, v.fps.value()),
@@ -505,7 +511,7 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         audio_tx,
         video_tx,
         _audio_capture: audio_capture,
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture")))]
         _video: video,
         capture_device,
         cast_relay,
@@ -604,8 +610,11 @@ impl AudioCapture {
     }
 }
 
-/// Windows screen-capture → AV1/VP9 encode → broadcast WS video frames.
-#[cfg(target_os = "windows")]
+/// Screen capture -> AV1/VP9 encode -> broadcast WS video frames.
+///
+/// Platform-agnostic: `crate::video::capture` resolves to the WGC backend on Windows and the
+/// portal/PipeWire one on Linux, and both expose the same frame slot + closed latch.
+#[cfg(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture")))]
 struct VideoProducer {
     stop: Arc<AtomicBool>,
     _capture: crate::video::capture::ScreenCapture,
@@ -615,7 +624,7 @@ struct VideoProducer {
     done_rx: std::sync::mpsc::Receiver<()>,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture")))]
 impl VideoProducer {
     fn start(
         cfg: VideoConfig,
@@ -821,7 +830,7 @@ impl VideoProducer {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture")))]
 impl Drop for VideoProducer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);

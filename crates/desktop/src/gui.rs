@@ -206,7 +206,7 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
             // the picker renders as disabled but apply() still acts on, asking for video the server
             // then silently drops. Normalize here, at the seed, so the state is unrepresentable —
             // same rule the VP9 `enc_idx` seed follows just below.
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture"))))]
             let kind = if kind == VideoSourceKind::Screen { VideoSourceKind::Off } else { kind };
             (kind, res_to_idx(v.resolution), v.fps == Fps::F60)
         }
@@ -1528,7 +1528,7 @@ impl ServerApp {
             // anyway meant picking "Whole screen", pressing Apply, and silently getting audio —
             // the stream looked healthy and clients simply never saw a picture. Show it, so the
             // capability is discoverable, but disabled and saying why.
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture")))]
             if ui
                 .radio_value(&mut self.video_kind, VideoSourceKind::Screen, "Whole screen")
                 .clicked()
@@ -1536,10 +1536,10 @@ impl ServerApp {
             {
                 self.source = SourceKind::AllApps; // a local screen can't pair with a cast audio source
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture"))))]
             ui.add_enabled(
                 false,
-                egui::RadioButton::new(false, "Whole screen  —  Windows-only for now"),
+                egui::RadioButton::new(false, "Whole screen  —  not built into this server"),
             )
             .on_disabled_hover_text(
                 "Capturing this machine's screen is only implemented on Windows. To share a \

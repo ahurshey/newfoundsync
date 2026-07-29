@@ -12,9 +12,11 @@
 //! **Capture requires a human, once.** The portal always shows a picker ("share which screen?") on
 //! the first Start, and there is no API to pre-approve it — `restore_token` can suppress the dialog
 //! on *later* runs, but only after somebody approved interactively at least once. So
-//! `start_primary()` BLOCKS until the dialog is answered. That is why it must never be called from
-//! the GUI thread; `media::start` already runs on the media-control thread, which is why the window
-//! stays responsive while the prompt is up.
+//! `start_primary()` blocks until the dialog is answered, BOUNDED by [`CONSENT_TIMEOUT`]: an
+//! unanswered prompt would otherwise wedge `media::start` and the web server would never bind its
+//! port, killing audio and the UI too. It must also never be called from the GUI thread;
+//! `media::start` already runs on the media-control thread, which keeps the window responsive while
+//! the prompt is up.
 //!
 //! **A headless box cannot do this at all.** The ScreenCast implementation lives in a
 //! desktop-environment backend (`xdg-desktop-portal-kde`, `-gnome`, …) that needs a running
@@ -33,10 +35,17 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use pipewire as pw;
 use pw::{properties::properties, spa};
+
+/// How long to wait for a human to answer the portal's screen-share dialog.
+///
+/// Generous on purpose -- somebody may be walking back to the machine -- but finite, because
+/// an unanswered prompt otherwise blocks `media::start` and the server never binds its port.
+const CONSENT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// One captured frame: tightly-packed BGRA (width*height*4). Byte-identical contract to the
 /// Windows backend's frame, because the encoder's `bgra_to_i420` reads b,g,r at p, p+1, p+2 and
@@ -96,10 +105,35 @@ impl ScreenCapture {
             })
             .context("spawn portal-capture thread")?;
 
-        match ready_rx.recv() {
+        tracing::info!(
+            "[capture] waiting for the desktop screen-share dialog (up to {}s)",
+            CONSENT_TIMEOUT.as_secs()
+        );
+        // BOUNDED wait, and this is the whole reason: the portal shows a dialog and blocks until a
+        // human answers it. Waiting forever wedges `media::start`, which means the web server never
+        // binds — no UI, no audio, nothing — because someone walked away from a prompt. Observed
+        // exactly that on a box whose screen had blanked. Windows capture never blocks, so nothing
+        // upstream of here is built to tolerate it; failing after a generous timeout keeps the rest
+        // of the server alive and audio-only, which is strictly better than dead.
+        match ready_rx.recv_timeout(CONSENT_TIMEOUT) {
             Ok(Ok(())) => Ok(ScreenCapture { closed, slot, quit: Some(quit_tx), thread: Some(thread) }),
             Ok(Err(e)) => bail!("{e}"),
-            Err(_) => bail!("portal capture thread died during setup"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("portal capture thread died during setup")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // The worker is still parked in the portal call and cannot be cancelled from here,
+                // so it is deliberately DETACHED rather than joined — teardown must not inherit the
+                // hang we are escaping. It owns everything it touches and exits once the dialog is
+                // answered or dismissed, finding no receiver.
+                bail!(
+                    "the screen-share dialog was not answered within {}s. Screen capture on Linux \
+                     needs someone to approve it at the machine; there is no way to pre-authorise \
+                     it. Start video from the GUI (where you will see the prompt), or relay a \
+                     browser's cast with --capture web --video instead",
+                    CONSENT_TIMEOUT.as_secs()
+                )
+            }
         }
     }
 

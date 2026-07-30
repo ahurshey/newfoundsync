@@ -29,6 +29,33 @@ use pulse::stream::{
 /// PulseAudio fragment size AND used as the read buffer, so the two cannot drift apart.
 const FRAME_BYTES: usize = FRAME_SAMPLES * 2;
 
+/// ASK FOR A 20 ms FRAGMENT. Passing a null buffer attr (the server's default) is what made Linux
+/// audio stutter: PulseAudio chose a ~340 ms fragment for the monitor source, so our 20 ms reads
+/// returned SEVENTEEN AT A TIME with no delay and then blocked for a third of a second.
+///
+/// The frame count stayed perfect — 51 frames/s, zero errors, /health looked healthy — but the
+/// cadence was a burst. That matters because the audio PTS is stamped when a frame is published, so
+/// seventeen frames read within a millisecond all claim nearly the SAME presentation time. The client
+/// is then told to play 340 ms of audio at one instant, plays one frame and discards the rest, and you
+/// hear audio cutting in and out roughly twice a second. Measured at the client: 94% of frames
+/// arriving <1 ms apart, p99 gap 340 ms.
+///
+/// Windows never showed this because WASAPI loopback delivers on a steady ~10-20 ms cadence, which is
+/// the regular delivery a publish-time PTS quietly assumes.
+///
+/// SHARED by both capture paths on purpose. The first fix passed this to `Simple::new` only, and the
+/// per-app path (`start_app`, a different libpulse API) silently kept the ~340 ms default — the same
+/// bug, still shipping, in the source you reach by picking a single application.
+const FRAGMENT_ATTR: pulse::def::BufferAttr = pulse::def::BufferAttr {
+    // The only one that matters for a RECORD stream: how many bytes the server hands over at a time.
+    fragsize: FRAME_BYTES as u32,
+    // u32::MAX means "server default"; maxlength is a cap, and tlength/prebuf/minreq are playback-only.
+    maxlength: u32::MAX,
+    tlength: u32::MAX,
+    prebuf: u32::MAX,
+    minreq: u32::MAX,
+};
+
 /// 20 ms of 48 kHz stereo, in i16 samples (960 frames × 2 channels).
 ///
 /// Both capture paths hand `on_frame` exactly this many samples, so the Opus encoder sees a uniform
@@ -88,29 +115,6 @@ impl PulseCapture {
             bail!("invalid PulseAudio sample spec");
         }
         // Open the record stream now so start() fails fast if the monitor can't be opened.
-        // ASK FOR A 20 ms FRAGMENT. Passing None here (the server's default) is what made Linux
-        // audio stutter: PulseAudio chose a ~340 ms fragment for the monitor source, so our 20 ms
-        // reads returned SEVENTEEN AT A TIME with no delay and then blocked for a third of a second.
-        //
-        // The frame count stayed perfect — 51 frames/s, zero errors, /health looked healthy — but
-        // the cadence was a burst. That matters because the PTS is stamped when a frame is
-        // published (`mono_now() + lead_ns`), so seventeen frames read within a millisecond all
-        // claim nearly the SAME presentation time. The client is then told to play 340 ms of audio
-        // at one instant, plays one frame and discards the rest, and you hear audio cutting in and
-        // out roughly twice a second. Measured at the client: 94% of frames arriving <1 ms apart,
-        // p99 gap 340 ms.
-        //
-        // Windows never showed this because WASAPI loopback delivers on a steady ~10-20 ms cadence,
-        // which is the regular delivery the wall-clock PTS quietly assumes.
-        let attr = pulse::def::BufferAttr {
-            // The one that matters for a record stream: bytes handed over per read.
-            fragsize: FRAME_BYTES as u32,
-            // u32::MAX means "server default" for the rest; tlength/prebuf/minreq are playback-only.
-            maxlength: u32::MAX,
-            tlength: u32::MAX,
-            prebuf: u32::MAX,
-            minreq: u32::MAX,
-        };
         let simple = Simple::new(
             None,                   // default server
             "Newfoundsync",         // application name
@@ -118,8 +122,8 @@ impl PulseCapture {
             Some(monitor.as_str()), // record the sink's monitor (system output)
             "system audio",         // stream description
             &spec,
-            None,        // default channel map
-            Some(&attr), // 20 ms fragments — see above
+            None,                 // default channel map
+            Some(&FRAGMENT_ATTR), // 20 ms fragments — see the constant
         )
         .map_err(|e| anyhow!("open monitor source '{monitor}': {e:?}"))?;
 
@@ -220,8 +224,15 @@ impl PulseCapture {
                     stream
                         .set_monitor_stream(target.index)
                         .map_err(|e| anyhow!("filter capture to sink-input {}: {e:?}", target.index))?;
+                    // Same 20 ms fragment the whole-system path asks for. Without it this path gets
+                    // the server default (~340 ms on a monitor source) and the burst below re-blocks
+                    // it into ~17 frames emitted back-to-back, all claiming nearly one instant.
                     stream
-                        .connect_record(Some(&monitor), None, StreamFlagSet::NOFLAGS)
+                        .connect_record(
+                            Some(&monitor),
+                            Some(&FRAGMENT_ATTR),
+                            StreamFlagSet::ADJUST_LATENCY,
+                        )
                         .map_err(|e| anyhow!("connect record stream to '{monitor}': {e:?}"))?;
                     loop {
                         match conn.mainloop.iterate(true) {

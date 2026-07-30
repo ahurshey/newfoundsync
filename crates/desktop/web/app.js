@@ -273,8 +273,16 @@ els.stop.addEventListener("click", stop);
 // output-latency model (onAudioData) runs ONLY for un-aligned devices, so this must survive reloads:
 // a calibration that legitimately lands on trim 0 is still "aligned" and must not re-engage the model.
 function markAligned(v) {
+  // Flipping this MOVES VIDEO by outLatMs (see videoPresentMs), and the decoded queue holds
+  // targetPerf values computed under the old value — up to DECODE_AHEAD_MS of frames that would be
+  // painted a whole speaker latency early. Every other alignment change flushes via setTrim(), but
+  // the calibration success path skips setTrim whenever the converged trim already equals the current
+  // one — the normal outcome — so the flush belongs HERE, at the flag itself, where no caller can
+  // forget it. Guarded on an actual change so startup (already false) does nothing.
+  const changed = v !== aligned;
   aligned = v;
   try { localStorage.setItem("nfs_aligned", v ? "1" : "0"); } catch (e) {}
+  if (changed) flushVideo(); // re-time the video queue to the new audible-instant map
 }
 function loadTrim() {
   try {

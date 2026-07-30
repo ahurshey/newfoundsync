@@ -6,7 +6,10 @@
 // standing between two speakers. Everything asserted below is a property that must hold for the
 // correlation to lock at all, so a break here is a break in sync itself.
 //
-// Run: node --test e2e/unit/   (no browser, no server, milliseconds)
+// Run: cd e2e && npm run test:unit   (no browser, no server, milliseconds)
+// Not `node --test <dir>` — on Node 24 that resolves the path as a MODULE and fails with "Cannot
+// find module", which reads as a broken test suite rather than a bad invocation. The npm script
+// names the files explicitly, and is what CI runs.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');

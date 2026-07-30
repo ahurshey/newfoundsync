@@ -341,26 +341,41 @@ pub struct MediaOptions {
 /// rather than when the encoder finished with it (the poll wait + scale + encode are tens of ms, and
 /// vary per frame — that difference lands directly on lip-sync).
 ///
-/// A REPEAT — the re-encode of `last` that happens when the source delivered nothing this tick — is
-/// stamped `now_ns` instead. Its content is still current (the screen genuinely still looks like
-/// that), so "now" is the honest answer, and it is the only answer that cannot drift.
+/// A REPEAT — the re-encode of `last` that happens when the source delivered nothing this tick —
+/// extends the LAST published stamp by the real time that has actually elapsed. That telescopes to
+/// `captured + elapsed + lead`, which keeps a repeat on the SAME reference as the fresh frames around
+/// it while staying anchored to the real clock.
 ///
-/// Two things were tried here first and both were wrong, hence the tests:
-///   * Stepping a running timeline forward by one NOMINAL frame duration per repeat. Real ticks are
-///     slower than nominal whenever encoding is (measured: 38 ms actual against a 33 ms nominal), so
-///     on an idle screen the PTS fell ~5 ms further into the past every frame and ran away without
-///     bound — 7 s behind inside one 18 s run. The client then drops everything as past-due.
+/// Both halves of that matter, and three earlier attempts each got one of them wrong:
+///   * Stepping by one NOMINAL frame duration per repeat. Real ticks are slower than nominal whenever
+///     encoding is (measured: 38 ms actual against a 33 ms nominal), so on an idle screen the PTS fell
+///     ~5 ms further into the past every frame and ran away without bound — 7 s behind inside one 18 s
+///     run, after which the client drops everything as past-due.
 ///   * Seeding that timeline from zero, which stamped the first frame ~56 years in the past.
+///   * Stamping a repeat at plain `now`. Anchored, but on a DIFFERENT reference than fresh frames: a
+///     repeat then sits one capture latency ahead of what the next fresh frame claims, so that fresh
+///     frame steps back BEHIND an already-queued repeat. The client's `videoStep` only inspects
+///     `vq[0]`, so a non-monotonic queue does not simply cost one past-due frame — the genuinely new
+///     picture is drained together with the later-stamped repeat and shown a frame late.
 ///
-/// A repeat's `now_ns` sits up to one capture latency AFTER what a fresh frame would claim, so a
-/// following fresh frame can step the PTS BACK by that much. That is intended: the client tolerates
-/// one past-due frame (it paints it at the next refresh), and re-anchoring to the truth beats
-/// inheriting an offset forever.
-fn video_pts(fresh: bool, captured_ns: i64, now_ns: i64, lead_ns: i64) -> i64 {
+/// Elapsed-time extension has none of those: it cannot drift (it tracks the real clock however slow
+/// the ticks get), it needs no estimate of the capture latency (the anchor carries it), and it stays
+/// monotonic — so the client's queue stays ordered.
+fn video_pts(
+    fresh: bool,
+    captured_ns: i64,
+    now_ns: i64,
+    lead_ns: i64,
+    prev: Option<(i64, i64)>,
+) -> i64 {
     if fresh {
-        captured_ns + lead_ns
-    } else {
-        now_ns + lead_ns
+        return captured_ns + lead_ns;
+    }
+    match prev {
+        Some((prev_pts, prev_now)) => prev_pts + (now_ns - prev_now),
+        // Nothing published yet: no reference to extend, and the held frame's capture time could be
+        // seconds stale. The screen still looks like that, so `now` is the honest stamp.
+        None => now_ns + lead_ns,
     }
 }
 
@@ -407,11 +422,21 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
             // callback fires — the buffer had to fill before we were handed it — and the client
             // schedules a frame's playback to START at its PTS. So stamping `mono_now()` here
             // described the frame's LAST sample and played the whole frame one frame-time late:
-            // systematic, every platform, and it lands entirely on A/V sync as 20 ms of audio lag
-            // against video that has no matching delay.
+            // systematic, and it lands entirely on A/V sync as 20 ms of audio lag against video that
+            // has no matching delay.
             //
             // Derived from the frame's own length rather than FRAME_DURATION_MS so a short frame
             // (source shutting down, a resampler flush) is stamped for what it actually contains.
+            //
+            // KNOWN FLOOR, not an exact age. It is exact for the Linux monitor path, where a read
+            // returns one fragment of just-captured audio. It is a LOWER BOUND for
+            // `capture::process` (the Windows `allapps`/`app` source, and the CLI default): that one
+            // drains WASAPI packets into a VecDeque and pops frames off the FRONT on a wall-clock
+            // schedule, bounding occupancy at four frames — so the true age is
+            // `span + current occupancy`, up to 80 ms more than claimed, and the residual sits
+            // wherever the producer/consumer clock mismatch parks that queue. Closing it properly
+            // means each backend stamping its own capture time and passing it through `on_frame`, the
+            // way the video path now does with `captured_ns`.
             let span_ns = (frame.len() / CHANNELS) as i64 * 1_000_000_000 / SAMPLE_RATE as i64;
             let capture_ns = mono_now() - span_ns;
             // FFI callback (cpal/WGC) — trap panics so they can't unwind across C.
@@ -723,6 +748,8 @@ impl VideoProducer {
                 // Counts only frames published from a NEW capture, so the latency log below can't
                 // sample a repeat.
                 let mut fresh_published: u64 = 0;
+                // (pts, mono_now) of the last published frame — the reference a repeat extends.
+                let mut prev_pub: Option<(i64, i64)> = None;
 
                 while !stop_t.load(Ordering::Relaxed) {
                     let tick = Instant::now();
@@ -806,8 +833,14 @@ impl VideoProducer {
                                         // audio, so that went straight out as lip-sync error that
                                         // wobbled frame to frame and no fixed trim could remove.
                                         let now_ns = mono_now();
-                                        let pts =
-                                            video_pts(fresh, frame.captured_ns, now_ns, lead_ns);
+                                        let pts = video_pts(
+                                            fresh,
+                                            frame.captured_ns,
+                                            now_ns,
+                                            lead_ns,
+                                            prev_pub,
+                                        );
+                                        prev_pub = Some((pts, now_ns));
                                         // FRESH frames only. Measuring a repeat here reports the age
                                         // of a deliberately frozen picture as though it were pipeline
                                         // latency — on an idle screen that printed 9118 ms, which
@@ -954,52 +987,89 @@ mod tests {
     const NOMINAL: i64 = 33_333_333; // ~1/30 s, the tick the producer AIMS for
     const ACTUAL: i64 = 38_000_000; //  what a tick really costs when encoding is slow
 
+    const LATENCY: i64 = 40_000_000; // 40 ms of poll wait + scale + encode, as measured
+
     #[test]
     fn a_fresh_frame_is_stamped_from_its_own_capture_time() {
-        // Not from "now": the poll wait + scale + encode must not leak into the timestamp, or video
-        // is presented that much after the moment it depicts.
+        // Not from "now": the poll wait + scale + encode must not leak into the timestamp, or video is
+        // presented that much after the moment it depicts.
         let captured = 1_700_000_000_000_000_000i64;
-        let published_40ms_later = captured + 40_000_000;
-        assert_eq!(video_pts(true, captured, published_40ms_later, LEAD), captured + LEAD);
+        let published_later = captured + LATENCY;
+        assert_eq!(video_pts(true, captured, published_later, LEAD, None), captured + LEAD);
+        // A prior publish must not change a fresh frame's answer — its own capture time is the truth.
+        let pts = video_pts(true, captured, published_later, LEAD, Some((999, published_later)));
+        assert_eq!(pts, captured + LEAD);
     }
 
     #[test]
-    fn a_repeat_is_stamped_now_because_a_frozen_screen_is_still_current() {
-        // The stale capture time must NOT be reused — it would be duplicated and then past-due.
+    fn a_repeat_with_no_prior_publish_is_stamped_now() {
+        // There is no reference to extend, and the held frame can be seconds stale. Reusing that stale
+        // capture time would emit a duplicate and then past-due timestamps; a bare 0 timeline (an
+        // earlier attempt) stamped it ~56 years in the past.
         let captured = 1_700_000_000_000_000_000i64;
         let now = captured + 9_000_000_000; // 9 s of an idle screen
-        assert_eq!(video_pts(false, captured, now, LEAD), now + LEAD);
+        assert_eq!(video_pts(false, captured, now, LEAD, None), now + LEAD);
+    }
+
+    #[test]
+    fn a_repeat_inherits_the_back_dating_of_the_frame_it_extends() {
+        // The property that keeps the queue ordered: a repeat must claim the same content age as the
+        // fresh frames around it, NOT publish time. Stamping a repeat at plain `now` put it one whole
+        // capture latency ahead, and the next fresh frame then sorted behind it.
+        let captured = 1_000_000_000i64;
+        let published = captured + LATENCY;
+        let fresh = video_pts(true, captured, published, LEAD, None);
+        let later = published + NOMINAL;
+        let repeat = video_pts(false, captured, later, LEAD, Some((fresh, published)));
+        assert_eq!(repeat, later - LATENCY + LEAD, "a repeat carries the SAME {LATENCY} ns back-dating");
+        assert!(repeat > fresh, "and is still strictly increasing");
+    }
+
+    #[test]
+    fn a_fresh_frame_after_repeats_does_not_step_back() {
+        // The ordering violation this rule exists to prevent. The client's videoStep only inspects
+        // vq[0], so a fresh frame stamped BEHIND an already-queued repeat is not simply "one past-due
+        // frame" — it is drained together with that repeat and the new picture is shown a frame late.
+        let mut now = 1_000_000_000i64;
+        let mut prev = Some((video_pts(true, now - LATENCY, now, LEAD, None), now));
+        for _ in 0..10 {
+            now += ACTUAL;
+            prev = Some((video_pts(false, now - LATENCY, now, LEAD, prev), now));
+        }
+        now += ACTUAL;
+        let fresh = video_pts(true, now - LATENCY, now, LEAD, prev);
+        assert!(fresh > prev.unwrap().0, "a fresh frame must not sort behind the repeats before it");
     }
 
     #[test]
     fn repeats_cannot_drift_when_ticks_run_slower_than_nominal() {
-        // The regression that made this a function. Advancing a timeline by NOMINAL per repeat while
-        // each real tick costs ACTUAL put the PTS ~5 ms further into the past every frame — 7 s behind
-        // inside one 18 s run, and unbounded after that. Stamping `now` cannot drift by construction:
-        // the PTS tracks the real clock however slow the ticks get.
-        let mut now = 1_000_000_000i64;
-        let mut prev = video_pts(false, 42, now, LEAD);
+        // The regression that made this a function. Advancing by NOMINAL per repeat while each real
+        // tick costs ACTUAL put the PTS ~5 ms further into the past every frame — 7 s behind inside one
+        // 18 s run, and unbounded after that. Extending by REAL elapsed time cannot drift: after 500
+        // slow ticks the stamp still sits exactly one capture latency behind the clock.
+        let start = 1_000_000_000i64;
+        let mut now = start;
+        let mut prev = Some((video_pts(true, now - LATENCY, now, LEAD, None), now));
         for i in 1..=500 {
             now += ACTUAL;
-            let pts = video_pts(false, 42, now, LEAD);
-            assert_eq!(pts - prev, ACTUAL, "repeat {i} must track the real clock, not the nominal fps");
-            assert_eq!(pts, now + LEAD, "a repeat is exactly now + lead — no accumulated state");
-            prev = pts;
+            let pts = video_pts(false, 42, now, LEAD, prev);
+            assert_eq!(pts - prev.unwrap().0, ACTUAL, "repeat {i} tracks the real clock, not nominal fps");
+            assert_eq!(pts, now - LATENCY + LEAD, "and never accumulates error");
+            prev = Some((pts, now));
         }
         assert!(NOMINAL < ACTUAL, "the drift only existed because nominal < actual");
     }
 
     #[test]
-    fn a_fresh_frame_after_repeats_re_anchors_to_truth_even_though_it_steps_back() {
-        // A repeat is stamped at publish time, so it sits one capture latency ahead of what the next
-        // fresh frame will claim. Stepping back is intended: the client tolerates one past-due frame,
-        // and inheriting the offset would mis-time video against audio for the rest of the stream.
-        let now = 2_000_000_000i64;
-        let repeat = video_pts(false, 1_000_000_000, now, LEAD);
-        let captured = now - 40_000_000; // the fresh frame was captured before that repeat went out
-        let fresh = video_pts(true, captured, now + 5_000_000, LEAD);
-        assert!(fresh < repeat, "re-anchoring to a fresh capture may step back");
-        assert_eq!(repeat - fresh, 40_000_000, "by exactly the capture latency, no more");
+    fn a_repeat_after_an_unsubscribed_gap_is_not_past_due() {
+        // Nothing publishes while no client is watching, so `prev` can be minutes old. The elapsed
+        // term covers the whole gap, so the stamp lands at ~now — not at the pre-gap timeline, which
+        // would be instantly discarded as past-due by the client that just connected.
+        let now = 1_000_000_000i64;
+        let prev = Some((video_pts(true, now - LATENCY, now, LEAD, None), now));
+        let after_gap = now + 120_000_000_000; // 2 minutes with no subscribers
+        let pts = video_pts(false, now - LATENCY, after_gap, LEAD, prev);
+        assert_eq!(pts, after_gap - LATENCY + LEAD, "the gap is absorbed, not inherited");
     }
 
     /// The distinction the stall watchdog is built on: "never produced" must NOT look like "stopped".

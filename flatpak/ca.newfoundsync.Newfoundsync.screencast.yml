@@ -1,0 +1,92 @@
+# Flatpak manifest VARIANT — the desktop server WITH Linux screen capture (`linux-capture`).
+#
+# STATUS: DOES NOT BUILD YET, and the blocker is upstream rather than here. Everything in this file
+# is correct and verified as far as the link step: the llvm18 SDK extension supplies the libclang
+# that both pipewire-sys and shiguredo_svt_av1 need for bindgen, and the SDK already carries
+# libpipewire-0.3 (1.2.4), libspa-0.2, cmake, nasm and git. It then dies here:
+#
+#   error: could not find native static library `SvtAv1Enc`, perhaps an -L flag is missing?
+#
+# shiguredo_svt_av1's build script emits rustc-link-search=<out>/lib unconditionally, while CMake's
+# GNUInstallDirs resolves to lib64 both inside this SDK and on Fedora. Debian-family resolves to lib,
+# which is why the same feature builds fine in an Ubuntu distrobox. Fix upstream (probe lib then
+# lib64), or vendor a patched fork, and this manifest should work as written.
+#
+# Until then, to run capture on an immutable host use an Ubuntu distrobox: it shares $HOME, the
+# session bus and the Wayland socket, so the app still drives the HOST's portal and compositor.
+#
+# Kept separate from ca.newfoundsync.Newfoundsync.yml on purpose: this one pulls the LLVM SDK
+# extension and builds SVT-AV1 from source, which roughly doubles the build time and the image, for a
+# feature that only works on a machine with a desktop session and a portal backend. The plain
+# manifest stays the thing you ship.
+#
+# Build exactly like the other one, pointing at this file:
+#   flatpak run org.flatpak.Builder --user --force-clean --disable-rofiles-fuse #     --repo=<repo> <builddir> flatpak/ca.newfoundsync.Newfoundsync.screencast.yml
+#
+# No extra finish-args are needed for capture: talking to org.freedesktop.portal.Desktop is what
+# portals exist for, and a sandboxed app may call ScreenCast without additional permissions. The
+# portal prompt is the permission.
+# Build from the repo root:
+#   flatpak-builder --user --force-clean --install-deps-from=flathub \
+#     --repo=/tmp/nfs-flatpak-repo build-dir flatpak/ca.newfoundsync.Newfoundsync.yml
+#   flatpak build-bundle /tmp/nfs-flatpak-repo ca.newfoundsync.Newfoundsync.flatpak ca.newfoundsync.Newfoundsync
+app-id: ca.newfoundsync.Newfoundsync
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+# bindgen needs libclang, and the 24.08 SDK ships none -- both pipewire-sys and shiguredo_svt_av1
+# generate bindings, so without this the build dies in the build script rather than the compiler.
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.llvm18
+command: newfoundsync
+finish-args:
+  - --socket=wayland          # egui window (Wayland)
+  - --socket=fallback-x11     # …or X11
+  - --share=ipc               # X11 shared memory
+  - --device=dri              # GPU for the egui/glow window
+  - --socket=pulseaudio       # capture system/loopback audio via PipeWire/Pulse
+  - --share=network           # serve HTTPS + WebSocket to LAN browsers
+build-options:
+  # Local build: network is shared so cargo can fetch crates AND we can bootstrap rustc.
+  build-args:
+    - --share=network
+  append-path: /usr/lib/sdk/llvm18/bin
+  prepend-ld-library-path: /usr/lib/sdk/llvm18/lib
+  env:
+    CARGO_HOME: /run/build/newfoundsync/cargo-home
+    RUSTUP_HOME: /run/build/newfoundsync/rustup
+    # bindgen finds libclang through this, not through PATH.
+    LIBCLANG_PATH: /usr/lib/sdk/llvm18/lib
+modules:
+  - name: newfoundsync
+    buildsystem: simple
+    build-commands:
+      # The 24.08 rust-stable SDK extension is rustc 1.89, but eframe 0.34.3 needs rustc 1.92, so
+      # bootstrap a current stable toolchain with rustup instead. (curl ships in the Freedesktop SDK.)
+      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh
+      - sh rustup-init.sh -y --profile minimal --default-toolchain stable --no-modify-path
+      # GUI + linux-capture. The feature implies video-encode-source, so SVT-AV1 is COMPILED here
+      # rather than downloaded: shiguredo_svt_av1 derives its prebuilt name as `ubuntu-{VERSION_ID}`,
+      # and inside this SDK that resolves to `ubuntu-24.08`, which does not exist -> 404.
+      - $CARGO_HOME/bin/cargo build --release -p newfoundsync --features linux-capture
+      - install -Dm755 target/release/newfoundsync /app/bin/newfoundsync
+      - install -Dm644 flatpak/ca.newfoundsync.Newfoundsync.desktop /app/share/applications/ca.newfoundsync.Newfoundsync.desktop
+      - install -Dm644 flatpak/ca.newfoundsync.Newfoundsync.metainfo.xml /app/share/metainfo/ca.newfoundsync.Newfoundsync.metainfo.xml
+      - install -Dm644 branding/icon-128.png /app/share/icons/hicolor/128x128/apps/ca.newfoundsync.Newfoundsync.png
+      - install -Dm644 branding/icon-256.png /app/share/icons/hicolor/256x256/apps/ca.newfoundsync.Newfoundsync.png
+      - install -Dm644 branding/icon-512.png /app/share/icons/hicolor/512x512/apps/ca.newfoundsync.Newfoundsync.png
+    sources:
+      - type: dir
+        path: ..
+        # Without these skips the source copy drags in the whole working tree — `target/` alone is
+        # multi-gigabyte, and a Windows-built `target/` is useless here anyway. Copying it doesn't just
+        # waste time and disk: flatpak-builder hashes the source dir, so any local rebuild would
+        # invalidate the cache every time.
+        skip:
+          - target
+          - .git
+          - vcpkg_installed
+          - e2e/node_modules
+          - e2e/playwright-report
+          - e2e/test-results
+          - dist

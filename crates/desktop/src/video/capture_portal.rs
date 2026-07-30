@@ -187,8 +187,15 @@ fn run_capture(
     // MainLoopRc, not MainLoopBox: the quit message below needs a handle the callback can own, and
     // only the Rc flavour is Clone (MainLoopBox is single-owner). Both deref to MainLoop::quit().
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| anyhow!("pw mainloop: {e}"))?;
-    let context =
-        pw::context::ContextBox::new(mainloop.loop_(), None).map_err(|e| anyhow!("pw context: {e}"))?;
+    // "Creation failed" here is almost always a MISSING CLIENT CONFIG rather than anything to do
+    // with the daemon: pw_context_new reads /usr/share/pipewire/client.conf, and a distro's
+    // libpipewire *-dev* package ships the shared object and the SPA modules WITHOUT that file. Cost
+    // an hour of looking at the portal handshake, which was fine. Say it here so nobody repeats it.
+    let context = pw::context::ContextBox::new(mainloop.loop_(), None).map_err(|e| {
+        anyhow!(
+            "could not create a PipeWire client context ({e}). If the log above mentions              client.conf, PipeWire's client configuration is missing — install the full `pipewire`              package, not just its -dev headers"
+        )
+    })?;
     let core = context.connect_fd(fd, None).map_err(|e| anyhow!("pw connect_fd: {e}"))?;
 
     // Teardown message: the loop quits itself when Drop sends.

@@ -7,7 +7,10 @@
 # One binary, so the two can never drift out of sync (unlike the .deb/.rpm split, where both
 # packages own /usr/bin/newfoundsync and have to Conflict).
 set -x
-VER=0.0.6
+# Derived from Cargo.toml, not hardcoded: a hand-bumped version here drifts from the binary and
+# you end up with a .pkg whose name disagrees with what is inside it.
+VER="$(grep -m1 '^version' crates/desktop/Cargo.toml | cut -d'"' -f2)"
+if [ -z "$VER" ]; then echo "cannot read the version from crates/desktop/Cargo.toml" >&2; exit 1; fi
 SRC="$HOME/nfs-src"
 ROOT=/tmp/nfspkg/root
 APP="$ROOT/Applications/Newfoundsync.app"

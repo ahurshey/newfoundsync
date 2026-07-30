@@ -485,6 +485,22 @@ fn open_url(url: &str) {
     }
 }
 
+/// The "Starting…" text, made specific when a local screen capture is about to be requested.
+///
+/// On Linux that request opens the desktop portal's share dialog and blocks until somebody answers
+/// it. A bare "Starting…" during that wait is actively misleading -- reported from the field as
+/// "it flashes up the screen grabber then sticks at Starting forever", which was really a 45-second
+/// wait for a prompt the operator had already dismissed. Naming the thing being waited on turns a
+/// hang into an instruction.
+fn starting_text(video_kind: VideoSourceKind) -> String {
+    let _ = video_kind;
+    #[cfg(all(target_os = "linux", feature = "linux-capture"))]
+    if video_kind == VideoSourceKind::Screen {
+        return "Starting… approve the screen-share prompt if it appears".to_string();
+    }
+    "Starting…".to_string()
+}
+
 fn serving_text(m: &Media) -> String {
     format!(
         "{SERVING_PREFIX}{}{}",
@@ -531,7 +547,16 @@ fn control_loop(
 ) {
     while let Ok(opts) = cmd_rx.recv() {
         starting.store(true, Ordering::Relaxed);
-        *status.lock().unwrap() = "Starting…".into();
+        // Same reasoning as starting_text(): if this start is going to open the portal dialog, say
+        // so, because the wait is long enough to look like a freeze.
+        let waiting_on_portal = cfg!(all(target_os = "linux", feature = "linux-capture"))
+            && opts.video.is_some()
+            && !matches!(opts.capture_source, CaptureSource::WebUplink);
+        *status.lock().unwrap() = if waiting_on_portal {
+            "Starting… approve the screen-share prompt if it appears".into()
+        } else {
+            String::from("Starting…")
+        };
         match media::start(opts) {
             Ok(m) => {
                 let _ = tx.send(Arc::new(StreamState::from_media(&m)));
@@ -974,7 +999,7 @@ impl ServerApp {
             encode_device: self.encode_device,
         };
         self.starting.store(true, Ordering::Relaxed);
-        *self.status.lock().unwrap() = "Starting…".into();
+        *self.status.lock().unwrap() = starting_text(self.video_kind);
         let _ = self.cmd_tx.send(opts);
         self.applied = Some(self.current_config()); // baseline for the "changes pending" state
     }

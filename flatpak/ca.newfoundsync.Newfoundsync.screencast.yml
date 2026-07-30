@@ -1,24 +1,17 @@
 # Flatpak manifest VARIANT — the desktop server WITH Linux screen capture (`linux-capture`).
 #
-# STATUS: DOES NOT BUILD YET, and the blocker is upstream rather than here. Everything in this file
-# is correct and verified as far as the link step: the llvm18 SDK extension supplies the libclang
-# that both pipewire-sys and shiguredo_svt_av1 need for bindgen, and the SDK already carries
-# libpipewire-0.3 (1.2.4), libspa-0.2, cmake, nasm and git. It then dies here:
+# Builds a working screen-capture Flatpak. Two things make it work that the plain manifest does not
+# need:
 #
-#   error: could not find native static library `SvtAv1Enc`, perhaps an -L flag is missing?
+#   * the llvm18 SDK extension, because bindgen needs libclang and the 24.08 SDK ships none (both
+#     pipewire-sys and shiguredo_svt_av1 generate bindings);
+#   * CMAKE_TOOLCHAIN_FILE pointing at cmake-force-libdir.cmake, which forces CMAKE_INSTALL_LIBDIR
+#     to lib. Without it SVT-AV1 installs to <out>/lib64 while shiguredo_svt_av1's build script looks
+#     in <out>/lib, and the link dies with "could not find native static library SvtAv1Enc". That
+#     mismatch also blocks Fedora; see packaging/README-rpm.md.
 #
-# shiguredo_svt_av1's build script emits rustc-link-search=<out>/lib unconditionally, while CMake's
-# GNUInstallDirs resolves to lib64 both inside this SDK and on Fedora. Debian-family resolves to lib,
-# which is why the same feature builds fine in an Ubuntu distrobox. Fix upstream (probe lib then
-# lib64), or vendor a patched fork, and this manifest should work as written.
-#
-# Until then, to run capture on an immutable host use an Ubuntu distrobox: it shares $HOME, the
-# session bus and the Wayland socket, so the app still drives the HOST's portal and compositor.
-#
-# Kept separate from ca.newfoundsync.Newfoundsync.yml on purpose: this one pulls the LLVM SDK
-# extension and builds SVT-AV1 from source, which roughly doubles the build time and the image, for a
-# feature that only works on a machine with a desktop session and a portal backend. The plain
-# manifest stays the thing you ship.
+# Kept separate from ca.newfoundsync.Newfoundsync.yml because it roughly doubles the build time and
+# the image for a feature that only works on a machine with a desktop session and a portal backend.
 #
 # Build exactly like the other one, pointing at this file:
 #   flatpak run org.flatpak.Builder --user --force-clean --disable-rofiles-fuse #     --repo=<repo> <builddir> flatpak/ca.newfoundsync.Newfoundsync.screencast.yml
@@ -57,6 +50,9 @@ build-options:
     RUSTUP_HOME: /run/build/newfoundsync/rustup
     # bindgen finds libclang through this, not through PATH.
     LIBCLANG_PATH: /usr/lib/sdk/llvm18/lib
+    # See cmake-force-libdir.cmake. Absolute path because CMake resolves a relative toolchain file
+    # against its own build directory, not ours.
+    CMAKE_TOOLCHAIN_FILE: /run/build/newfoundsync/flatpak/cmake-force-libdir.cmake
 modules:
   - name: newfoundsync
     buildsystem: simple

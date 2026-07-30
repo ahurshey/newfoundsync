@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use newfoundsync_core::config::mono_now;
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
 use windows_capture::graphics_capture_api::InternalCaptureControl;
@@ -28,6 +29,9 @@ pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     pub bgra: Vec<u8>,
+    /// `mono_now()` at the moment this picture was taken. The video PTS is derived from THIS, not
+    /// from when the encoder finished, so the timestamp describes the content and not the pipeline.
+    pub captured_ns: i64,
 }
 
 /// Shared latest-frame slot — capture writes, the video-producer thread takes.
@@ -76,6 +80,8 @@ impl GraphicsCaptureApiHandler for Handler {
             tracing::info!(width = w, height = h, "video capture: first frame arrived");
             self.first_frame_logged = true;
         }
+        // Stamp BEFORE the copy: this is as close as we get to when the picture was on screen.
+        let captured_ns = mono_now();
         // Copy BGRA into the slot for the video-producer thread to scale + encode.
         let fb = frame.buffer()?;
         let bgra = fb.as_nopadding_buffer(&mut self.scratch);
@@ -84,6 +90,7 @@ impl GraphicsCaptureApiHandler for Handler {
                 width: w,
                 height: h,
                 bgra: bgra.to_vec(),
+                captured_ns,
             });
         }
         Ok(())

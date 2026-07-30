@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use tokio::sync::broadcast;
 
 use newfoundsync_core::codec::{CodecKind, Encoder};
-use newfoundsync_core::config::mono_now;
+use newfoundsync_core::config::{mono_now, CHANNELS, SAMPLE_RATE};
 use newfoundsync_core::video::{EncodeDevice, EncoderBackend, VideoConfig};
 
 #[cfg(not(target_os = "linux"))]
@@ -374,10 +374,21 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         let audio_health = health.clone();
         let mut enc_err = LogThrottle::new();
         let on_frame = move |frame: &[i16]| {
+            // When the FIRST sample in this frame was captured. The frame spans the 20 ms BEFORE the
+            // callback fires — the buffer had to fill before we were handed it — and the client
+            // schedules a frame's playback to START at its PTS. So stamping `mono_now()` here
+            // described the frame's LAST sample and played the whole frame one frame-time late:
+            // systematic, every platform, and it lands entirely on A/V sync as 20 ms of audio lag
+            // against video that has no matching delay.
+            //
+            // Derived from the frame's own length rather than FRAME_DURATION_MS so a short frame
+            // (source shutting down, a resampler flush) is stamped for what it actually contains.
+            let span_ns = (frame.len() / CHANNELS) as i64 * 1_000_000_000 / SAMPLE_RATE as i64;
+            let capture_ns = mono_now() - span_ns;
             // FFI callback (cpal/WGC) — trap panics so they can't unwind across C.
             let _ = std::panic::catch_unwind(AssertUnwindSafe(|| match encoder.encode(frame) {
                 Ok(payload) => {
-                    let pts = mono_now() + lead_ns;
+                    let pts = capture_ns + lead_ns;
                     let mut msg = Vec::with_capacity(9 + payload.len());
                     msg.push(MSG_AUDIO);
                     msg.extend_from_slice(&pts.to_be_bytes());
@@ -680,9 +691,15 @@ impl VideoProducer {
                 let mut got_any = false;
                 let mut warned_no_frame = false;
                 let mut enc_err = LogThrottle::new();
+                let frame_dur_ns = frame_dur.as_nanos() as i64;
+                let mut last_pts: i64 = 0;
+                let mut published: u64 = 0;
 
                 while !stop_t.load(Ordering::Relaxed) {
                     let tick = Instant::now();
+                    // Did the OS hand us a NEW picture this tick? Drives the PTS: a new frame is
+                    // stamped from its own capture time, a re-encode of `last` cannot be.
+                    let mut fresh = false;
                     // Mirror the authoritative capture-death signal into health so the web layer can
                     // report it (see MediaHealth::capture_closed for why frame silence must NOT be
                     // used for this).
@@ -694,6 +711,7 @@ impl VideoProducer {
                     if let Some(f) = slot.lock().unwrap().take() {
                         last = Some(f);
                         got_any = true;
+                        fresh = true;
                         // Counted separately from encoded output: the loop below happily re-encodes
                         // `last` forever after capture stops, so video_frames alone can't tell a live
                         // screen from a frozen one. This only moves on a genuinely NEW OS frame.
@@ -751,7 +769,38 @@ impl VideoProducer {
                                 }
                                 match enc.encode_bgra(&scaled) {
                                     Ok(bits) if !bits.is_empty() => {
-                                        let pts = mono_now() + lead_ns;
+                                        // PTS describes when the PICTURE EXISTED, not when the
+                                        // encoder finished with it. Stamping `mono_now()` here folded
+                                        // the poll wait + scale + AV1 encode into the timestamp —
+                                        // tens of ms, and a different amount every frame. The client
+                                        // deadline-schedules video against the same master clock as
+                                        // audio, so that went straight out as lip-sync error that
+                                        // wobbled frame to frame and no fixed trim could remove.
+                                        let pts = if fresh {
+                                            frame.captured_ns + lead_ns
+                                        } else {
+                                            // A re-encode of `last` (idle source) carries a stale
+                                            // capture time. Step the timeline instead of re-emitting
+                                            // a past-due PTS the client would drop — the screen still
+                                            // looks like this now, so "now-ish" is the honest stamp.
+                                            // The repeat→fresh transition can then step BACK by up to
+                                            // one capture latency; the client handles a past-due frame
+                                            // (it paints it at the next refresh) and this re-anchors
+                                            // to the truth rather than inheriting the drift.
+                                            last_pts + frame_dur_ns
+                                        };
+                                        last_pts = pts;
+                                        published += 1;
+                                        if published == 60 {
+                                            // Past the encoder's cold start. This is exactly what the
+                                            // capture stamp removes from the PTS; if it is large,
+                                            // video is arriving late and the client is likely
+                                            // dropping frames as past-due.
+                                            tracing::info!(
+                                                ms = (mono_now() - frame.captured_ns) / 1_000_000,
+                                                "video capture→publish latency"
+                                            );
+                                        }
                                         // Flag the keyframe from the ACTUAL emitted bitstream (an AV1
                                         // Sequence-Header OBU or the VP9 keyframe bit), not the request —
                                         // force_keyframe is a no-op on the GPU MFT (GOP-driven), so the

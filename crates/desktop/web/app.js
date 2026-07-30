@@ -975,9 +975,26 @@ function serverPtsToPerfMs(ptsNs) {
   // ptsNs is server-mono ns; offsetNs maps it to performance.now() ms, then we add
   // the shared buffer (same on every client → same wall-clock instant) plus this
   // device's effective sync trim (local + server-pushed). This is the shared content→wall-clock
-  // map used by BOTH audio and video, so it stays output-latency-agnostic; the audio path applies
-  // the speaker-output-latency correction itself (onAudioData), since video carries no such delay.
+  // map used by BOTH audio and video, so it stays output-latency-agnostic; each side applies its own
+  // speaker-output-latency correction (onAudioData / videoPresentMs).
   return (ptsNs - offsetNs) / 1e6 + bufferMs + effTrimMs();
+}
+
+// When a video frame must be ON SCREEN: the instant the matching sound is AUDIBLE, not the instant
+// its samples are handed to the audio device.
+//
+// For an UN-aligned device the audio path pulls its own anchor back by outLat, so sound emerges at
+// serverPtsToPerfMs() and video needs no correction. Once ALIGNED, effTrim folds the output latency
+// in instead (calibration measured acoustic arrival, so it already paid for the speaker delay) — the
+// shared map is then the SUBMIT time and the sound emerges outLat after it. Video, which has no
+// speaker delay to absorb, must wait that long too or the picture runs ahead of the lips by a full
+// output latency: tens of ms on a laptop, 150 ms+ over Bluetooth.
+//
+// Deliberately mirrors the `aligned ? 0 : outLatMs` in onAudioData: whatever that decides, video
+// targets the same audible instant, so A/V stay locked to each other even if the absolute
+// cross-device alignment is off.
+function videoPresentMs(ptsNs) {
+  return serverPtsToPerfMs(ptsNs) + (aligned ? outLatMs : 0);
 }
 
 // Cache the speaker output latency the browser reports (ms). Read lazily/throttled from onAudioData
@@ -1427,7 +1444,7 @@ function pumpVideo() {
   const now = performance.now();
   while (evq.length && vq.length < MAX_DECODED && videoDecoder.decodeQueueSize < 8) {
     const head = evq[0];
-    if (serverPtsToPerfMs(head.tsUs * 1000) > now + DECODE_AHEAD_MS) break;
+    if (videoPresentMs(head.tsUs * 1000) > now + DECODE_AHEAD_MS) break;
     evq.shift();
     if (needDecodeKey) {
       if (!head.key) continue; // skip stale deltas until a keyframe re-anchors decode
@@ -1457,7 +1474,7 @@ function onVideoFrame(frame) {
     frame.close();
     return;
   }
-  vq.push({ frame, targetPerf: serverPtsToPerfMs(frame.timestamp * 1000) });
+  vq.push({ frame, targetPerf: videoPresentMs(frame.timestamp * 1000) });
   // Overflow guard (rare — pumpVideo already gates on MAX_DECODED). Drop a doomed past-due frame
   // first, else the farthest-FUTURE one — never the imminent frame, which would be a guaranteed skip.
   while (vq.length > MAX_DECODED) {
@@ -1572,7 +1589,10 @@ function onAudioData(ad) {
   // no clock yet) is not audible, so counting it above would let the stall detector call real silence
   // "playing" — the exact lie this is here to stop.
   aPlayable++;
-  if (!aligned && (outLatMs === 0 || aFrames % 250 === 0)) refreshOutLat(); // seed on first real frame + keep fresh
+  // Kept fresh even when aligned: the audio path ignores outLat once aligned, but videoPresentMs
+  // needs it precisely THEN (it is the whole A/V correction), so gating this on !aligned would leave
+  // video reading a stale 0 on every calibrated device.
+  if (outLatMs === 0 || aFrames % 250 === 0) refreshOutLat(); // seed on first real frame + keep fresh
   const dur = ad.numberOfFrames / ad.sampleRate; // seconds this frame occupies
   // For an UN-aligned device, pull the AUDIO anchor earlier by the reported output-buffer latency so
   // sound EMERGES at the shared instant (not merely written to the buffer then) — this shrinks the
@@ -1821,6 +1841,10 @@ window.nfsDebug = function () {
     rateIntPpm: +(aRateInt * 1e6).toFixed(0), //     integral term alone (ppm) — should settle to ~crystal ppm
     aligned, //                                      false ⇒ outLat model active
     outLatMs: +outLatMs.toFixed(1),
+    // How much later than the shared map video is being painted, to land on the AUDIBLE instant
+    // rather than the audio-submit instant (see videoPresentMs). This is exactly the amount the
+    // picture used to lead the lips by on an aligned device — read it here to size a sync complaint.
+    avCorrectionMs: +(videoPresentMs(0) - serverPtsToPerfMs(0)).toFixed(1),
     audioFrames: aFrames,
     evq: evq.length,
     vq: vq.length,

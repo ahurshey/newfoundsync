@@ -38,6 +38,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
+use newfoundsync_core::config::mono_now;
 use pipewire as pw;
 use pw::{properties::properties, spa};
 
@@ -54,6 +55,10 @@ pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     pub bgra: Vec<u8>,
+    /// `mono_now()` at the moment this picture arrived from PipeWire. The video PTS is derived from
+    /// THIS, not from when the encoder finished, so the timestamp describes the content and not the
+    /// pipeline. Same contract as the Windows backend's field.
+    pub captured_ns: i64,
 }
 
 /// Latest-frame slot, overwrite-on-arrival. Never a queue: the encoder pulls at its own fps and
@@ -257,6 +262,9 @@ fn run_capture(
         .process({
             let slot = slot.clone();
             move |stream, state| {
+                // Stamped on arrival, before the de-stride copy: the PTS has to describe when the
+                // picture existed, not when the encoder was done with it.
+                let captured_ns = mono_now();
                 let Some(mut buffer) = stream.dequeue_buffer() else { return };
                 let datas = buffer.datas_mut();
                 if datas.is_empty() {
@@ -282,7 +290,7 @@ fn run_capture(
                         .copy_from_slice(&src[y * stride..y * stride + row]);
                 }
                 if let Ok(mut guard) = slot.lock() {
-                    *guard = Some(CapturedFrame { width: w, height: h, bgra });
+                    *guard = Some(CapturedFrame { width: w, height: h, bgra, captured_ns });
                 }
             }
         })

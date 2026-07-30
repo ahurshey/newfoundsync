@@ -25,12 +25,19 @@ use pulse::stream::{
     Direction, FlagSet as StreamFlagSet, PeekResult, State as StreamState, Stream,
 };
 
+/// 20 ms of 48 kHz stereo in BYTES (960 frames x 2 channels x 2 bytes). Requested as the
+/// PulseAudio fragment size AND used as the read buffer, so the two cannot drift apart.
+const FRAME_BYTES: usize = FRAME_SAMPLES * 2;
+
 /// 20 ms of 48 kHz stereo, in i16 samples (960 frames × 2 channels).
 ///
-/// The whole-system path gets this cadence for free — `pa_simple` reads a fixed-size buffer. The
-/// per-app path reads whatever PulseAudio hands it, so it re-blocks to this same size before
-/// calling `on_frame`: downstream (the Opus encoder) is fed a uniform frame either way, and the two
-/// capture paths stay behaviourally interchangeable.
+/// Both capture paths hand `on_frame` exactly this many samples, so the Opus encoder sees a uniform
+/// frame and the two paths stay behaviourally interchangeable.
+///
+/// A fixed READ SIZE does not by itself buy a fixed cadence — that was the assumption behind the
+/// Linux stutter. `pa_simple` returns as soon as the server has data, so with a large server-side
+/// fragment it returns many reads instantly and then blocks. The cadence comes from asking for a
+/// matching `fragsize` (see `BufferAttr` in `start`), not from the size of this buffer.
 const FRAME_SAMPLES: usize = 1920;
 
 /// Records the default output sink's monitor. Stops the capture thread on drop.
@@ -81,6 +88,29 @@ impl PulseCapture {
             bail!("invalid PulseAudio sample spec");
         }
         // Open the record stream now so start() fails fast if the monitor can't be opened.
+        // ASK FOR A 20 ms FRAGMENT. Passing None here (the server's default) is what made Linux
+        // audio stutter: PulseAudio chose a ~340 ms fragment for the monitor source, so our 20 ms
+        // reads returned SEVENTEEN AT A TIME with no delay and then blocked for a third of a second.
+        //
+        // The frame count stayed perfect — 51 frames/s, zero errors, /health looked healthy — but
+        // the cadence was a burst. That matters because the PTS is stamped when a frame is
+        // published (`mono_now() + lead_ns`), so seventeen frames read within a millisecond all
+        // claim nearly the SAME presentation time. The client is then told to play 340 ms of audio
+        // at one instant, plays one frame and discards the rest, and you hear audio cutting in and
+        // out roughly twice a second. Measured at the client: 94% of frames arriving <1 ms apart,
+        // p99 gap 340 ms.
+        //
+        // Windows never showed this because WASAPI loopback delivers on a steady ~10-20 ms cadence,
+        // which is the regular delivery the wall-clock PTS quietly assumes.
+        let attr = pulse::def::BufferAttr {
+            // The one that matters for a record stream: bytes handed over per read.
+            fragsize: FRAME_BYTES as u32,
+            // u32::MAX means "server default" for the rest; tlength/prebuf/minreq are playback-only.
+            maxlength: u32::MAX,
+            tlength: u32::MAX,
+            prebuf: u32::MAX,
+            minreq: u32::MAX,
+        };
         let simple = Simple::new(
             None,                   // default server
             "Newfoundsync",         // application name
@@ -88,8 +118,8 @@ impl PulseCapture {
             Some(monitor.as_str()), // record the sink's monitor (system output)
             "system audio",         // stream description
             &spec,
-            None, // default channel map
-            None, // default buffering
+            None,        // default channel map
+            Some(&attr), // 20 ms fragments — see above
         )
         .map_err(|e| anyhow!("open monitor source '{monitor}': {e:?}"))?;
 
@@ -99,8 +129,8 @@ impl PulseCapture {
         let thread = thread::Builder::new()
             .name("pulse-capture".into())
             .spawn(move || {
-                // ~20 ms of 48 kHz stereo S16 = 48000 * 2ch * 2B / 50 = 3840 bytes.
-                let mut buf = [0u8; 3840];
+                // Same size we asked the server for, via the shared constant.
+                let mut buf = [0u8; FRAME_BYTES];
                 let mut samples = vec![0i16; buf.len() / 2];
                 let mut reads: u64 = 0;
                 let mut peak: i32 = 0;

@@ -335,6 +335,36 @@ pub struct MediaOptions {
 /// to clients. If those disagree the server emits AV1 while telling browsers to decode `vp09` — every
 /// client then fails to decode, which is far worse than the wrong codec. Resolving once makes the
 /// mismatch unrepresentable.
+/// The presentation timestamp for one encoded video frame.
+///
+/// A FRESH frame is stamped from its own capture time, so the PTS states when the picture existed
+/// rather than when the encoder finished with it (the poll wait + scale + encode are tens of ms, and
+/// vary per frame — that difference lands directly on lip-sync).
+///
+/// An idle source is re-encoded from the last captured frame, and that frame's capture time is stale.
+/// Re-emitting it would produce duplicate, then increasingly past-due timestamps the client drops, so
+/// the timeline steps forward by one frame instead: the screen still looks like that now, which makes
+/// "now-ish" the honest stamp for a repeat. A later fresh frame may then step the PTS BACK by up to
+/// one capture latency; the client tolerates a past-due frame (it paints it at the next refresh) and
+/// re-anchoring to the truth beats inheriting the drift forever.
+///
+/// `last_pts` is `None` until something has actually been published. That case is why this is a
+/// function with tests: treating "no timeline yet" as zero stamps the first frame at ~0 ns — 56 years
+/// in the past — and every client throws it away. It is reachable whenever the first tick after a
+/// client subscribes finds no new frame in the slot, which is common at startup.
+fn video_pts(
+    fresh: bool,
+    captured_ns: i64,
+    lead_ns: i64,
+    last_pts: Option<i64>,
+    frame_dur_ns: i64,
+) -> i64 {
+    match last_pts {
+        Some(prev) if !fresh => prev + frame_dur_ns,
+        _ => captured_ns + lead_ns,
+    }
+}
+
 fn resolve_encoder(requested: EncoderBackend) -> EncoderBackend {
     #[cfg(not(feature = "vp9"))]
     if matches!(requested, EncoderBackend::Vp9) {
@@ -692,7 +722,8 @@ impl VideoProducer {
                 let mut warned_no_frame = false;
                 let mut enc_err = LogThrottle::new();
                 let frame_dur_ns = frame_dur.as_nanos() as i64;
-                let mut last_pts: i64 = 0;
+                // None until the first frame is PUBLISHED — there is no timeline to step forward yet.
+                let mut last_pts: Option<i64> = None;
                 let mut published: u64 = 0;
 
                 while !stop_t.load(Ordering::Relaxed) {
@@ -776,20 +807,14 @@ impl VideoProducer {
                                         // deadline-schedules video against the same master clock as
                                         // audio, so that went straight out as lip-sync error that
                                         // wobbled frame to frame and no fixed trim could remove.
-                                        let pts = if fresh {
-                                            frame.captured_ns + lead_ns
-                                        } else {
-                                            // A re-encode of `last` (idle source) carries a stale
-                                            // capture time. Step the timeline instead of re-emitting
-                                            // a past-due PTS the client would drop — the screen still
-                                            // looks like this now, so "now-ish" is the honest stamp.
-                                            // The repeat→fresh transition can then step BACK by up to
-                                            // one capture latency; the client handles a past-due frame
-                                            // (it paints it at the next refresh) and this re-anchors
-                                            // to the truth rather than inheriting the drift.
-                                            last_pts + frame_dur_ns
-                                        };
-                                        last_pts = pts;
+                                        let pts = video_pts(
+                                            fresh,
+                                            frame.captured_ns,
+                                            lead_ns,
+                                            last_pts,
+                                            frame_dur_ns,
+                                        );
+                                        last_pts = Some(pts);
                                         published += 1;
                                         if published == 60 {
                                             // Past the encoder's cold start. This is exactly what the
@@ -925,6 +950,50 @@ impl Drop for VideoProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LEAD: i64 = 100_000_000; // 100 ms
+    const DUR: i64 = 33_333_333; //   ~1/30 s
+
+    #[test]
+    fn fresh_frame_is_stamped_from_its_own_capture_time() {
+        // Not from "now": the encode time must not leak into the timestamp.
+        assert_eq!(video_pts(true, 5_000, LEAD, None, DUR), 5_000 + LEAD);
+        assert_eq!(video_pts(true, 9_000, LEAD, Some(1_000_000), DUR), 9_000 + LEAD);
+    }
+
+    #[test]
+    fn a_repeat_before_anything_was_published_uses_the_capture_time() {
+        // The regression this function exists for. With `last_pts` as a bare 0, this returned one
+        // frame duration — a PTS ~56 years in the past, which every client discards as past-due.
+        // Reachable at startup: the first tick after a client subscribes often finds the slot empty
+        // and re-encodes the previous frame.
+        let captured = 1_700_000_000_000_000_000i64; // a realistic monotonic reading
+        assert_eq!(video_pts(false, captured, LEAD, None, DUR), captured + LEAD);
+    }
+
+    #[test]
+    fn repeats_step_the_timeline_forward_one_frame_at_a_time() {
+        // An idle screen must keep emitting usable, strictly increasing timestamps.
+        let mut last = Some(1_000_000_000i64);
+        for i in 1..=5 {
+            let pts = video_pts(false, 42, LEAD, last, DUR);
+            assert_eq!(pts, 1_000_000_000 + i * DUR, "repeat {i} must advance by exactly one frame");
+            assert!(pts > last.unwrap(), "a repeat must never regress");
+            last = Some(pts);
+        }
+    }
+
+    #[test]
+    fn a_fresh_frame_re_anchors_to_truth_even_if_that_steps_back() {
+        // After a static period the timeline can sit AHEAD of the real capture clock. The fresh frame
+        // still wins: inheriting the drift would keep video permanently mis-timed against audio,
+        // whereas one past-due frame costs a single refresh.
+        let drifted_ahead = Some(2_000_000_000i64);
+        let captured = 1_900_000_000i64;
+        let pts = video_pts(true, captured, 0, drifted_ahead, DUR);
+        assert_eq!(pts, captured);
+        assert!(pts < drifted_ahead.unwrap(), "re-anchoring to a fresh capture may step back");
+    }
 
     /// The distinction the stall watchdog is built on: "never produced" must NOT look like "stopped".
     /// A web-cast source with no caster yet, or the first moments after Apply, legitimately has zero

@@ -341,27 +341,26 @@ pub struct MediaOptions {
 /// rather than when the encoder finished with it (the poll wait + scale + encode are tens of ms, and
 /// vary per frame — that difference lands directly on lip-sync).
 ///
-/// An idle source is re-encoded from the last captured frame, and that frame's capture time is stale.
-/// Re-emitting it would produce duplicate, then increasingly past-due timestamps the client drops, so
-/// the timeline steps forward by one frame instead: the screen still looks like that now, which makes
-/// "now-ish" the honest stamp for a repeat. A later fresh frame may then step the PTS BACK by up to
-/// one capture latency; the client tolerates a past-due frame (it paints it at the next refresh) and
-/// re-anchoring to the truth beats inheriting the drift forever.
+/// A REPEAT — the re-encode of `last` that happens when the source delivered nothing this tick — is
+/// stamped `now_ns` instead. Its content is still current (the screen genuinely still looks like
+/// that), so "now" is the honest answer, and it is the only answer that cannot drift.
 ///
-/// `last_pts` is `None` until something has actually been published. That case is why this is a
-/// function with tests: treating "no timeline yet" as zero stamps the first frame at ~0 ns — 56 years
-/// in the past — and every client throws it away. It is reachable whenever the first tick after a
-/// client subscribes finds no new frame in the slot, which is common at startup.
-fn video_pts(
-    fresh: bool,
-    captured_ns: i64,
-    lead_ns: i64,
-    last_pts: Option<i64>,
-    frame_dur_ns: i64,
-) -> i64 {
-    match last_pts {
-        Some(prev) if !fresh => prev + frame_dur_ns,
-        _ => captured_ns + lead_ns,
+/// Two things were tried here first and both were wrong, hence the tests:
+///   * Stepping a running timeline forward by one NOMINAL frame duration per repeat. Real ticks are
+///     slower than nominal whenever encoding is (measured: 38 ms actual against a 33 ms nominal), so
+///     on an idle screen the PTS fell ~5 ms further into the past every frame and ran away without
+///     bound — 7 s behind inside one 18 s run. The client then drops everything as past-due.
+///   * Seeding that timeline from zero, which stamped the first frame ~56 years in the past.
+///
+/// A repeat's `now_ns` sits up to one capture latency AFTER what a fresh frame would claim, so a
+/// following fresh frame can step the PTS BACK by that much. That is intended: the client tolerates
+/// one past-due frame (it paints it at the next refresh), and re-anchoring to the truth beats
+/// inheriting an offset forever.
+fn video_pts(fresh: bool, captured_ns: i64, now_ns: i64, lead_ns: i64) -> i64 {
+    if fresh {
+        captured_ns + lead_ns
+    } else {
+        now_ns + lead_ns
     }
 }
 
@@ -721,10 +720,9 @@ impl VideoProducer {
                 let mut got_any = false;
                 let mut warned_no_frame = false;
                 let mut enc_err = LogThrottle::new();
-                let frame_dur_ns = frame_dur.as_nanos() as i64;
-                // None until the first frame is PUBLISHED — there is no timeline to step forward yet.
-                let mut last_pts: Option<i64> = None;
-                let mut published: u64 = 0;
+                // Counts only frames published from a NEW capture, so the latency log below can't
+                // sample a repeat.
+                let mut fresh_published: u64 = 0;
 
                 while !stop_t.load(Ordering::Relaxed) {
                     let tick = Instant::now();
@@ -807,24 +805,25 @@ impl VideoProducer {
                                         // deadline-schedules video against the same master clock as
                                         // audio, so that went straight out as lip-sync error that
                                         // wobbled frame to frame and no fixed trim could remove.
-                                        let pts = video_pts(
-                                            fresh,
-                                            frame.captured_ns,
-                                            lead_ns,
-                                            last_pts,
-                                            frame_dur_ns,
-                                        );
-                                        last_pts = Some(pts);
-                                        published += 1;
-                                        if published == 60 {
-                                            // Past the encoder's cold start. This is exactly what the
-                                            // capture stamp removes from the PTS; if it is large,
-                                            // video is arriving late and the client is likely
-                                            // dropping frames as past-due.
-                                            tracing::info!(
-                                                ms = (mono_now() - frame.captured_ns) / 1_000_000,
-                                                "video capture→publish latency"
-                                            );
+                                        let now_ns = mono_now();
+                                        let pts =
+                                            video_pts(fresh, frame.captured_ns, now_ns, lead_ns);
+                                        // FRESH frames only. Measuring a repeat here reports the age
+                                        // of a deliberately frozen picture as though it were pipeline
+                                        // latency — on an idle screen that printed 9118 ms, which
+                                        // reads as a catastrophe and means nothing.
+                                        if fresh {
+                                            fresh_published += 1;
+                                            if fresh_published == 60 {
+                                                // Past the encoder's cold start. This is exactly what
+                                                // the capture stamp removes from the PTS; if it is
+                                                // large, video is arriving late and the client is
+                                                // likely dropping frames as past-due.
+                                                tracing::info!(
+                                                    ms = (now_ns - frame.captured_ns) / 1_000_000,
+                                                    "video capture→publish latency"
+                                                );
+                                            }
                                         }
                                         // Flag the keyframe from the ACTUAL emitted bitstream (an AV1
                                         // Sequence-Header OBU or the VP9 keyframe bit), not the request —
@@ -951,48 +950,56 @@ impl Drop for VideoProducer {
 mod tests {
     use super::*;
 
-    const LEAD: i64 = 100_000_000; // 100 ms
-    const DUR: i64 = 33_333_333; //   ~1/30 s
+    const LEAD: i64 = 100_000_000; //  100 ms
+    const NOMINAL: i64 = 33_333_333; // ~1/30 s, the tick the producer AIMS for
+    const ACTUAL: i64 = 38_000_000; //  what a tick really costs when encoding is slow
 
     #[test]
-    fn fresh_frame_is_stamped_from_its_own_capture_time() {
-        // Not from "now": the encode time must not leak into the timestamp.
-        assert_eq!(video_pts(true, 5_000, LEAD, None, DUR), 5_000 + LEAD);
-        assert_eq!(video_pts(true, 9_000, LEAD, Some(1_000_000), DUR), 9_000 + LEAD);
+    fn a_fresh_frame_is_stamped_from_its_own_capture_time() {
+        // Not from "now": the poll wait + scale + encode must not leak into the timestamp, or video
+        // is presented that much after the moment it depicts.
+        let captured = 1_700_000_000_000_000_000i64;
+        let published_40ms_later = captured + 40_000_000;
+        assert_eq!(video_pts(true, captured, published_40ms_later, LEAD), captured + LEAD);
     }
 
     #[test]
-    fn a_repeat_before_anything_was_published_uses_the_capture_time() {
-        // The regression this function exists for. With `last_pts` as a bare 0, this returned one
-        // frame duration — a PTS ~56 years in the past, which every client discards as past-due.
-        // Reachable at startup: the first tick after a client subscribes often finds the slot empty
-        // and re-encodes the previous frame.
-        let captured = 1_700_000_000_000_000_000i64; // a realistic monotonic reading
-        assert_eq!(video_pts(false, captured, LEAD, None, DUR), captured + LEAD);
+    fn a_repeat_is_stamped_now_because_a_frozen_screen_is_still_current() {
+        // The stale capture time must NOT be reused — it would be duplicated and then past-due.
+        let captured = 1_700_000_000_000_000_000i64;
+        let now = captured + 9_000_000_000; // 9 s of an idle screen
+        assert_eq!(video_pts(false, captured, now, LEAD), now + LEAD);
     }
 
     #[test]
-    fn repeats_step_the_timeline_forward_one_frame_at_a_time() {
-        // An idle screen must keep emitting usable, strictly increasing timestamps.
-        let mut last = Some(1_000_000_000i64);
-        for i in 1..=5 {
-            let pts = video_pts(false, 42, LEAD, last, DUR);
-            assert_eq!(pts, 1_000_000_000 + i * DUR, "repeat {i} must advance by exactly one frame");
-            assert!(pts > last.unwrap(), "a repeat must never regress");
-            last = Some(pts);
+    fn repeats_cannot_drift_when_ticks_run_slower_than_nominal() {
+        // The regression that made this a function. Advancing a timeline by NOMINAL per repeat while
+        // each real tick costs ACTUAL put the PTS ~5 ms further into the past every frame — 7 s behind
+        // inside one 18 s run, and unbounded after that. Stamping `now` cannot drift by construction:
+        // the PTS tracks the real clock however slow the ticks get.
+        let mut now = 1_000_000_000i64;
+        let mut prev = video_pts(false, 42, now, LEAD);
+        for i in 1..=500 {
+            now += ACTUAL;
+            let pts = video_pts(false, 42, now, LEAD);
+            assert_eq!(pts - prev, ACTUAL, "repeat {i} must track the real clock, not the nominal fps");
+            assert_eq!(pts, now + LEAD, "a repeat is exactly now + lead — no accumulated state");
+            prev = pts;
         }
+        assert!(NOMINAL < ACTUAL, "the drift only existed because nominal < actual");
     }
 
     #[test]
-    fn a_fresh_frame_re_anchors_to_truth_even_if_that_steps_back() {
-        // After a static period the timeline can sit AHEAD of the real capture clock. The fresh frame
-        // still wins: inheriting the drift would keep video permanently mis-timed against audio,
-        // whereas one past-due frame costs a single refresh.
-        let drifted_ahead = Some(2_000_000_000i64);
-        let captured = 1_900_000_000i64;
-        let pts = video_pts(true, captured, 0, drifted_ahead, DUR);
-        assert_eq!(pts, captured);
-        assert!(pts < drifted_ahead.unwrap(), "re-anchoring to a fresh capture may step back");
+    fn a_fresh_frame_after_repeats_re_anchors_to_truth_even_though_it_steps_back() {
+        // A repeat is stamped at publish time, so it sits one capture latency ahead of what the next
+        // fresh frame will claim. Stepping back is intended: the client tolerates one past-due frame,
+        // and inheriting the offset would mis-time video against audio for the rest of the stream.
+        let now = 2_000_000_000i64;
+        let repeat = video_pts(false, 1_000_000_000, now, LEAD);
+        let captured = now - 40_000_000; // the fresh frame was captured before that repeat went out
+        let fresh = video_pts(true, captured, now + 5_000_000, LEAD);
+        assert!(fresh < repeat, "re-anchoring to a fresh capture may step back");
+        assert_eq!(repeat - fresh, 40_000_000, "by exactly the capture latency, no more");
     }
 
     /// The distinction the stall watchdog is built on: "never produced" must NOT look like "stopped".

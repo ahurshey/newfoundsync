@@ -27,6 +27,7 @@
        so `flatpak info`) reports THIS, not the crate version, so a stale entry here makes an
        installed build misreport itself. -->
   <releases>
+    <release version="0.0.6" date="2026-07-30"/>
     <release version="0.0.5" date="2026-07-28"/>
     <release version="0.0.4" date="2026-07-28"/>
     <release version="0.0.3" date="2026-07-28"/>

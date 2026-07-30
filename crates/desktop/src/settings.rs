@@ -86,3 +86,21 @@ pub fn load_encode_device() -> Option<newfoundsync_core::video::EncodeDevice> {
 pub fn save_encode_device(d: newfoundsync_core::video::EncodeDevice) -> Result<(), String> {
     save_key("encode_device", d.as_str())
 }
+
+/// The saved xdg-desktop-portal ScreenCast restore token, if a screen share was previously
+/// approved. `None` ⇒ the portal will show its picker dialog.
+///
+/// Only meaningful on Linux, but kept unconditional like the rest of this module — it is a string
+/// in a text file, and cfg-ing it would buy nothing.
+pub fn load_screencast_token() -> Option<String> {
+    load_all().get("screencast_token").map(|s| s.to_string()).filter(|s| !s.is_empty())
+}
+
+/// Persist the portal's restore token so the next run does not re-prompt.
+///
+/// The token ROTATES: the portal issues a fresh one with every Start response and invalidates the
+/// old one, so this must be called on every successful session or the saved value goes stale and the
+/// dialog comes back.
+pub fn save_screencast_token(token: &str) -> Result<(), String> {
+    save_key("screencast_token", token)
+}

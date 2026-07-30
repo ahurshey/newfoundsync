@@ -389,6 +389,15 @@ async fn open_portal() -> Result<(u32, std::os::fd::OwnedFd)> {
         anyhow!("the desktop portal refused a ScreenCast session ({e}) — is xdg-desktop-portal-kde \
                  (or -gnome, matching your desktop) installed?")
     })?;
+    // Reuse a previously granted share, if we have one. This is what stops the picker appearing on
+    // every single start: with a valid token and PersistMode::ExplicitlyRevoked the portal replays
+    // the earlier choice silently. It can only ever be an OPTIMISATION -- there is no way to
+    // bootstrap consent unattended, so the first run always prompts, and a stale or revoked token
+    // simply means the dialog comes back.
+    let saved = crate::settings::load_screencast_token();
+    if saved.is_some() {
+        tracing::debug!("reusing a saved screen-share approval; the portal should not prompt");
+    }
     proxy
         .select_sources(
             &session,
@@ -397,8 +406,8 @@ async fn open_portal() -> Result<(u32, std::os::fd::OwnedFd)> {
                 .set_cursor_mode(CursorMode::Embedded)
                 .set_sources(SourceType::Monitor | SourceType::Window)
                 .set_multiple(false)
-                .set_restore_token(None)
-                .set_persist_mode(PersistMode::DoNot),
+                .set_restore_token(saved.as_deref())
+                .set_persist_mode(PersistMode::ExplicitlyRevoked),
         )
         .await
         .map_err(|e| anyhow!("portal SelectSources failed: {e}"))?;
@@ -411,6 +420,20 @@ async fn open_portal() -> Result<(u32, std::os::fd::OwnedFd)> {
         .map_err(|e| {
             anyhow!("screen sharing was not granted ({e}) — the portal dialog was dismissed or denied")
         })?;
+    // The token ROTATES on every Start: the portal hands back a new one and invalidates whatever we
+    // sent. Failing to re-save it is a silent regression -- capture keeps working today and the
+    // dialog quietly returns tomorrow -- so save it before anything else can fail.
+    match response.restore_token() {
+        Some(tok) => {
+            if let Err(e) = crate::settings::save_screencast_token(tok) {
+                tracing::warn!("couldn't save the screen-share approval: {e}");
+            } else {
+                tracing::info!("[capture] screen-share approval saved; later runs won't re-prompt");
+            }
+        }
+        // Not every backend implements persistence. Nothing breaks; it just prompts each time.
+        None => tracing::debug!("the portal returned no restore token; it will prompt again"),
+    }
     let stream = response
         .streams()
         .first()

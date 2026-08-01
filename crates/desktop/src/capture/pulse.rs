@@ -12,9 +12,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
+use newfoundsync_core::config::FRAME_DURATION_MS;
 use psimple::Simple;
 use pulse::callbacks::ListResult;
 use pulse::context::{Context, FlagSet as ContextFlagSet, State as ContextState};
@@ -269,8 +270,33 @@ impl PulseCapture {
                 let mut scratch: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 2);
                 let mut reads: u64 = 0;
                 let mut peak: i32 = 0;
+                // KEEP THE TIMELINE ALIVE WHILE THE APP IS QUIET.
+                //
+                // A per-app tap is attached to one sink-input, and a sink-input that is not playing
+                // delivers NOTHING — not zeros. Pause a video, switch tabs, let a track end, and
+                // PulseAudio simply stops handing us data. Without this the whole server stops
+                // publishing: every connected client starves at the same instant, the stall watchdog
+                // fires ("AUDIO HAS STOPPED"), and the clients do not recover on their own — they
+                // need a page reload, which is exactly what was reported from three devices at once.
+                //
+                // The whole-system monitor never shows this, because an idle sink still renders
+                // zeros. So the per-app path has to synthesise what the monitor gets for free: after
+                // a short grace period, emit silent frames on the normal 20 ms cadence until real
+                // audio comes back. This mirrors the Windows process-capture path, which silence-pads
+                // on underrun for the same reason.
+                let silence = [0i16; FRAME_SAMPLES];
+                let frame_dur = Duration::from_millis(FRAME_DURATION_MS as u64);
+                // Wait this long after the last real frame before synthesising. Generous enough that
+                // ordinary delivery jitter never injects a spurious silent frame between two real
+                // ones (which would be an audible click and an extra 20 ms of timeline).
+                let quiet_grace = frame_dur * 3;
+                let mut next_due = Instant::now() + quiet_grace;
+                let mut padding = false;
                 while !stop_t.load(Ordering::Relaxed) {
-                    match conn.mainloop.iterate(true) {
+                    // NON-blocking: a blocking iterate parks here until PulseAudio has something to
+                    // say, and a corked sink-input says nothing — so the padding below would never
+                    // get to run, which is the whole point of it.
+                    match conn.mainloop.iterate(false) {
                         IterateResult::Success(_) => {}
                         IterateResult::Quit(_) => break,
                         IterateResult::Err(e) => {
@@ -304,6 +330,7 @@ impl PulseCapture {
                         peak = peak.max((*s as i32).abs());
                     }
                     pending.extend_from_slice(&scratch);
+                    let had_data = !scratch.is_empty();
                     while pending.len() >= FRAME_SAMPLES {
                         on_frame(&pending[..FRAME_SAMPLES]);
                         pending.drain(..FRAME_SAMPLES);
@@ -314,6 +341,32 @@ impl PulseCapture {
                             );
                             peak = 0;
                         }
+                    }
+                    if had_data {
+                        // Real audio resets the clock; padding only starts after a fresh grace period.
+                        if padding {
+                            tracing::info!("[capture] per-app: audio resumed, stopped padding silence");
+                            padding = false;
+                        }
+                        next_due = Instant::now() + quiet_grace;
+                    } else if Instant::now() >= next_due {
+                        if !padding {
+                            // INFO, not debug: this is the difference between "the app is paused" and
+                            // "capture is broken", and it is the first thing to check when a listener
+                            // says the sound went away.
+                            tracing::info!(
+                                "[capture] per-app: the app went quiet — sending silence to keep \
+                                 clients in sync (audio returns on its own when it plays again)"
+                            );
+                            padding = true;
+                        }
+                        on_frame(&silence);
+                        next_due += frame_dur;
+                    }
+                    if !had_data {
+                        // Non-blocking iterate would otherwise spin a core. Well under one frame, so
+                        // the padding cadence above stays accurate.
+                        thread::sleep(Duration::from_millis(2));
                     }
                 }
                 let _ = stream.disconnect();

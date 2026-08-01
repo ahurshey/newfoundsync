@@ -239,6 +239,14 @@ const MSG_SET_TRIM: u8 = 0x23;
 /// of only the value the server commanded (which is 0 until the operator touches it).
 const MSG_CLIENT_SYNC: u8 = 0x24;
 
+/// Server→client: reset this client's OWN sync trim to 0 and clear its "aligned" state. No payload.
+///
+/// Distinct from [`MSG_SET_TRIM`] 0, which only clears the SERVER's offset — the device's own
+/// calibration trim is local state the server cannot otherwise reach, and it is where a calibrated
+/// device keeps its whole speaker-output-latency compensation. Resetting sync from the GUI means
+/// both: this message, plus the server's own offset going to 0.
+const MSG_RESET_SYNC: u8 = 0x25;
+
 // --- Web-client cast (uplink relay) — only meaningful when the active source is WebUplink. ---
 /// C→S: a casting client's Opus packet. `[0x30][opus bytes]` (server stamps PTS, re-broadcasts).
 const MSG_UP_AUDIO: u8 = 0x30;
@@ -360,6 +368,12 @@ pub fn set_trim_msg(ms: i32) -> Vec<u8> {
     m.push(MSG_SET_TRIM);
     m.extend_from_slice(&ms.to_le_bytes());
     m
+}
+
+/// Build a server→client [`MSG_RESET_SYNC`] frame (tag only, no payload).
+/// Exposed so the GUI's per-client and "Reset all" buttons can clear a device's own trim.
+pub fn reset_sync_msg() -> Vec<u8> {
+    vec![MSG_RESET_SYNC]
 }
 
 /// Build a server→client [`MSG_CAST_GRANT`]. On grant, carries the server's encode targets the

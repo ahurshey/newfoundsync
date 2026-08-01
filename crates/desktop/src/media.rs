@@ -324,6 +324,20 @@ pub struct MediaOptions {
     pub encoder: EncoderBackend,
     /// Where video encodes (GPU / CPU / Auto). Audio is unaffected.
     pub encode_device: EncodeDevice,
+    /// A/V offset in NANOSECONDS, added to every audio PTS. Positive = audio plays LATER.
+    ///
+    /// Shared and read per frame so the operator can tune it by ear while the stream runs — an
+    /// Apply-and-restart cycle makes a control like this unusable, because judging lip-sync needs
+    /// continuous playback.
+    ///
+    /// It exists because the audio and video we capture do not describe the same instant, and the
+    /// gap is not derivable. A player lip-syncs its own output, so the frame on screen at time T
+    /// matches the sound HEARD at T — which was written to the sink earlier, at T - L. The monitor
+    /// hands us that audio at write time, so our audio runs L ahead of our video, and L depends on
+    /// the sound card, the playing app's buffering and the compositor. PipeWire reports 0 usec for
+    /// every latency here, so there is nothing honest to read it from. Screen-capture tools all
+    /// solve this the same way — OBS calls it "audio sync offset".
+    pub av_offset_ns: Arc<AtomicI64>,
 }
 
 /// Resolve the requested encoder against what this BUILD can actually do, once, before anything
@@ -416,6 +430,7 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
         let mut encoder = Encoder::new(opts.codec, opts.bitrate).context("build audio encoder")?;
         let audio_pub = audio_tx.clone();
         let audio_health = health.clone();
+        let av_offset = opts.av_offset_ns.clone();
         let mut enc_err = LogThrottle::new();
         let on_frame = move |frame: &[i16]| {
             // When the FIRST sample in this frame was captured. The frame spans the 20 ms BEFORE the
@@ -442,7 +457,9 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
             // FFI callback (cpal/WGC) — trap panics so they can't unwind across C.
             let _ = std::panic::catch_unwind(AssertUnwindSafe(|| match encoder.encode(frame) {
                 Ok(payload) => {
-                    let pts = capture_ns + lead_ns;
+                    // + the operator's A/V offset (see MediaOptions::av_offset_ns). Read per frame,
+                    // so dragging the slider re-times the stream immediately.
+                    let pts = capture_ns + lead_ns + av_offset.load(Ordering::Relaxed);
                     let mut msg = Vec::with_capacity(9 + payload.len());
                     msg.push(MSG_AUDIO);
                     msg.extend_from_slice(&pts.to_be_bytes());

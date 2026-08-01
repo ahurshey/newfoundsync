@@ -7,3 +7,6 @@ Terminal=false
 Type=Application
 Categories=AudioVideo;Audio;Network;
 Keywords=audio;sync;lan;multiroom;cast;stream;
+# Matches the window's app_id (set via ViewportBuilder::with_app_id) so X11 sessions and any
+# compositor that keys off WM_CLASS map the window to this entry — and to this icon.
+StartupWMClass=ca.newfoundsync.Newfoundsync

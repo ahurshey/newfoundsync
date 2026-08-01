@@ -87,6 +87,20 @@ pub fn save_encode_device(d: newfoundsync_core::video::EncodeDevice) -> Result<(
     save_key("encode_device", d.as_str())
 }
 
+/// The saved A/V offset in milliseconds (audio against video). `None` ⇒ 0.
+///
+/// Worth persisting because it is a property of the MACHINE — its sound card, its compositor, the
+/// buffering of whatever plays the media — not of a session. Having to re-find it by ear on every
+/// launch would make it useless.
+pub fn load_av_offset_ms() -> Option<i32> {
+    load_all().get("av_offset_ms").and_then(|v| v.parse::<i32>().ok()).map(|v| v.clamp(-500, 500))
+}
+
+/// Persist the A/V offset (preserving other settings).
+pub fn save_av_offset_ms(ms: i32) -> Result<(), String> {
+    save_key("av_offset_ms", &ms.clamp(-500, 500).to_string())
+}
+
 /// The saved xdg-desktop-portal ScreenCast restore token, if a screen share was previously
 /// approved. `None` ⇒ the portal will show its picker dialog.
 ///

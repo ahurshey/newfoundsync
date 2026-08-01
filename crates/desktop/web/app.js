@@ -37,6 +37,7 @@ const MSG_SET_VOLUME = 0x20; // server→client: set this device's remote volume
 const MSG_HELLO = 0x21; // client→server: identify with a stable id + friendly name
 const MSG_SET_TRIM = 0x23; // server→client: set this device's sync offset, ms (i32 LE)
 const MSG_CLIENT_SYNC = 0x24; // client→server: report this device's ACTUAL effective sync, ms (i32 LE)
+const MSG_RESET_SYNC = 0x25; // server→client: clear this device's OWN trim back to 0 (no payload)
 const MSG_CALIB_CTRL = 0x22; // server↔client: calibration orchestration (ROLE / STATUS sub-types)
 const MSG_UP_AUDIO = 0x30; // client→server: a casting client's Opus packet [0x30][opus]
 const MSG_UP_VIDEO = 0x31; // client→server: a casting client's H.264 access unit [0x31][key u8][annexb] (Phase 2)
@@ -82,6 +83,7 @@ const els = {
   trimval: document.getElementById("trimval"),
   trimdown: document.getElementById("trimdown"),
   trimup: document.getElementById("trimup"),
+  trimreset: document.getElementById("trimreset"),
   stage: document.getElementById("stage"),
   vlogo: document.getElementById("vlogo"),
   vlogoimg: document.getElementById("vlogoimg"),
@@ -314,6 +316,24 @@ els.trim.addEventListener("input", () => { setTrim(parseFloat(els.trim.value)); 
 els.trimdown.addEventListener("click", () => { setTrim(trimMs - 10); markAligned(effTrimMs() !== 0); });
 els.trimup.addEventListener("click", () => { setTrim(trimMs + 10); markAligned(effTrimMs() !== 0); });
 
+// Back to square one: this device's OWN trim to 0, and NOT aligned any more.
+//
+// Clearing `aligned` is the half that is easy to forget and impossible to see. A calibrated device
+// folds its whole speaker output latency into the trim, and both the audio anchor and videoPresentMs
+// branch on the flag. Zeroing the slider while leaving the flag set would claim a compensation that
+// is no longer in the trim — audio would sit one output latency off and video would follow it.
+//
+// Does NOT touch the server's pushed offset (remoteTrimMs): that belongs to the operator, and the
+// server would re-push it on the next state sweep anyway. The server's own reset clears both ends.
+function resetSync(note) {
+  setTrim(0); //          re-anchors audio, flushes the video queue, reports the new sync upstream
+  markAligned(false); //  re-enables the output-latency model for an un-calibrated device
+  // Replaces any stale "✔ Aligned to the reference…" text, which would otherwise still be sitting
+  // there claiming an alignment that was just thrown away.
+  setCalibStatus(note || "");
+}
+els.trimreset.addEventListener("click", () => resetSync("Sync reset to 0 ms."));
+
 // ---- Light/dark theme toggle (persisted; default dark). The <head> pre-applies the saved
 // theme before paint to avoid a flash; here we keep the button icon + theme-color meta in sync.
 function applyTheme(light) {
@@ -442,11 +462,18 @@ let outLatMs = 0; // cached speaker output latency (ms); modeled in the anchor o
 let audioDecoder = null;
 let videoDecoder = null;
 let gotParams = false; // have we configured the video decoder from SPS/PPS yet?
-// Decoder accel: let the browser choose (hardware when good, software otherwise). Desktop
-// Chrome often lacks usable hardware H.264 in WebCodecs, so we fall back to software on
-// repeated errors instead of looping on a dead hardware path. (Async failures arrive via
-// the error callback, not the synchronous configure() — see onDecErr.)
-let videoAccel = "no-preference";
+// Decoder accel. ASK FOR HARDWARE first — this is the single biggest lever on a phone.
+//
+// A mid-range Android decoding 1080p in software is spending most of a CPU core on it: it heats up,
+// throttles, and the picture starts to stutter. The same phone has dedicated silicon that does it at
+// a fraction of the power — VP9 decoders are effectively universal on Android (YouTube depends on
+// them), while hardware AV1 only appears on recent SoCs. "no-preference" leaves the choice to the
+// browser and, in practice, it does not always take the hardware path.
+//
+// Safe to ask: it is a HINT, the configure() call is wrapped in a try/catch that retries without it,
+// and a hardware decoder that fails intermittently still escalates to software after
+// VDEC_ERR_LIMIT errors (see onDecErr) rather than looping on a dead path.
+let videoAccel = "prefer-hardware";
 let aPlayhead = null; // AudioContext time of the next audio frame (gapless scheduler)
 let liveSources = new Set(); // scheduled playout AudioBufferSourceNodes, so re-anchor/stop can cancel them
 let firstPlayoutAc = null; // ac time the first buffered audio is scheduled to sound
@@ -632,7 +659,7 @@ function onStart() {
   stopping = false;
   everPlayed = false; // a fresh, user-initiated connect → the buffering bar may show again
   resetAudioStallClock(); // honour the grace period from NOW, not from a previous session
-  videoAccel = "no-preference"; // re-evaluate decoder accel each fresh start (don't stay stuck on software)
+  videoAccel = "prefer-hardware"; // re-evaluate each fresh start — don't stay stuck on software
   vDecErrStreak = 0;
   vGoodRun = 0;
   videoAvccMode = false;
@@ -1098,6 +1125,14 @@ function onMessage(ev) {
     return;
   }
 
+  if (type === MSG_RESET_SYNC) {
+    // The operator pressed reset for this device (or "Reset all") in the server GUI. Same path as
+    // the client's own ⟲ button, so a server-driven reset and a local one cannot diverge. The
+    // server clears ITS offset separately via MSG_SET_TRIM 0; this half clears the device's own trim
+    // and its aligned flag, which the server cannot reach any other way.
+    resetSync("Sync reset to 0 ms by the server.");
+    return;
+  }
 
   if (type === MSG_CAST_GRANT) {
     // Reply to our CAST_REQUEST: [0x33][grant][videoOn][w u16][h u16][fps][vKbps u32][aBps u32][sampleRate u32][channels]

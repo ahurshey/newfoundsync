@@ -84,6 +84,11 @@ struct Cli {
     /// Audio is unaffected. Separate from --encoder, which picks the CODEC.
     #[arg(long, default_value = "auto")]
     encode_device: String,
+    /// Shift AUDIO against video, in milliseconds (-500..=500). Positive delays the audio, which is
+    /// the direction that fixes sound arriving BEFORE the picture. Omitted ⇒ the value saved from the
+    /// GUI slider, else 0.
+    #[arg(long)]
+    av_offset_ms: Option<i32>,
     /// Audio source: allapps (survives mute) | system | app | web (a web client casts up to here).
     #[arg(long, default_value = "allapps")]
     capture: String,
@@ -193,6 +198,13 @@ fn main() -> Result<()> {
     // without the `gui` feature (the headless Linux/server .deb) has no GUI at all → always
     // server-only, regardless of the flag.
     #[cfg(feature = "gui")]
+    // ONE handle, shared by the GUI slider and the audio producer. The CLI wins for this run if
+    // given, else the value the operator last tuned by ear (it is a property of the machine, so it
+    // belongs in settings rather than being re-found on every launch).
+    let av_offset_ns = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
+        cli.av_offset_ms.or_else(settings::load_av_offset_ms).unwrap_or(0).clamp(-500, 500) as i64
+            * 1_000_000,
+    ));
     if !cli.headless {
         return gui::run(
             port,
@@ -205,6 +217,7 @@ fn main() -> Result<()> {
                 buffer_ms,
                 codec,
                 bitrate: cli.bitrate,
+                av_offset_ns: av_offset_ns.clone(),
             },
         );
     }
@@ -223,6 +236,7 @@ fn main() -> Result<()> {
         buffer_ms,
         port,
         !cli.insecure_http,
+        av_offset_ns,
     )
 }
 
@@ -238,6 +252,7 @@ fn run_headless(
     buffer_ms: i64,
     port: u16,
     use_tls: bool,
+    av_offset_ns: std::sync::Arc<std::sync::atomic::AtomicI64>,
 ) -> Result<()> {
     let media = media::start(MediaOptions {
         name: name.clone(),
@@ -247,6 +262,7 @@ fn run_headless(
         buffer_ms,
         capture_source,
         video,
+        av_offset_ns,
         video_target: media::VideoTarget::PrimaryMonitor, // headless: whole monitor (no window picker)
         encoder,
         encode_device,

@@ -272,7 +272,10 @@ window.__NFS_BUILD = "__NFS_BUILD__";
     -webkit-appearance: none; appearance: none; flex: 1; min-width: 0; height: 32px;
     background: transparent; cursor: pointer; outline: none; margin: 0;
   }
-  #vol { --fill: var(--accent); max-width: 260px; }
+  /* No max-width: Volume is the primary control, so it runs the full row — which lands its right
+     edge exactly where the Sync row's ⟲ reset button ends, since both rows are the same flex box.
+     (It used to stop at 260px, leaving it visibly short of everything below it.) */
+  #vol { --fill: var(--accent); }
   #trim { --fill: var(--ok); }
   input[type=range]::-webkit-slider-runnable-track {
     height: 6px; border-radius: 999px; border: 1px solid var(--border); box-shadow: var(--slot);
@@ -391,6 +394,7 @@ window.__NFS_BUILD = "__NFS_BUILD__";
           <input id="trim" type="range" min="-2000" max="3000" step="1" value="0" aria-label="Sync trim" />
           <button id="trimup" class="ctlbtn small" title="Delay 10 ms" aria-label="Later">+</button>
           <span id="trimval">0 ms</span>
+          <button id="trimreset" class="ctlbtn small" title="Reset sync to 0 ms (clears calibration on this device)" aria-label="Reset sync to zero">⟲</button>
         </div>
         <div class="ctlhint">Drag <b>Sync</b> until devices line up by ear (+ = later, − = earlier), or tap <b>Calibrate</b> to auto-align by mic in the same room.</div>
         <div class="ctlrow actions">

@@ -63,10 +63,19 @@ const RES_LABELS: [(&str, &str); 4] = [
     ("1440p", "1440p"),
     ("2160p (4K)", "2160p"),
 ];
-const ENC_LABELS: [(&str, &str); 2] = [
-    ("AV1 (royalty-free)", "av1"),
-    ("VP9 (royalty-free)", "vp9"),
-];
+const ENC_LABELS: [(&str, &str); 2] = [("AV1", "av1"), ("VP9", "vp9")];
+
+/// What each codec is actually FOR, shown on hover. Both are royalty-free — that is why these are
+/// the only two offered — so saying it in the label told the operator nothing about which to pick.
+/// This does.
+const AV1_HINT: &str =
+    "Best picture for the bandwidth, and the only one that can encode on the GPU (Windows). But most \
+     phones have no AV1 decoding silicon, so they decode it on the CPU — that's the one that gets \
+     hot and stutters.";
+const VP9_HINT: &str =
+    "Choose this for phones. Almost every Android has a hardware VP9 decoder, so playback is far \
+     lighter and cooler there, and it plays on older devices that show a black screen on AV1. Costs \
+     more CPU on THIS machine (it encodes on the CPU only) and a little more bandwidth.";
 
 /// Initial server config (from CLI flags) used to seed the GUI + first stream.
 pub struct InitialConfig {
@@ -77,6 +86,9 @@ pub struct InitialConfig {
     pub buffer_ms: i64,
     pub codec: CodecKind,
     pub bitrate: i32,
+    /// Shared A/V offset (ns) — see `MediaOptions::av_offset_ns`. Held as an Arc rather than a value
+    /// so it survives an Apply: the stream restarts, the handle (and the operator's tuning) does not.
+    pub av_offset_ns: std::sync::Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl InitialConfig {
@@ -87,6 +99,7 @@ impl InitialConfig {
             bitrate: self.bitrate,
             lead_ms: config::DEFAULT_LEAD_MS,
             buffer_ms: self.buffer_ms,
+            av_offset_ns: self.av_offset_ns.clone(),
             capture_source: self.capture_source,
             video: self.video,
             video_target: VideoTarget::PrimaryMonitor, // CLI/initial stream starts on the monitor
@@ -229,6 +242,10 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         clients_reg,
         cast: cast.clone(),
         master_vol: 1.0,
+        master_muted: false,
+        av_offset_ms: (init.av_offset_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000)
+            as i32,
+        av_offset_ns: init.av_offset_ns.clone(),
         client_vols: HashMap::new(),
         client_trims: HashMap::new(),
         client_names: HashMap::new(),
@@ -253,8 +270,6 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         apps_rx: None,
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         refreshing: false,
-        #[cfg(target_os = "linux")]
-        last_app_scan: None,
         selected_pid,
         selected_name: String::new(),
         video_kind,
@@ -296,8 +311,22 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         // horizontally; both body columns scroll vertically and the QR shrinks, so going below the
         // content's natural height just scrolls instead of clipping.
         .with_min_inner_size([640.0, 240.0])
-        .with_title("Newfoundsync server");
-    // Brand the window/taskbar with the Newfoundland badge.
+        .with_title("Newfoundsync server")
+        // WAYLAND ICONS COME FROM HERE, NOT FROM with_icon BELOW.
+        //
+        // Wayland has no protocol for a client to hand the compositor a window icon (the recent
+        // xdg-toplevel-icon-v1 aside, which this stack does not speak). Instead the compositor
+        // matches the toplevel's app_id against an installed .desktop file and uses that file's
+        // Icon=. Without an app_id set, winit supplies its own default, KWin finds no matching
+        // entry, and the TITLEBAR falls back to a generic placeholder — the Wayland logo — while the
+        // taskbar and application menu still look right, because those read the .desktop file
+        // directly and never needed the window at all. That asymmetry is the whole symptom.
+        //
+        // The string must match the .desktop basename EXACTLY (and the Flatpak app id, which is the
+        // same): flatpak/ca.newfoundsync.Newfoundsync.desktop.
+        .with_app_id(APP_ID);
+    // X11 and Windows DO take a pixel icon from the client — Wayland ignores this one. Keep both:
+    // the app must look right under either session type.
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../../../branding/icon-256.png")) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
@@ -391,7 +420,43 @@ const UI_ZOOM_BASE: f32 = 0.6;
 /// Horizontal inset between the window edge and the panels, in points. Deliberately small — the goal
 /// is just to stop the cards touching the frame (and to stop the leftmost glyphs being clipped), not
 /// to add a wide gutter that eats space we spent effort reclaiming.
+/// The application id, in the reverse-DNS form the desktop stack expects. Must stay identical to
+/// the Flatpak app id, the `.desktop` file's basename, and the installed icon's basename — a
+/// mismatch in any of them is what makes a desktop show a placeholder icon instead of ours.
+const APP_ID: &str = "ca.newfoundsync.Newfoundsync";
+
 const EDGE_PAD: f32 = 10.0;
+
+/// Width of a per-client Vol / Sync slider, in points. Two of them plus their labels and buttons
+/// have to fit a client row even at the window's 880px minimum width.
+const CLIENT_SLIDER_W: f32 = 88.0;
+
+/// Space reserved at the end of the master row for its "100%" / " off" readout, so the slider can
+/// take everything else. Sized for the widest string it has to hold, plus the item spacing.
+const MASTER_READOUT_W: f32 = 52.0;
+
+/// Rail thickness for the master slider, in points — three times the 6.0 the rest of the UI uses.
+/// At full window width a hairline rail reads as a divider rather than something you grab, and this
+/// is the one control that scales every device at once.
+/// Everything on a client row that ISN'T the two sliders: the mute toggle, the "Vol" and "Sync"
+/// captions, the percentage and millisecond readouts, the reset button, and the spacing between
+/// them. Subtracted from the row width so the two bars can split what's actually left.
+///
+/// Deliberately generous — over-reserving costs a few points of bar, while under-reserving pushes
+/// the reset button off the end of the row, and egui does not wrap a horizontal layout.
+const CLIENT_ROW_FIXED_W: f32 = 290.0;
+
+const MASTER_RAIL_H: f32 = 18.0;
+
+/// Row height for the master slider. egui derives the handle radius from the row height
+/// (`rect.height() / 2.5`), so raising this with the rail keeps the grab target in proportion
+/// instead of leaving a small dot riding a thick bar.
+const MASTER_ROW_H: f32 = 34.0;
+
+/// Least room right of the QR worth placing the master into. Below this it goes on its own row:
+/// mute button + a usable slider + the readout do not fit in less, and a horizontal layout that
+/// doesn't fit does not shrink — it runs off the edge of the window.
+const MASTER_MIN_INLINE: f32 = 260.0;
 
 /// Apply the theme + desktop-tuned spacing/fonts/zoom once at startup.
 fn setup_style(ctx: &egui::Context) {
@@ -605,6 +670,13 @@ struct ServerApp {
     cast: webserver::CastState,
     /// Server master volume (0..=1): scales every client's effective remote volume.
     master_vol: f32,
+    /// Master mute. Kept SEPARATE from `master_vol` so muting preserves the level to come back to;
+    /// folded into the pushed gain in `push_client_state`, exactly like a per-client mute.
+    master_muted: bool,
+    /// Live A/V offset in MILLISECONDS (what the slider edits). Mirrored into `av_offset_ns` in
+    /// nanoseconds on change, which is what the audio producer actually reads.
+    av_offset_ms: i32,
+    av_offset_ns: std::sync::Arc<std::sync::atomic::AtomicI64>,
     /// Per-client (pre-master) volume, keyed by the client's *stable* id so it
     /// survives reconnects. Absent ⇒ 1.0 (full) for a client we haven't touched.
     client_vols: HashMap<String, f32>,
@@ -655,9 +727,6 @@ struct ServerApp {
     /// When the Linux app list was last re-enumerated. Windows windows persist, so a manual
     /// refresh is fine there; a Linux list is a snapshot of what is *playing this instant*, so it
     /// has to re-scan on a timer or it will show apps that already stopped and miss ones that
-    /// just started.
-    #[cfg(target_os = "linux")]
-    last_app_scan: Option<std::time::Instant>,
     selected_pid: Option<u32>,
     selected_name: String,
     // VIDEO SOURCE: off / whole screen / a specific window — its own picker, like audio.
@@ -696,7 +765,7 @@ impl ServerApp {
             for e in reg.values_mut() {
                 let per = self.client_vols.get(&e.stable_id).copied().unwrap_or(1.0);
                 let muted = self.client_muted.get(&e.stable_id).copied().unwrap_or(false);
-                let eff = if muted {
+                let eff = if muted || self.master_muted {
                     0.0
                 } else {
                     (per * self.master_vol).clamp(0.0, 1.0)
@@ -992,6 +1061,7 @@ impl ServerApp {
             bitrate: self.bitrate,
             lead_ms: config::DEFAULT_LEAD_MS,
             buffer_ms: config::clamp_buffer_ms(self.buffer_ms as i64),
+            av_offset_ns: self.av_offset_ns.clone(),
             capture_source,
             video,
             video_target,
@@ -1009,7 +1079,7 @@ impl ServerApp {
     /// Full-width "connect" strip under the header: the URL plate (left) + the QR code,
     /// scan hint and one-time-cert disclosure (right). Read-only.
     fn ui_connect_strip(&mut self, ui: &mut egui::Ui, qr: &Option<egui::TextureHandle>) {
-        ui.horizontal_top(|ui| {
+        let inline_master = ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.label(
                     egui::RichText::new("Open this on any phone or PC on the same Wi-Fi:").color(c_dim()),
@@ -1067,7 +1137,10 @@ impl ServerApp {
                 });
             });
             ui.add_space(16.0);
-            ui.vertical(|ui| {
+            // The QR's drawn size varies with the window height, so the master can only line up with
+            // it by asking — hence the side length coming back out of this block.
+            let qr_side = ui.vertical(|ui| {
+                let mut side = 0.0;
                 if let Some(tex) = qr {
                     // The QR is the largest fixed block in the window, and drawn at its natural
                     // texture size it never yielded an inch — so in a short window it was pure
@@ -1076,7 +1149,7 @@ impl ServerApp {
                     const QR_MIN: f32 = 96.0;
                     const QR_SHARE: f32 = 0.34; // of the panel height, so it yields first
                     let natural = tex.size_vec2().x;
-                    let side = natural.min((ui.available_height() * QR_SHARE).max(QR_MIN));
+                    side = natural.min((ui.available_height() * QR_SHARE).max(QR_MIN));
                     ui.image(egui::load::SizedTexture::new(tex.id(), egui::vec2(side, side)));
                 }
                 // Cert help folded into a hover (was a standalone "First time on a device?" line) to
@@ -1087,7 +1160,94 @@ impl ServerApp {
                          (Advanced -> proceed) — it's a self-signed certificate, needed so the \
                          browser allows playback.",
                     );
-            });
+                side
+            })
+            .inner;
+            // MASTER VOLUME lives up here, right of the QR, rather than inside the clients card.
+            //
+            // It is a LIVE control — it takes effect instantly, no Apply — and this strip is the one
+            // region that is always on screen. Down in the clients card it scrolled out of reach as
+            // soon as a few devices connected, which is the wrong behaviour for the control that
+            // mutes the whole house. It also fills the widest dead space in the window.
+            //
+            // Inline ONLY when the room is genuinely there. egui does not wrap a horizontal layout —
+            // it overflows — so on a narrow window (or a small screen, where the URL box and QR have
+            // already eaten the row) this would render past the window edge and simply not exist as
+            // far as the operator is concerned. Below the threshold it drops to its own row instead,
+            // which keeps it visible and full-width rather than clipped.
+            let room = ui.available_width();
+            let inline = room >= MASTER_MIN_INLINE;
+            if inline {
+                ui.add_space(20.0);
+                // Centred on the QR SQUARE, not on the whole QR column (which includes the "Scan to
+                // connect" caption) — the square is what the eye lines the bar up against. Allocating
+                // a region of exactly the QR's height and laying out across it with Align::Center
+                // does the centring from the real measurement, so it stays true as the QR resizes
+                // with the window.
+                // Centre the BAR on the QR's midline — not the label+bar group. The bar is what the
+                // eye pairs with the QR square; centring the group instead leaves the bar sitting
+                // below the QR's middle by half a label.
+                //
+                // Done as an explicit offset rather than a centred Layout: egui's Align::Center
+                // vertically centres ITEMS in a row, but a nested `vertical()` block is sized after
+                // it is placed, so it just lands at the cursor and the centring silently no-ops —
+                // measured on a 1920x1080 desktop, bar at y=177 against a QR midline of y=199.
+                let label_h = ui.text_style_height(&egui::TextStyle::Body);
+                let pad = (qr_side * 0.5 - (label_h + 4.0 + MASTER_ROW_H * 0.5)).max(0.0);
+                ui.vertical(|ui| {
+                    ui.add_space(pad);
+                    self.master_control(ui);
+                });
+            }
+            inline
+        })
+        .inner;
+        // Didn't fit beside the QR — give it the full width of its own row. Still above the columns,
+        // so it is still the always-visible control it was moved up here to be.
+        if !inline_master {
+            ui.add_space(8.0);
+            self.master_control(ui);
+        }
+    }
+
+    /// The master volume control: label above, mute + slider + readout beneath. One definition, used
+    /// both inline beside the QR and as its own row when the window is too narrow for that.
+    fn master_control(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Master").strong().color(c_text()));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(self.master_muted, if self.master_muted { "🔇" } else { "🔊" })
+                .on_hover_text(if self.master_muted {
+                    "Unmute everyone (restores the master level)"
+                } else {
+                    "Mute everyone instantly — the master level is kept"
+                })
+                .clicked()
+            {
+                self.master_muted = !self.master_muted;
+            }
+            // Fills whatever the window leaves, re-measured every frame, so the bar tracks a resize
+            // instead of sitting at a fixed length. Only the readout is reserved. The floor keeps it
+            // draggable once the URL box and QR have taken their share of a narrow window.
+            //
+            // The trade-off of a very long bar is that one pixel of drag becomes a very small step;
+            // if that proves fiddly the answer is keyboard nudging, not shortening the bar.
+            ui.spacing_mut().slider_rail_height = MASTER_RAIL_H;
+            ui.spacing_mut().interact_size.y = MASTER_ROW_H;
+            ui.spacing_mut().slider_width =
+                (ui.available_width() - MASTER_READOUT_W).max(CLIENT_SLIDER_W);
+            ui.add(egui::Slider::new(&mut self.master_vol, 0.0..=1.0).show_value(false))
+                .on_hover_text("Scales every client's volume — applies instantly");
+            ui.label(
+                egui::RichText::new(if self.master_muted {
+                    " off".to_string()
+                } else {
+                    format!("{:>3}%", (self.master_vol * 100.0).round() as i32)
+                })
+                .monospace()
+                .color(c_dim()),
+            );
         });
     }
 
@@ -1107,6 +1267,10 @@ impl ServerApp {
         let calibrating = self.calibrating;
         let mut do_calibrate = false; // set inside the card closure, acted on after it
         let mut do_stop_calib = false;
+        // Sync resets, deferred out of the card closure for the same reason: the client registry
+        // can't be locked while `self` is borrowed by the UI.
+        let mut reset_sync_for: Option<String> = None; // one device, by stable id
+        let mut do_reset_all = false;
         let mut do_stop_cast: Option<u64> = None; // caster's conn_id when the operator kicks it
         // The active web-caster (if any) — only its row shows the operator "Stop cast" control.
         let active_caster: Option<u64> = self.cast.lock().ok().and_then(|s| *s);
@@ -1132,15 +1296,6 @@ impl ServerApp {
                 ui.label(egui::RichText::new(format!("({clients_n})")).strong().color(c_accent()));
             });
             ui.add_space(6.0);
-            // Master volume — scales every client's remote (server-controlled) volume.
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Master").color(c_text2()));
-                ui.add(egui::Slider::new(&mut self.master_vol, 0.0..=1.0).show_value(false));
-                ui.label(
-                    egui::RichText::new(format!("{:>3}%", (self.master_vol * 100.0).round() as i32))
-                        .color(c_dim()),
-                );
-            });
             if snapshot.is_empty() {
                 ui.add_space(2.0);
                 ui.label(
@@ -1179,6 +1334,20 @@ impl ServerApp {
                         );
                     if resp.clicked() {
                         do_calibrate = true;
+                    }
+                    // Sits to the RIGHT of "Calibrate all" and is the undo for it. Enabled whenever
+                    // anything is connected — unlike calibration it needs no mics, no second device,
+                    // and no room: it is the way back to a known state when an alignment went wrong.
+                    if ui
+                        .add_enabled(!snapshot.is_empty(), egui::Button::new("Reset all"))
+                        .on_hover_text(
+                            "Reset every connected device's sync to 0 ms — clears the server \
+                             offsets and tells each device to drop its own calibration trim.",
+                        )
+                        .on_disabled_hover_text("No devices connected.")
+                        .clicked()
+                    {
+                        do_reset_all = true;
                     }
                     if !ready {
                         ui.label(
@@ -1258,7 +1427,18 @@ impl ServerApp {
                             }
                             let muted = self.client_muted.get(stable_id).copied().unwrap_or(false);
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().slider_width = 88.0; // fits two sliders + labels even at the 880px min width
+                                // Both bars grow with the window, like the master above them.
+                                //
+                                // Measured, not fixed: take the row's width, reserve what the
+                                // non-slider widgets need (mute, the two captions, both readouts,
+                                // the reset button and the gaps between them), and split the rest
+                                // between the two sliders — they share one `slider_width`, so it is
+                                // one number for both. CLIENT_SLIDER_W stays as the FLOOR, which is
+                                // what a narrow window falls back to rather than collapsing them to
+                                // an undraggable stub.
+                                let per_slider = ((ui.available_width() - CLIENT_ROW_FIXED_W) * 0.5)
+                                    .max(CLIENT_SLIDER_W);
+                                ui.spacing_mut().slider_width = per_slider;
                                 if ui
                                     .selectable_label(muted, if muted { "🔇" } else { "🔊" })
                                     .on_hover_text("Mute / unmute this device")
@@ -1300,6 +1480,16 @@ impl ServerApp {
                                 } else {
                                     "server-commanded offset (the device hasn't reported its actual sync yet)"
                                 });
+                                if ui
+                                    .button("⟲")
+                                    .on_hover_text(
+                                        "Reset this device's sync to 0 ms — clears BOTH the server \
+                                         offset and the device's own calibration trim.",
+                                    )
+                                    .clicked()
+                                {
+                                    reset_sync_for = Some(stable_id.clone());
+                                }
                             });
                             if !calib_status.is_empty() {
                                 let ok = calib_status.contains("aligned") || calib_status == "reference";
@@ -1342,6 +1532,30 @@ impl ServerApp {
                     let _ = e.ctrl_tx.send(webserver::cast_stop_msg());
                 }
             }
+        }
+        // A sync reset has TWO halves and needs both. Clearing our own offset only moves the value
+        // the server commands; a calibrated device keeps its whole speaker-latency compensation in
+        // its OWN trim, which lives in the browser and is reachable only by asking. Sending one
+        // without the other leaves the device sitting at a number nobody chose.
+        if do_reset_all || reset_sync_for.is_some() {
+            if let Ok(mut reg) = self.clients_reg.lock() {
+                for e in reg.values_mut() {
+                    if !do_reset_all && reset_sync_for.as_deref() != Some(e.stable_id.as_str()) {
+                        continue;
+                    }
+                    self.client_trims.insert(e.stable_id.clone(), 0);
+                    if e.ctrl_tx.send(webserver::reset_sync_msg()).is_ok() {
+                        // Mirror what the device will now report, so the row doesn't show the old
+                        // value until the next report lands.
+                        e.trim_ms = 0;
+                    }
+                }
+            }
+            *self.status.lock().unwrap() = if do_reset_all {
+                "Sync reset to 0 ms on every connected device.".into()
+            } else {
+                "Sync reset to 0 ms on that device.".into()
+            };
         }
         if do_calibrate {
             if !self.start_calibrate_all() {
@@ -1443,16 +1657,20 @@ impl ServerApp {
                     if ui
                         .radio_value(&mut self.source, SourceKind::App, PICK_LABEL)
                         .clicked()
-                        && self.video_kind == VideoSourceKind::WebCast
                     {
-                        self.video_kind = VideoSourceKind::Off;
+                        // Arriving at the per-app source: enumerate now, so the list is current the
+                        // first time it is opened rather than whatever was cached at startup.
+                        self.refresh_apps();
+                        if self.video_kind == VideoSourceKind::WebCast {
+                            self.video_kind = VideoSourceKind::Off;
+                        }
                     }
                     let label = if self.selected_pid.is_some() {
                         self.selected_name.clone()
                     } else {
                         "(choose)".to_string()
                     };
-                    egui::ComboBox::from_id_salt("app_pick")
+                    let combo = egui::ComboBox::from_id_salt("app_pick")
                         .selected_text(label)
                         .show_ui(ui, |ui| {
                             for a in &apps {
@@ -1478,6 +1696,12 @@ impl ServerApp {
                                 ui.label("(nothing is playing audio right now — start playback and it appears here)");
                             }
                         });
+                    // Opening the picker enumerates. With no background scan, this is what keeps the
+                    // list honest: what you are about to choose from was just read, not cached from
+                    // whenever the GUI last happened to look.
+                    if combo.response.clicked() {
+                        self.refresh_apps();
+                    }
                     let label = if self.refreshing { "⟳ Refreshing…" } else { "⟳ Refresh" };
                     if ui.add_enabled(!self.refreshing, egui::Button::new(label)).clicked() {
                         self.refresh_apps();
@@ -1652,9 +1876,8 @@ impl ServerApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Codec:").on_hover_text(
-                            "Both royalty-free. AV1 = best quality; uses your GPU's AV1 encoder if it \
-                             has one, else CPU (SVT-AV1). VP9 = a fallback that decodes on more older \
-                             devices (older Apple / Android / TVs) but encodes CPU-only (libvpx) here.",
+                            "Which video codec to send. Hover either option for what it's good for — \
+                             the short version is AV1 for quality, VP9 if a device won't play AV1.",
                         );
                         // VP9 links libvpx and lives behind the (non-default) `vp9` feature, so this
                         // build may be unable to honor it. Don't offer a choice we'd silently
@@ -1665,11 +1888,13 @@ impl ServerApp {
                         let vp9_available = cfg!(feature = "vp9");
                         let is_vp9 = self.enc_idx == 1 && vp9_available;
                         egui::ComboBox::from_id_salt("codec")
-                            .selected_text(if is_vp9 { "VP9 · royalty-free" } else { "AV1 · royalty-free" })
+                            .selected_text(if is_vp9 { ENC_LABELS[1].0 } else { ENC_LABELS[0].0 })
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.enc_idx, 0, "AV1 · royalty-free");
+                                ui.selectable_value(&mut self.enc_idx, 0, ENC_LABELS[0].0)
+                                    .on_hover_text(AV1_HINT);
                                 if vp9_available {
-                                    ui.selectable_value(&mut self.enc_idx, 1, "VP9 · royalty-free");
+                                    ui.selectable_value(&mut self.enc_idx, 1, ENC_LABELS[1].0)
+                                        .on_hover_text(VP9_HINT);
                                 } else {
                                     ui.add_enabled(false, egui::Button::new("VP9 · not in this build"))
                                         .on_disabled_hover_text(
@@ -1722,11 +1947,26 @@ impl ServerApp {
                                     }
                                 }
                             });
+                        // Not a stub for missing work — the hardware is the blocker, and saying so
+                        // is the difference between "they haven't got round to it" and "your GPU
+                        // cannot do this". Checked with vainfo on an Intel Iris Xe + RTX 3070:
+                        // AV1 and VP9 appear only as VAEntrypointVLD (decode). The sole ENCODE
+                        // entrypoints are MPEG2/H.264/HEVC/JPEG — the patent-encumbered codecs this
+                        // project removed on purpose. GPU AV1 encode needs Intel Arc / Meteor Lake+,
+                        // AMD RDNA3+, or NVIDIA Ada (RTX 40+); NVENC has never encoded VP9 at all.
                         #[cfg(not(target_os = "windows"))]
                         ui.label(
-                            egui::RichText::new("CPU (SVT-AV1) — GPU encoding is Windows-only")
+                            egui::RichText::new("CPU (SVT-AV1) — no GPU AV1/VP9 encoder here")
                                 .size(11.0)
                                 .color(c_dim()),
+                        )
+                        .on_hover_text(
+                            "Not a missing feature — a hardware one. Most GPUs can DECODE AV1/VP9 \
+                             but only encode H.264/HEVC, which this app doesn't ship. Hardware AV1 \
+                             encoding needs Intel Arc / Meteor Lake or newer, AMD RX 7000 or newer, \
+                             or an RTX 40-series; no NVIDIA GPU has ever encoded VP9. On Windows \
+                             the GPU path exists because Media Foundation exposes an AV1 encoder \
+                             where the hardware has one.",
                         );
                     });
                     ui.horizontal(|ui| {
@@ -1753,7 +1993,64 @@ impl ServerApp {
                     }
                 });
             }
+            // A/V OFFSET — live, deliberately NOT Apply-gated.
+            //
+            // Judging lip-sync needs continuous playback, so a control you can only change by
+            // restarting the stream is a control you cannot actually tune. This writes straight to
+            // the atomic the audio producer reads per frame.
+            //
+            // Only meaningful with video on, so it is hidden when video is off rather than sitting
+            // there inviting a change that does nothing.
+            if self.video_kind != VideoSourceKind::Off {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("A/V offset").color(c_text2())).on_hover_text(
+                        "Shifts AUDIO against video, for everyone, instantly. Drag right if you \
+                         hear the sound BEFORE the lips move; left if the sound lags the picture. \
+                         It is needed because a player writes its audio to the speakers ahead of \
+                         time, so the sound we capture belongs with a picture slightly later than \
+                         the one we capture with it — and nothing on the system reports that gap.",
+                    );
+                    let mut ms = self.av_offset_ms;
+                    ui.spacing_mut().slider_width = CLIENT_SLIDER_W * 2.0;
+                    if ui
+                        .add(egui::Slider::new(&mut ms, -500..=500).show_value(false))
+                        .changed()
+                    {
+                        self.set_av_offset(ms);
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{:>+5} ms", self.av_offset_ms))
+                            .monospace()
+                            .color(c_dim()),
+                    );
+                    if ui.button("⟲").on_hover_text("Back to 0 ms").clicked() {
+                        self.set_av_offset(0);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "+ = delay the audio (fixes sound arriving before the picture)",
+                    )
+                    .size(11.0)
+                    .color(c_dim()),
+                );
+            }
         });
+    }
+
+    /// Set the live A/V offset: the slider's ms, the nanoseconds the audio producer reads, and the
+    /// saved value, kept in step so a restart comes back where the operator left it.
+    fn set_av_offset(&mut self, ms: i32) {
+        self.av_offset_ms = ms.clamp(-500, 500);
+        self.av_offset_ns.store(
+            self.av_offset_ms as i64 * 1_000_000,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if let Err(e) = crate::settings::save_av_offset_ms(self.av_offset_ms) {
+            tracing::debug!("could not save the A/V offset: {e}");
+        }
     }
 
     /// CONFIG RAIL: the buffer card (the former "Advanced" section, now a plain Apply-gated card).
@@ -1874,21 +2171,14 @@ impl eframe::App for ServerApp {
             if self.refreshing {
                 ui.ctx().request_repaint_after(Duration::from_millis(50)); // pick up the result promptly
             }
-            // Linux only: keep the app list alive while the operator is choosing from it. Entries
-            // exist only while their app is playing, so a click-to-refresh list would routinely be
-            // wrong by the time it is read — you would press play and nothing would appear. Scan
-            // only while the per-app radio is the selection, so the idle GUI stays idle.
-            #[cfg(target_os = "linux")]
-            if self.source == SourceKind::App {
-                let due = self
-                    .last_app_scan
-                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
-                if due && !self.refreshing {
-                    self.last_app_scan = Some(std::time::Instant::now());
-                    self.refresh_apps();
-                }
-                ui.ctx().request_repaint_after(Duration::from_millis(500));
-            }
+            // NO periodic rescan. Linux entries exist only while their app is playing, so the list
+            // does go stale — but a scan every 2 s made the Refresh button flicker to "⟳ Refreshing…"
+            // and disable itself every couple of seconds, which reads as the UI fighting you, and it
+            // kept the GUI repainting forever on an idle machine.
+            //
+            // The list is refreshed where it actually matters instead: when you select the per-app
+            // source, when you open the picker (so what you are looking at was just enumerated), and
+            // whenever you press Refresh. That is what the button is for.
         }
         let busy = self.starting.load(Ordering::Relaxed);
         let st = self.status.lock().unwrap().clone();

@@ -19,9 +19,15 @@ pub mod relay;
 // capability meant "add screen capture to Linux" silently also meant "port the encoder".
 #[cfg(any(target_os = "windows", feature = "video-encode"))]
 pub mod codec;
-// VP9 links libvpx (a vcpkg-supplied C library), so it is behind the `vp9` feature — a fresh clone
-// builds without any vcpkg setup and gets AV1, which needs none.
-#[cfg(all(target_os = "windows", feature = "vp9"))]
+// VP9 links libvpx (a C library supplied at build time), so it is behind the `vp9` feature — a fresh
+// clone builds without any of that setup and gets AV1, which needs none.
+//
+// Gated on the FEATURE only, never the OS: the encoder is plain libvpx FFI with nothing
+// Windows-specific in it, and the earlier `target_os = "windows"` gate meant "ship VP9 on Linux"
+// silently also meant "port the encoder" — the same trap the AV1 encoder was in before it was gated
+// on capability instead. libvpx comes from vcpkg on Windows, the Freedesktop runtime in the Flatpak,
+// and a local build on macOS.
+#[cfg(feature = "vp9")]
 pub mod vp9;
 #[cfg(target_os = "windows")]
 pub mod capture;

@@ -64,7 +64,10 @@ modules:
       # GUI + linux-capture. The feature implies video-encode-source, so SVT-AV1 is COMPILED here
       # rather than downloaded: shiguredo_svt_av1 derives its prebuilt name as `ubuntu-{VERSION_ID}`,
       # and inside this SDK that resolves to `ubuntu-24.08`, which does not exist -> 404.
-      - $CARGO_HOME/bin/cargo build --release -p newfoundsync --features linux-capture
+      # vp9-bindgen, not vp9: the runtime ships libvpx 1.14.1 and the crate's pre-generated
+      # bindings stop at 1.13.0 — generating them against the real headers is the only safe
+      # pairing. libclang is already here for pipewire-sys/SVT-AV1, so it costs nothing extra.
+      - $CARGO_HOME/bin/cargo build --release -p newfoundsync --features linux-capture,vp9-bindgen
       - install -Dm755 target/release/newfoundsync /app/bin/newfoundsync
       - install -Dm644 flatpak/ca.newfoundsync.Newfoundsync.desktop /app/share/applications/ca.newfoundsync.Newfoundsync.desktop
       - install -Dm644 flatpak/ca.newfoundsync.Newfoundsync.metainfo.xml /app/share/metainfo/ca.newfoundsync.Newfoundsync.metainfo.xml

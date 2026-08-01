@@ -11,6 +11,7 @@
 //! On a machine with no VP9 hardware encoder (i.e. everything except recent Intel QuickSync),
 //! this is the only VP9 path — it runs on the CPU.
 
+use std::mem::MaybeUninit;
 use std::os::raw::c_int;
 
 use anyhow::{bail, Result};
@@ -40,10 +41,21 @@ impl Vp9Encoder {
         }
         unsafe {
             let iface = vpx_codec_vp9_cx();
-            let mut cfg: vpx_codec_enc_cfg_t = std::mem::zeroed();
-            if vpx_codec_enc_config_default(iface, &mut cfg, 0) != vpx_codec_err_t::VPX_CODEC_OK {
+            // libvpx FILLS each of these structs; we only supply the memory. `std::mem::zeroed()`
+            // cannot be used to do that here: bindgen renders the vpx enums as real Rust enums
+            // (`rustified_enum`), so an all-zero bit pattern is not a valid value of the struct, and
+            // mem::zeroed()'s validity check turns that into a non-unwinding panic —
+            //   "attempted to zero-initialize type `vpx_codec_enc_cfg`, which is invalid"
+            // — which ABORTS the process the moment the first frame is encoded. That is what made
+            // `--encoder vp9` unusable: it built fine and killed the server on the first frame.
+            // MaybeUninit::zeroed hands C the same zeroed memory without asserting that the bytes
+            // are a valid Rust value, and assume_init() is only reached after C has initialised it.
+            let mut cfg = MaybeUninit::<vpx_codec_enc_cfg_t>::zeroed();
+            if vpx_codec_enc_config_default(iface, cfg.as_mut_ptr(), 0) != vpx_codec_err_t::VPX_CODEC_OK
+            {
                 bail!("vpx_codec_enc_config_default(vp9) failed");
             }
+            let mut cfg = cfg.assume_init();
             cfg.g_w = width;
             cfg.g_h = height;
             cfg.g_timebase.num = 1;
@@ -59,9 +71,10 @@ impl Vp9Encoder {
                 .unwrap_or(4)
                 .min(16) as u32;
 
-            let mut ctx: vpx_codec_ctx_t = std::mem::zeroed();
+            // Same reasoning as `cfg` above — vpx_codec_enc_init_ver writes every field.
+            let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::zeroed();
             if vpx_codec_enc_init_ver(
-                &mut ctx,
+                ctx.as_mut_ptr(),
                 iface,
                 &cfg,
                 0,
@@ -70,17 +83,22 @@ impl Vp9Encoder {
             {
                 bail!("vpx_codec_enc_init(vp9) failed");
             }
+            let mut ctx = ctx.assume_init();
             // Realtime / low-latency controls (same as WebRTC's VP9 path).
             vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP8E_SET_CPUUSED as c_int, 7 as c_int);
             vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP8E_SET_ENABLEAUTOALTREF as c_int, 0 as c_int);
             vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP9E_SET_ROW_MT as c_int, 1 as c_int);
             vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as c_int, 1 as c_int);
 
-            let mut img: vpx_image_t = std::mem::zeroed();
-            if vpx_img_alloc(&mut img, vpx_img_fmt::VPX_IMG_FMT_I420, width, height, 1).is_null() {
+            // …and again for the image: vpx_img_alloc populates it.
+            let mut img = MaybeUninit::<vpx_image_t>::zeroed();
+            if vpx_img_alloc(img.as_mut_ptr(), vpx_img_fmt::VPX_IMG_FMT_I420, width, height, 1)
+                .is_null()
+            {
                 vpx_codec_destroy(&mut ctx);
                 bail!("vpx_img_alloc failed");
             }
+            let img = img.assume_init();
             let cw = w.div_ceil(2);
             let ch = h.div_ceil(2);
             Ok(Vp9Encoder {

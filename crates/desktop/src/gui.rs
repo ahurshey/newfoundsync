@@ -1544,11 +1544,21 @@ impl ServerApp {
                         continue;
                     }
                     self.client_trims.insert(e.stable_id.clone(), 0);
-                    if e.ctrl_tx.send(webserver::reset_sync_msg()).is_ok() {
-                        // Mirror what the device will now report, so the row doesn't show the old
-                        // value until the next report lands.
-                        e.trim_ms = 0;
-                    }
+                    let _ = e.ctrl_tx.send(webserver::reset_sync_msg());
+                    // DELIBERATELY does not touch `e.trim_ms`. That field records what was last
+                    // DELIVERED and is the dedup guard in push_client_state
+                    // (`if trim != e.trim_ms { send(set_trim_msg(trim)) }`), so zeroing it here made
+                    // the guard see 0 == 0 on the next frame and skip the SET_TRIM 0 entirely.
+                    //
+                    // That silently halved the reset: MSG_RESET_SYNC clears the device's OWN trim,
+                    // but the client deliberately leaves the server-pushed `remoteTrimMs` alone
+                    // ("the server's own reset clears both ends" — app.js), so nothing cleared it.
+                    // The operator saw "Sync reset to 0 ms", the slider read 0, and the device kept
+                    // playing at the old offset until its next report repainted the row.
+                    //
+                    // Leaving the mirror alone means the guard now sees 0 != old and pushes
+                    // SET_TRIM 0 on the very next frame, through the one code path that owns
+                    // delivering trims.
                 }
             }
             *self.status.lock().unwrap() = if do_reset_all {
@@ -2014,11 +2024,18 @@ impl ServerApp {
                     );
                     let mut ms = self.av_offset_ms;
                     ui.spacing_mut().slider_width = CLIENT_SLIDER_W * 2.0;
-                    if ui
-                        .add(egui::Slider::new(&mut ms, -500..=500).show_value(false))
-                        .changed()
-                    {
-                        self.set_av_offset(ms);
+                    let resp = ui.add(egui::Slider::new(&mut ms, -500..=500).show_value(false));
+                    // The LIVE value has to move on every change — that is the whole point of the
+                    // control, you tune it by ear against a running stream.
+                    if resp.changed() {
+                        self.apply_av_offset(ms);
+                    }
+                    // Saving is a different question. save_key() reads the whole settings file,
+                    // writes a temp copy and renames it, and `changed()` fires on every mouse-move
+                    // of a drag — so persisting there did that dance ~60 times a second for the
+                    // length of a drag. Once the drag ends is exactly as durable and costs one write.
+                    if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+                        self.save_av_offset();
                     }
                     ui.label(
                         egui::RichText::new(format!("{:>+5} ms", self.av_offset_ms))
@@ -2026,7 +2043,8 @@ impl ServerApp {
                             .color(c_dim()),
                     );
                     if ui.button("⟲").on_hover_text("Back to 0 ms").clicked() {
-                        self.set_av_offset(0);
+                        self.apply_av_offset(0);
+                        self.save_av_offset();
                     }
                 });
                 ui.label(
@@ -2040,14 +2058,20 @@ impl ServerApp {
         });
     }
 
-    /// Set the live A/V offset: the slider's ms, the nanoseconds the audio producer reads, and the
-    /// saved value, kept in step so a restart comes back where the operator left it.
-    fn set_av_offset(&mut self, ms: i32) {
+    /// Apply the A/V offset LIVE: the slider's ms and the nanoseconds the audio producer reads, kept
+    /// in step. Cheap enough to call on every frame of a drag — it is two stores.
+    fn apply_av_offset(&mut self, ms: i32) {
         self.av_offset_ms = ms.clamp(-500, 500);
         self.av_offset_ns.store(
             self.av_offset_ms as i64 * 1_000_000,
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    /// Persist the current offset. Split from [`Self::apply_av_offset`] because saving is a
+    /// read-modify-write of the settings file plus a rename, and doing that per mouse-move of a drag
+    /// is pure churn for a value only the final position of which matters.
+    fn save_av_offset(&self) {
         if let Err(e) = crate::settings::save_av_offset_ms(self.av_offset_ms) {
             tracing::debug!("could not save the A/V offset: {e}");
         }

@@ -194,32 +194,41 @@ fn main() -> Result<()> {
     // Effective HTTP port: an explicit --port wins, else the port last saved in the GUI,
     // else the built-in default. (The GUI lets users change + save this; it applies next launch.)
     let port = cli.port.or_else(settings::load_port).unwrap_or(config::DEFAULT_HTTP_PORT);
-    // The GUI build (default `gui` feature) opens the picker window unless --headless. A build
-    // without the `gui` feature (the headless Linux/server .deb) has no GUI at all → always
-    // server-only, regardless of the flag.
-    #[cfg(feature = "gui")]
     // ONE handle, shared by the GUI slider and the audio producer. The CLI wins for this run if
     // given, else the value the operator last tuned by ear (it is a property of the machine, so it
     // belongs in settings rather than being re-found on every launch).
+    //
+    // MUST stay above the #[cfg] below, and outside it: both paths use it (the headless call at the
+    // bottom of this function takes it too). It previously sat BETWEEN the attribute and the `if`,
+    // which silently re-targeted the attribute onto this `let` — so a headless build compiled the
+    // binding away and the gui::run call in, and `cargo check --no-default-features` failed with
+    // four errors. An intervening comment does not rebind an attribute, but an intervening
+    // STATEMENT does; the braced form below cannot be re-targeted that way.
     let av_offset_ns = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
         cli.av_offset_ms.or_else(settings::load_av_offset_ms).unwrap_or(0).clamp(-500, 500) as i64
             * 1_000_000,
     ));
-    if !cli.headless {
-        return gui::run(
-            port,
-            name,
-            gui::InitialConfig {
-                capture_source,
-                video,
-                encoder,
-                encode_device,
-                buffer_ms,
-                codec,
-                bitrate: cli.bitrate,
-                av_offset_ns: av_offset_ns.clone(),
-            },
-        );
+    // The GUI build (default `gui` feature) opens the picker window unless --headless. A build
+    // without the `gui` feature (the headless Linux/server package) has no GUI at all → always
+    // server-only, regardless of the flag.
+    #[cfg(feature = "gui")]
+    {
+        if !cli.headless {
+            return gui::run(
+                port,
+                name,
+                gui::InitialConfig {
+                    capture_source,
+                    video,
+                    encoder,
+                    encode_device,
+                    buffer_ms,
+                    codec,
+                    bitrate: cli.bitrate,
+                    av_offset_ns: av_offset_ns.clone(),
+                },
+            );
+        }
     }
     #[cfg(not(feature = "gui"))]
     if !cli.headless {

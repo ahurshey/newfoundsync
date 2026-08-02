@@ -172,3 +172,70 @@ jobs:
           name: playwright-report
           path: e2e/playwright-report
           retention-days: 7
+
+  # THE CONFIGURATIONS WE ACTUALLY SHIP.
+  #
+  # Everything above builds default features or --no-default-features. Neither of those is what any
+  # release artifact is built with, and two bugs escaped through exactly that gap in one afternoon:
+  #
+  #   * `vp9` did not imply `video-encode`, so `--features vp9` failed to compile anywhere the
+  #     encoder module was not already on — caught only by hand-building for macOS.
+  #   * widening the screen-capture cfg gates missed the one in main.rs, so --video stayed refused
+  #     on a build that had a working backend.
+  #
+  # The note on the windows job called the VP9 gap "known and accepted ... if VP9 ever stops being
+  # optional, add --features vp9". It has: VP9 now ships in all three artifacts.
+  shipped-linux:
+    name: cargo check the SHIPPED Linux config (Flatpak features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same list as encoder-check, plus what linux-capture and vp9 add: pipewire headers for the
+      # portal capture, and libvpx for the VP9 encoder. clang/libclang covers bindgen for both
+      # pipewire-sys and vp9-bindgen.
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libopus-dev libasound2-dev libpulse-dev \
+            cmake nasm git g++ libclang-dev libpipewire-0.3-dev libvpx-dev
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: shipped-linux
+
+      # vp9-bindgen rather than vp9: distro libvpx is newer than the crate's pre-generated 1.13.0
+      # bindings (the Flatpak runtime ships 1.14.1), and pairing those is a struct-layout mismatch.
+      - name: cargo check (linux-capture + vp9-bindgen — what the Flatpak builds)
+        run: cargo check -p newfoundsync --features linux-capture,vp9-bindgen
+
+  shipped-macos:
+    name: cargo check the SHIPPED macOS config
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Homebrew supplies opus + libvpx with .pc files, so pkg-config finds both and none of the
+      # OPUS_*/VPX_* escape hatches are needed here (the dev Mac needs them only because it has no
+      # Homebrew).
+      - name: Install system deps
+        run: brew install opus libvpx pkg-config
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: shipped-macos
+
+      # Compiles capture_mac.rs (ScreenCaptureKit) and the vp9 encoder. Cannot RUN capture in CI —
+      # Screen Recording is a TCC permission with no headless grant — so this is a compile gate only,
+      # which is precisely the class of bug that got through.
+      - name: cargo check (mac-capture + vp9)
+        run: cargo check -p newfoundsync --features mac-capture,vp9

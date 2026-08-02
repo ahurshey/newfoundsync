@@ -508,7 +508,7 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
     #[cfg(not(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture"), all(target_os = "macos", feature = "mac-capture"))))]
     if opts.video.is_some() && !web_uplink {
         tracing::warn!(
-            "this build has no local screen-capture backend; serving audio only (Linux needs \n             --features linux-capture)"
+            "this build has no local screen-capture backend; serving audio only (Linux needs \n             --features linux-capture, macOS --features mac-capture)"
         );
     }
 

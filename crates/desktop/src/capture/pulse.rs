@@ -350,6 +350,21 @@ impl PulseCapture {
                         }
                         next_due = Instant::now() + quiet_grace;
                     } else if Instant::now() >= next_due {
+                        // Never try to CATCH UP a long gap. `next_due += frame_dur` advances by one
+                        // frame per pass, so after a stall (thread descheduled, machine suspended,
+                        // a slow encode blocking on_frame) the loop would run flat out emitting one
+                        // silent frame per iteration until it caught up — a burst. Every frame in
+                        // that burst is stamped from `mono_now()` when it is PUBLISHED, so they all
+                        // claim nearly the same instant, and the client is handed a second of audio
+                        // to play at one moment. That is exactly the PTS collapse the 20 ms fragment
+                        // request was added to cure; re-creating it here would be a bad joke.
+                        //
+                        // So on a gap of more than a few frames, abandon the old schedule and resume
+                        // from now. The same guard the Windows process-capture path uses.
+                        let now = Instant::now();
+                        if now > next_due + quiet_grace {
+                            next_due = now;
+                        }
                         if !padding {
                             // INFO, not debug: this is the difference between "the app is paused" and
                             // "capture is broken", and it is the first thing to check when a listener

@@ -237,5 +237,12 @@ jobs:
       # Compiles capture_mac.rs (ScreenCaptureKit) and the vp9 encoder. Cannot RUN capture in CI —
       # Screen Recording is a TCC permission with no headless grant — so this is a compile gate only,
       # which is precisely the class of bug that got through.
-      - name: cargo check (mac-capture + vp9)
-        run: cargo check -p newfoundsync --features mac-capture,vp9
+      #
+      # vp9-bindgen, not vp9: Homebrew's libvpx is newer than the crate's pre-generated bindings
+      # (which stop at 1.13.0), so the plain feature panics in the build script here. The shipped
+      # .pkg avoids that by building libvpx 1.13.1 into ~/.local and pinning VPX_VERSION; reproducing
+      # that in CI would cost a source build for no extra coverage, because which BINDINGS are used
+      # does not change any of our code — the point of this job is that capture_mac.rs and the vp9
+      # module compile at all.
+      - name: cargo check (mac-capture + vp9-bindgen)
+        run: cargo check -p newfoundsync --features mac-capture,vp9-bindgen

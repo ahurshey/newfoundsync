@@ -18,7 +18,12 @@ description = "Lightweight LAN audio sharing with tight multiroom sync (desktop)
 # `--features vp9` when you specifically want `--encoder vp9`; see the VP9 section of the README.
 default = ["gui"]
 gui = ["dep:eframe", "dep:qrcode"]
-vp9 = ["dep:env-libvpx-sys"]
+# Implies `video-encode` because the encoder MODULE is a single enum that always carries an AV1
+# variant — there is no "VP9 only" shape of it. Without this, `--features vp9` on a platform where
+# video-encode isn't already on (macOS) compiles the vp9 module but not `video::codec`, and the build
+# dies on `unresolved import crate::video::codec`. Windows compiles codec unconditionally and the
+# Flatpak gets it via linux-capture, so macOS was the only configuration that showed it.
+vp9 = ["dep:env-libvpx-sys", "video-encode"]
 # `vp9-bindgen`: VP9, but with the libvpx bindings GENERATED from the headers actually installed,
 # instead of the crate's pre-generated set (which stops at 1.13.0).
 #

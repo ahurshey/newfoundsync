@@ -1,0 +1,16 @@
+# macOS: point the linker at the system Swift runtime.
+#
+# The `mac-capture` feature pulls in screencapturekit, which bridges through Swift, so the binary
+# ends up depending on libswift_Concurrency.dylib. Without an rpath the link SUCCEEDS and the
+# program dies at startup instead:
+#
+#   dyld: Library not loaded: @rpath/libswift_Concurrency.dylib ... no LC_RPATH's found
+#
+# /usr/lib/swift is where the OS keeps the runtime on every macOS this app supports. Set here rather
+# than in a build script so it applies to `cargo build`, `cargo test`, and the packaging script
+# alike — a flag you have to remember to pass is a flag that eventually gets forgotten.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]

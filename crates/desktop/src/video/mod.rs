@@ -36,5 +36,9 @@ pub mod capture;
 #[cfg(all(target_os = "linux", feature = "linux-capture"))]
 #[path = "capture_portal.rs"]
 pub mod capture;
+// …and the third backend, same surface again: ScreenCaptureKit on macOS.
+#[cfg(all(target_os = "macos", feature = "mac-capture"))]
+#[path = "capture_mac.rs"]
+pub mod capture;
 #[cfg(target_os = "windows")]
 pub mod mf_encoder;

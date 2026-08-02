@@ -173,10 +173,10 @@ fn main() -> Result<()> {
         // The web-uplink exception is real, not a courtesy: the relay is deliberately not gated at
         // all (media.rs computes `video_on` as `opts.video.is_some()` for a web uplink), because a
         // cast carries the browser's own encoded frames and needs no local capture.
-        #[cfg(not(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture"))))]
+        #[cfg(not(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture"), all(target_os = "macos", feature = "mac-capture"))))]
         if !matches!(capture_source, CaptureSource::WebUplink) {
             return Err(anyhow!(
-                "--video captures this machine's screen, and this build has no capture backend \n                 for it. On Linux, rebuild with --features linux-capture (needs a desktop \n                 session with an xdg-desktop-portal backend). Otherwise relay a browser's cast: \n                 `--capture web --video` (both flags -- `--capture web` alone relays audio only)."
+                "--video captures this machine's screen, and this build has no capture backend \n                 for it. On Linux rebuild with --features linux-capture, on macOS --features mac-capture (needs a desktop \n                 session with an xdg-desktop-portal backend). Otherwise relay a browser's cast: \n                 `--capture web --video` (both flags -- `--capture web` alone relays audio only)."
             ));
         }
         let resolution = Resolution::parse(&cli.resolution).ok_or_else(|| {

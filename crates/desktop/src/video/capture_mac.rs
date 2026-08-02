@@ -26,7 +26,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
@@ -34,6 +34,7 @@ use newfoundsync_core::config::mono_now;
 // `width`/`height`/`bytes_per_row`/`as_slice` are inherent methods on the lock guard itself — no
 // extension trait to import (the crate's own doc example implies one; there isn't).
 use screencapturekit::cv::CVPixelBufferLockFlags;
+use screencapturekit::stream::delegate_trait::StreamCallbacks;
 use screencapturekit::prelude::*;
 
 /// How long to wait for the first frame before calling it a permission failure. ScreenCaptureKit
@@ -69,9 +70,6 @@ pub struct ScreenCapture {
     pub closed: Arc<AtomicBool>,
     pub slot: FrameSlot,
     stream: Option<SCStream>,
-    /// Joined on drop purely so the stop is observable in logs; the stream itself stops via
-    /// `stop_capture` below.
-    _thread: Option<JoinHandle<()>>,
 }
 
 /// Receives frames on ScreenCaptureKit's dispatch queue and drops them into the shared slot.
@@ -80,7 +78,9 @@ pub struct ScreenCapture {
 /// is a Mutex rather than anything cleverer.
 struct Handler {
     slot: FrameSlot,
-    closed: Arc<AtomicBool>,
+    /// What we ASKED ScreenCaptureKit for, so the first delivered frame can be compared against it.
+    asked: (u32, u32),
+    logged: AtomicBool,
 }
 
 impl SCStreamOutputTrait for Handler {
@@ -107,6 +107,26 @@ impl SCStreamOutputTrait for Handler {
         for y in 0..h {
             bgra[y * row..(y + 1) * row].copy_from_slice(&src[y * stride..y * stride + row]);
         }
+        // POINTS-vs-PIXELS, answered by the first real frame rather than guessed.
+        //
+        // `SCDisplay::width/height` are documented by Apple as POINTS, while SCStreamConfiguration's
+        // width/height are PIXELS (the crate's own doc comment calls the display ones pixels, which
+        // is why this is worth checking rather than trusting). If they are points, then on any
+        // Retina Mac we are configuring the stream at half the panel's real resolution and every
+        // 1080p+ stream is an upscale of a ~1512-wide capture.
+        //
+        // Blind-fixing it by multiplying by 2 would double the capture cost if the value was already
+        // pixels, so instead: say what we asked for and what arrived, once. One line in the log
+        // settles it on the first machine that ever runs this.
+        if !self.logged.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                asked_w = self.asked.0,
+                asked_h = self.asked.1,
+                got_w = w,
+                got_h = h,
+                "[capture] macOS first frame — if 'got' is ~2x 'asked' this display is Retina and                  the configured size was in points; if they match, the capture is at the size we set"
+            );
+        }
         if let Ok(mut slot) = self.slot.lock() {
             *slot = Some(CapturedFrame {
                 width: w as u32,
@@ -115,8 +135,11 @@ impl SCStreamOutputTrait for Handler {
                 captured_ns,
             });
         }
-        // A frame arrived, so the stream is definitively alive.
-        self.closed.store(false, Ordering::Relaxed);
+        // Deliberately does NOT touch `closed`. That flag is a one-way death latch — the producer
+        // mirrors it into health as "capture died" and never expects it to go back. Clearing it here
+        // (which an earlier version did, on the reasoning that a frame proves liveness) would let a
+        // single in-flight frame delivered after teardown un-report a real capture death, and cost an
+        // atomic write per frame to do it.
     }
 }
 
@@ -158,9 +181,28 @@ impl ScreenCapture {
         let slot: FrameSlot = Arc::new(Mutex::new(None));
         let closed = Arc::new(AtomicBool::new(false));
 
-        let mut stream = SCStream::new(&filter, &config);
+        // A DELEGATE, so a stream that dies mid-session is REPORTED. Without one, `closed` could
+        // only ever be set by our own Drop, and a capture killed by macOS (display unplugged,
+        // permission revoked while running, stream error) would leave the producer happily
+        // re-encoding its last frame forever while /health still said healthy — the exact failure
+        // the other two backends have an authoritative signal for, and the reason `capture_frames`
+        // is tracked separately from `video_frames`.
+        let died = closed.clone();
+        let delegate = StreamCallbacks::new()
+            .on_stop(move |err| {
+                match err {
+                    Some(e) => tracing::error!("macOS screen capture stopped: {e}"),
+                    // A stop with no error is also death as far as the producer is concerned: no
+                    // further frames are coming, whatever the reason.
+                    None => tracing::warn!("macOS screen capture stopped"),
+                }
+                died.store(true, Ordering::Relaxed);
+            })
+            .on_error(|e| tracing::error!("macOS screen capture error: {e}"));
+
+        let mut stream = SCStream::new_with_delegate(&filter, &config, delegate);
         stream.add_output_handler(
-            Handler { slot: slot.clone(), closed: closed.clone() },
+            Handler { slot: slot.clone(), asked: (w, h), logged: AtomicBool::new(false) },
             SCStreamOutputType::Screen,
         );
         stream
@@ -174,7 +216,7 @@ impl ScreenCapture {
         while Instant::now() < deadline {
             if slot.lock().map(|s| s.is_some()).unwrap_or(false) {
                 tracing::info!(width = w, height = h, "[capture] macOS ScreenCaptureKit active");
-                return Ok(ScreenCapture { closed, slot, stream: Some(stream), _thread: None });
+                return Ok(ScreenCapture { closed, slot, stream: Some(stream) });
             }
             thread::sleep(Duration::from_millis(50));
         }

@@ -179,12 +179,24 @@ window.__NFS_BUILD = "__NFS_BUILD__";
   main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 16px; padding: clamp(24px, 5vh, 56px) 18px 28px; }
   /* During playback: logo/visualizer on top (center), controls card below. */
   #playview { display: flex; flex-direction: column; align-items: center; gap: 16px; width: 100%; }
+  /* --stage-ar is set from the FIRST video frame's real shape, so an ultrawide or a pivoted
+     monitor gets a box its own shape instead of being letterboxed inside a 16:9 one. 16/9 is only
+     the placeholder used before any frame arrives. */
   #stage {
     position: relative; width: 100%; max-width: 1280px; background: #000;
-    border: 1px solid var(--border); border-radius: var(--r-card); overflow: hidden; aspect-ratio: 16/9; display: none;
+    border: 1px solid var(--border); border-radius: var(--r-card); overflow: hidden;
+    aspect-ratio: var(--stage-ar, 16/9); display: none;
     box-shadow: var(--shadow-card);
   }
+  /* contain = whole picture, correct shape (the default). cover = fill the box, cropping the edges.
+     fill = stretch to the box, which distorts — offered because on a phone held in portrait some
+     people would rather have the pixels than the geometry. */
   canvas { width: 100%; height: 100%; display: block; object-fit: contain; }
+  #stage.fit-cover canvas { object-fit: cover; }
+  #stage.fit-fill  canvas { object-fit: fill; }
+  /* When the user picks cover/fill they are choosing how the picture meets the BOX, so the box goes
+     back to a predictable 16:9 rather than following the source. */
+  #stage.fit-cover, #stage.fit-fill { aspect-ratio: 16/9; }
   /* Logo + audio visualizer, hero at the top. JS toggles display. */
   #vlogo {
     display: none; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
@@ -400,6 +412,7 @@ window.__NFS_BUILD = "__NFS_BUILD__";
         <div class="ctlrow actions">
           <button id="calib" class="actionbtn" title="Auto-sync devices in the same room">🎚 Calibrate</button>
           <button id="castbtn" class="actionbtn" title="Cast this device's screen or audio to everyone">📡 Cast</button>
+          <button id="fitbtn" class="actionbtn" title="How the picture fills the frame — Fit keeps its true shape, Fill crops to the edges, Stretch distorts to fill" style="display:none">🖥 Fit</button>
           <button id="mute" class="actionbtn" title="Mute / unmute">🔊 Sound on</button>
           <button id="stop" class="actionbtn danger" title="Stop playback and disconnect">⏹ Stop</button>
         </div>

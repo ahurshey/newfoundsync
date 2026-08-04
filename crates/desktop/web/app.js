@@ -84,6 +84,7 @@ const els = {
   trimdown: document.getElementById("trimdown"),
   trimup: document.getElementById("trimup"),
   trimreset: document.getElementById("trimreset"),
+  fitbtn: document.getElementById("fitbtn"),
   stage: document.getElementById("stage"),
   vlogo: document.getElementById("vlogo"),
   vlogoimg: document.getElementById("vlogoimg"),
@@ -147,6 +148,12 @@ let wakeLock = null;
 let volume = 1; // 0..1, persisted (the device's own slider)
 let muted = false;
 let remoteVol = 1; // 0..1, server-controlled (SET_VOLUME); multiplies the local volume
+// How the picture meets its frame. "contain" (default) shows the whole picture in its true shape;
+// "cover" fills the frame and crops; "fill" stretches and distorts. Persisted per device because it
+// is a property of the SCREEN you watch on, not of the stream.
+let fitMode = "contain";
+const FIT_MODES = ["contain", "cover", "fill"];
+const FIT_LABEL = { contain: "🖥 Fit", cover: "🔲 Fill", fill: "↔ Stretch" };
 let trimMs = 0; // per-device sync trim (ms), persisted: + = play later, - = earlier
 let remoteTrimMs = 0; // server-controlled sync offset (SET_TRIM, ms); ADDS to the local trim
 // MUST be declared before loadTrim() runs (~line 313): loadTrim() writes `aligned` when restoring a
@@ -333,6 +340,23 @@ function resetSync(note) {
   setCalibStatus(note || "");
 }
 els.trimreset.addEventListener("click", () => resetSync("Sync reset to 0 ms."));
+
+// Fit mode: the classes do the work in CSS (see #stage rules); this only records the choice.
+function applyFit() {
+  els.stage.classList.toggle("fit-cover", fitMode === "cover");
+  els.stage.classList.toggle("fit-fill", fitMode === "fill");
+  els.fitbtn.textContent = FIT_LABEL[fitMode] || FIT_LABEL.contain;
+  try { localStorage.setItem("nfs_fit", fitMode); } catch (e) {}
+}
+try {
+  const saved = localStorage.getItem("nfs_fit");
+  if (FIT_MODES.includes(saved)) fitMode = saved;
+} catch (e) {}
+els.fitbtn.addEventListener("click", () => {
+  fitMode = FIT_MODES[(FIT_MODES.indexOf(fitMode) + 1) % FIT_MODES.length];
+  applyFit();
+});
+applyFit();
 
 // ---- Light/dark theme toggle (persisted; default dark). The <head> pre-applies the saved
 // theme before paint to avoid a flash; here we keep the button icon + theme-color meta in sync.
@@ -1553,9 +1577,17 @@ function videoStep(nowTs) {
     due = vq.shift().frame;
   }
   if (!due) return;
-  if (els.canvas.width !== due.displayWidth) {
+  if (els.canvas.width !== due.displayWidth || els.canvas.height !== due.displayHeight) {
     els.canvas.width = due.displayWidth;
     els.canvas.height = due.displayHeight;
+    // Give the STAGE the picture's own shape. The box was hard-coded to 16/9, so an ultrawide
+    // desktop sat letterboxed inside it with black bars top and bottom even though the frame itself
+    // was correct — and on a 21:9 source that wastes a third of the width you are watching on.
+    // Height is compared too: a source can change shape (display swap, a phone rotating) without
+    // its width changing.
+    els.stage.style.setProperty("--stage-ar", due.displayWidth + " / " + due.displayHeight);
+    // Only worth offering once there is a picture to shape.
+    els.fitbtn.style.display = "";
   }
   if (els.vlogo.style.display !== "none") { els.vlogo.style.display = "none"; vizStop(); } // real video → swap logo for the stage
   els.stage.style.display = "block";

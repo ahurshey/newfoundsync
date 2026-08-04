@@ -723,7 +723,10 @@ impl VideoProducer {
 
         const KEYFRAME_SECS: u64 = 2;
 
-        let (dw, dh) = cfg.resolution.dims();
+        // Provisional only. The real target keeps the SOURCE's shape and is derived from the first
+        // captured frame (see fit_dims at the encoder build below) — the preset alone is always 16:9,
+        // and using it directly is what squashed ultrawide desktops into ellipses.
+        let (mut dw, mut dh) = cfg.resolution.dims();
         let fps = cfg.fps.value();
         let bitrate = cfg.suggested_bitrate_kbps();
 
@@ -805,6 +808,26 @@ impl VideoProducer {
                         if let Some(frame) = &last {
                             // Lazily build the system-memory encoder on the first slot frame.
                             if encoder.is_none() {
+                                // NOW the source shape is known, so pick a target that matches it
+                                // rather than the preset's fixed 16:9. Done once, here, because the
+                                // encoder is built once: changing dimensions later would mean
+                                // rebuilding it and re-keyframing every client.
+                                let (fw, fh) = newfoundsync_core::video::fit_dims(
+                                    frame.width,
+                                    frame.height,
+                                    cfg.resolution,
+                                );
+                                if (fw, fh) != (dw, dh) {
+                                    tracing::info!(
+                                        src_w = frame.width,
+                                        src_h = frame.height,
+                                        enc_w = fw,
+                                        enc_h = fh,
+                                        "video: encoding at the source's aspect ratio"
+                                    );
+                                    dw = fw;
+                                    dh = fh;
+                                }
                                 match VideoEncoder::new(encoder_backend, encode_device, dw, dh, fps, bitrate) {
                                     Ok(e) => {
                                         tracing::info!(backend = e.backend_label(), "video encoder ready");

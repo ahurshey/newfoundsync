@@ -241,6 +241,40 @@ impl VideoConfig {
     }
 }
 
+/// Encode dimensions that keep the SOURCE's shape, within the pixel budget of `res`.
+///
+/// The resolution presets are all 16:9, and the scaler stretches source to destination on each axis
+/// independently — so a 21:9 ultrawide fed to "1080p" was squashed into 1920x1080 and every circle on
+/// screen arrived as an ellipse. This derives the target from the actual source instead.
+///
+/// The BUDGET is total pixels, not height, and that is the important part: the advertised AV1/VP9
+/// level is chosen from the preset's pixel count (see the two functions below, whose levels key off
+/// `samples`), and a spec-conformant decoder rejects a stream that exceeds its declared level. Giving
+/// an ultrawide the preset's full HEIGHT would mean 2580x1080 for "1080p" — 34% more pixels than
+/// declared, so an overrun of both the level and the CPU/bitrate the operator chose. Holding pixels
+/// constant keeps the declaration honest and the cost predictable; a wide source simply gets fewer
+/// lines, which is what a fixed budget means.
+///
+/// Both dimensions come back EVEN: I420 chroma is subsampled 2x2, and the VP9 encoder rejects odd
+/// dimensions outright.
+pub fn fit_dims(src_w: u32, src_h: u32, res: Resolution) -> (u32, u32) {
+    let (bw, bh) = res.dims();
+    let budget = bw as u64 * bh as u64;
+    if src_w == 0 || src_h == 0 {
+        return (bw, bh); // nothing to derive a shape from — keep the preset
+    }
+    let aspect = src_w as f64 / src_h as f64;
+    // h = sqrt(budget / aspect) is the tallest picture of this shape that fits the budget.
+    let mut h = ((budget as f64 / aspect).sqrt().floor() as u32).max(2) & !1;
+    let mut w = (((h as f64) * aspect).round() as u32).max(2) & !1;
+    // Rounding both to even can push the product a hair over; step the height down until it fits.
+    while (w as u64) * (h as u64) > budget && h > 2 {
+        h -= 2;
+        w = (((h as f64) * aspect).round() as u32).max(2) & !1;
+    }
+    (w, h)
+}
+
 /// AV1 codec string (`av01.P.LLT.DD`) advertised to WebCodecs clients, with a `seq_level_idx`
 /// that *covers* this resolution+fps. A spec-conformant decoder requires the declared level to
 /// be ≥ the encoded level, so this must never understate the stream. Profile 0 (Main), Main tier
@@ -294,6 +328,56 @@ pub fn vp9_codec_string(res: Resolution, fps: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this exists for: a 21:9 desktop was being squashed into a 16:9 frame, so everything
+    /// on screen arrived horizontally compressed. The shape of the OUTPUT must match the INPUT.
+    #[test]
+    fn ultrawide_keeps_its_shape() {
+        let (w, h) = fit_dims(3440, 1440, Resolution::P1080);
+        let src = 3440.0 / 1440.0;
+        let got = w as f64 / h as f64;
+        assert!((got - src).abs() < 0.01, "{w}x{h} is {got:.3}, source is {src:.3}");
+        // …and within the preset's pixel budget, because the advertised codec level is derived from
+        // that count and a decoder rejects a stream that exceeds its declared level.
+        assert!((w as u64) * (h as u64) <= 1920 * 1080, "{w}x{h} exceeds the 1080p budget");
+    }
+
+    #[test]
+    fn a_16_9_source_is_left_exactly_alone() {
+        // The common case must not move: same shape, same budget, so the same numbers.
+        assert_eq!(fit_dims(1920, 1080, Resolution::P1080), (1920, 1080));
+        assert_eq!(fit_dims(2560, 1440, Resolution::P720), (1280, 720));
+    }
+
+    #[test]
+    fn dimensions_are_always_even() {
+        // I420 subsamples chroma 2x2 and the VP9 encoder rejects odd dimensions outright, so an odd
+        // result is not a cosmetic issue — it is a failed encoder init.
+        for (sw, sh) in [(3440, 1440), (2560, 1080), (1366, 768), (1080, 1920), (5120, 1440)] {
+            for res in Resolution::ALL {
+                let (w, h) = fit_dims(sw, sh, res);
+                assert_eq!(w % 2, 0, "{sw}x{sh}@{res:?} -> width {w} is odd");
+                assert_eq!(h % 2, 0, "{sw}x{sh}@{res:?} -> height {h} is odd");
+                assert!((w as u64) * (h as u64) <= {
+                    let (bw, bh) = res.dims();
+                    bw as u64 * bh as u64
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn a_portrait_source_is_handled_too() {
+        // A phone casting, or a pivoted monitor: taller than wide, and the same rule applies.
+        let (w, h) = fit_dims(1080, 1920, Resolution::P1080);
+        assert!(h > w, "portrait source must stay portrait, got {w}x{h}");
+        assert!((w as f64 / h as f64 - 1080.0 / 1920.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_degenerate_source_falls_back_to_the_preset() {
+        assert_eq!(fit_dims(0, 0, Resolution::P720), (1280, 720));
+    }
 
     #[test]
     fn dims_and_labels() {

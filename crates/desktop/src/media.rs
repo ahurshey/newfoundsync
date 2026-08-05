@@ -863,8 +863,8 @@ impl VideoProducer {
                                     enc.force_keyframe(); // a REQUEST; the GPU may honor it on its own GOP cadence
                                     last_key_req = Instant::now();
                                 }
-                                match enc.encode_bgra(&scaled) {
-                                    Ok(bits) if !bits.is_empty() => {
+                                match enc.encode_bgra(&scaled, frame.captured_ns) {
+                                    Ok((bits, content_ns)) if !bits.is_empty() => {
                                         // PTS describes when the PICTURE EXISTED, not when the
                                         // encoder finished with it. Stamping `mono_now()` here folded
                                         // the poll wait + scale + AV1 encode into the timestamp —
@@ -873,9 +873,15 @@ impl VideoProducer {
                                         // audio, so that went straight out as lip-sync error that
                                         // wobbled frame to frame and no fixed trim could remove.
                                         let now_ns = mono_now();
+                                        // content_ns, NOT frame.captured_ns: with a pipelined
+                                        // encoder the bits coming back belong to an earlier frame,
+                                        // and stamping them with the frame we just submitted is a
+                                        // systematic lip-sync error. The in-process encoders return
+                                        // the same value they were given, so this is identical for
+                                        // them.
                                         let pts = video_pts(
                                             fresh,
-                                            frame.captured_ns,
+                                            content_ns,
                                             now_ns,
                                             lead_ns,
                                             prev_pub,
@@ -913,7 +919,7 @@ impl VideoProducer {
                                         let _ = tx.send(Arc::new(msg));
                                         health.note_video();
                                     }
-                                    Ok(_) => {}
+                                    Ok(_) => {} // no packet ready this tick
                                     Err(e) => {
                                         // WARN, not debug: a per-frame failure (e.g. after a GPU driver
                                         // reset) freezes the client picture on its last frame while

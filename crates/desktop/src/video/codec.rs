@@ -272,15 +272,22 @@ impl VideoEncoder {
         Ok(VideoEncoder::Av1Cpu(e))
     }
 
-    pub fn encode_bgra(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
+    /// Encode one frame, returning the bits and THE CAPTURE TIME OF THE PICTURE THOSE BITS CONTAIN.
+    ///
+    /// For the in-process encoders that is simply `captured_ns` back again — one frame in, that
+    /// frame's bits out. The FFmpeg backend is a separate process with pipeline depth, so the packet
+    /// it returns belongs to an earlier frame and it reports that frame's capture time instead.
+    /// Returning it rather than assuming 1:1 is what keeps every PTS a content time; assuming it put
+    /// a systematic lip-sync error on the hardware path.
+    pub fn encode_bgra(&mut self, bgra: &[u8], captured_ns: i64) -> Result<(Vec<u8>, i64)> {
         match self {
-            VideoEncoder::Av1Cpu(e) => e.encode_bgra(bgra),
+            VideoEncoder::Av1Cpu(e) => e.encode_bgra(bgra).map(|b| (b, captured_ns)),
             #[cfg(feature = "vp9")]
-            VideoEncoder::Vp9Cpu(e) => e.encode_bgra(bgra),
+            VideoEncoder::Vp9Cpu(e) => e.encode_bgra(bgra).map(|b| (b, captured_ns)),
             #[cfg(target_os = "windows")]
-            VideoEncoder::Av1Gpu(e) => e.encode_bgra(bgra),
+            VideoEncoder::Av1Gpu(e) => e.encode_bgra(bgra).map(|b| (b, captured_ns)),
             #[cfg(all(target_os = "linux", feature = "linux-hw-encode"))]
-            VideoEncoder::Av1Gpu(e) => e.encode_bgra(bgra),
+            VideoEncoder::Av1Gpu(e) => e.encode_bgra(bgra, captured_ns),
         }
     }
 

@@ -211,8 +211,11 @@ jobs:
 
       # vp9-bindgen rather than vp9: distro libvpx is newer than the crate's pre-generated 1.13.0
       # bindings (the Flatpak runtime ships 1.14.1), and pairing those is a struct-layout mismatch.
-      - name: cargo check (linux-capture + vp9-bindgen — what the Flatpak builds)
-        run: cargo check -p newfoundsync --features linux-capture,vp9-bindgen
+      # linux-hw-encode, matching the manifest. It IMPLIES linux-capture, so this still covers the
+      # portal capture; it additionally compiles the FFmpeg hardware backend. Needs no extra system
+      # packages because that backend shells out to an ffmpeg binary rather than linking libav*.
+      - name: cargo check (linux-hw-encode + vp9-bindgen — what the Flatpak builds)
+        run: cargo check -p newfoundsync --features linux-hw-encode,vp9-bindgen
 
   shipped-macos:
     name: cargo check the SHIPPED macOS config

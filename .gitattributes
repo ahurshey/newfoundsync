@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts must reach a Linux box with LF endings, which `text=auto` alone does not guarantee:
+# on a Windows checkout it materialises them CRLF, and `set -euo pipefail` then fails with
+# "invalid option name" because the option carries a trailing \r — aborting the Flatpak build script
+# on its seventh line. Diagnosed once the hard way; pinned here so it cannot recur.
+*.sh text eol=lf

@@ -54,6 +54,30 @@ build-options:
     # against its own build directory, not ours.
     CMAKE_TOOLCHAIN_FILE: /run/build/newfoundsync/flatpak/cmake-force-libdir.cmake
 modules:
+  # FFmpeg in the 24.08 runtime has VA-API but no active NVENC backend. Build the NVIDIA codec
+  # headers and an FFmpeg binary in /app so NVIDIA Ada+ can use `av1_nvenc`; it dlopens the host
+  # driver extension's libnvidia-encode at runtime, rather than bundling any proprietary driver.
+  # VA-API remains enabled in this binary for Intel and AMD AV1 hardware.
+  - name: nv-codec-headers
+    buildsystem: simple
+    build-commands:
+      - make PREFIX=/app LIBDIR=lib install
+    sources:
+      - type: git
+        url: https://github.com/FFmpeg/nv-codec-headers.git
+        tag: n12.2.72.0
+        commit: 157becbf51c8b813425572b75c06c370bd43d8fd
+  - name: ffmpeg-hw-encode
+    buildsystem: simple
+    build-commands:
+      - PKG_CONFIG_PATH=/app/lib/pkgconfig:$PKG_CONFIG_PATH ./configure --prefix=/app --disable-doc --disable-debug --disable-static --enable-shared --disable-autodetect --enable-ffnvcodec --enable-nvenc --enable-vaapi --enable-libdrm
+      - make -j${FLATPAK_BUILDER_N_JOBS}
+      - make install
+    sources:
+      - type: git
+        url: https://github.com/FFmpeg/FFmpeg.git
+        tag: n7.1.2
+        commit: 7003a8c4544b780eb0ab5c02ac4ad89d2132f2a2
   - name: newfoundsync
     buildsystem: simple
     build-commands:
@@ -61,13 +85,17 @@ modules:
       # bootstrap a current stable toolchain with rustup instead. (curl ships in the Freedesktop SDK.)
       - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh
       - sh rustup-init.sh -y --profile minimal --default-toolchain stable --no-modify-path
-      # GUI + linux-capture. The feature implies video-encode-source, so SVT-AV1 is COMPILED here
-      # rather than downloaded: shiguredo_svt_av1 derives its prebuilt name as `ubuntu-{VERSION_ID}`,
-      # and inside this SDK that resolves to `ubuntu-24.08`, which does not exist -> 404.
+      # GUI + Linux capture + hardware AV1. `linux-hw-encode` implies linux-capture and its
+      # source-built SVT-AV1 fallback. The FFmpeg module above provides VA-API (AMD/Intel) and
+      # NVENC (NVIDIA Ada+) at runtime; Auto uses either supported host encoder, otherwise CPU.
+      #
+      # The source build is needed because shiguredo_svt_av1 derives its prebuilt name as
+      # `ubuntu-{VERSION_ID}`, and inside this SDK that resolves to `ubuntu-24.08`, which does not
+      # exist -> 404.
       # vp9-bindgen, not vp9: the runtime ships libvpx 1.14.1 and the crate's pre-generated
       # bindings stop at 1.13.0 — generating them against the real headers is the only safe
       # pairing. libclang is already here for pipewire-sys/SVT-AV1, so it costs nothing extra.
-      - $CARGO_HOME/bin/cargo build --release -p newfoundsync --features linux-capture,vp9-bindgen
+      - $CARGO_HOME/bin/cargo build --release -p newfoundsync --features linux-hw-encode,vp9-bindgen
       - install -Dm755 target/release/newfoundsync /app/bin/newfoundsync
       - install -Dm644 flatpak/ca.newfoundsync.Newfoundsync.desktop /app/share/applications/ca.newfoundsync.Newfoundsync.desktop
       - install -Dm644 flatpak/ca.newfoundsync.Newfoundsync.metainfo.xml /app/share/metainfo/ca.newfoundsync.Newfoundsync.metainfo.xml

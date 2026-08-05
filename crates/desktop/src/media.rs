@@ -920,6 +920,27 @@ impl VideoProducer {
                                         // everything still reports healthy. Throttled — this fires at
                                         // frame rate.
                                         health.video_errors.fetch_add(1, Ordering::Relaxed);
+                                        // A hardware encoder can fail after its initial capability probe
+                                        // (for example after a driver reset). Auto promises a usable
+                                        // stream, not merely a successful probe, so replace it with
+                                        // SVT-AV1 here and keyframe the next frame. GPU-only keeps
+                                        // reporting the real hardware failure instead of spending CPU.
+                                        if encode_device == EncodeDevice::Auto {
+                                            match enc.fall_back_to_cpu() {
+                                                Ok(true) => {
+                                                    tracing::warn!(
+                                                        "video: GPU AV1 failed ({e:#}); switched to CPU SVT-AV1"
+                                                    );
+                                                    enc.force_keyframe();
+                                                    last_key_req = Instant::now();
+                                                    continue;
+                                                }
+                                                Ok(false) => {}
+                                                Err(fallback) => tracing::error!(
+                                                    "video: GPU AV1 failed ({e:#}); CPU fallback also failed: {fallback:#}"
+                                                ),
+                                            }
+                                        }
                                         if let Some(suppressed) = enc_err.tick() {
                                             tracing::warn!(suppressed, "video encode failed — picture is frozen: {e}");
                                         }

@@ -69,7 +69,8 @@ const ENC_LABELS: [(&str, &str); 2] = [("AV1", "av1"), ("VP9", "vp9")];
 /// the only two offered — so saying it in the label told the operator nothing about which to pick.
 /// This does.
 const AV1_HINT: &str =
-    "Best picture for the bandwidth, and the only one that can encode on the GPU (Windows). But most \
+    "Best picture for the bandwidth, and the only one that can encode on the GPU (Windows or the \
+     Linux screencast Flatpak). But most \
      phones have no AV1 decoding silicon, so they decode it on the CPU — that's the one that gets \
      hot and stutters.";
 const VP9_HINT: &str =
@@ -1927,9 +1928,9 @@ impl ServerApp {
                              CPU only never touches the GPU, which is the way out of a flaky \
                              hardware encoder.",
                         );
-                        // Windows-only: no GPU encode path exists elsewhere, so offering the choice
-                        // would be offering two spellings of "CPU" plus one that always fails.
-                        #[cfg(target_os = "windows")]
+                        // The screencast Flatpak has VA-API/NVENC backends; the ordinary Linux
+                        // Flatpak intentionally does not, so only expose a choice where it works.
+                        #[cfg(any(target_os = "windows", all(target_os = "linux", feature = "linux-hw-encode")))]
                         egui::ComboBox::from_id_salt("encode_device")
                             .selected_text(match self.encode_device {
                                 EncodeDevice::Auto => "Auto · GPU, else CPU",
@@ -1957,14 +1958,7 @@ impl ServerApp {
                                     }
                                 }
                             });
-                        // Not a stub for missing work — the hardware is the blocker, and saying so
-                        // is the difference between "they haven't got round to it" and "your GPU
-                        // cannot do this". Checked with vainfo on an Intel Iris Xe + RTX 3070:
-                        // AV1 and VP9 appear only as VAEntrypointVLD (decode). The sole ENCODE
-                        // entrypoints are MPEG2/H.264/HEVC/JPEG — the patent-encumbered codecs this
-                        // project removed on purpose. GPU AV1 encode needs Intel Arc / Meteor Lake+,
-                        // AMD RDNA3+, or NVIDIA Ada (RTX 40+); NVENC has never encoded VP9 at all.
-                        #[cfg(not(target_os = "windows"))]
+                        #[cfg(not(any(target_os = "windows", all(target_os = "linux", feature = "linux-hw-encode"))))]
                         ui.label(
                             egui::RichText::new("CPU (SVT-AV1) — no GPU AV1/VP9 encoder here")
                                 .size(11.0)

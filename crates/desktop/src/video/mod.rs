@@ -36,6 +36,10 @@ pub mod capture;
 #[cfg(all(target_os = "linux", feature = "linux-capture"))]
 #[path = "capture_portal.rs"]
 pub mod capture;
+// The screencast Flatpak bundles an FFmpeg with AV1 VA-API (AMD/Intel) and NVENC (NVIDIA) support.
+// Keep the wrapper Linux-only and feature-gated: a headless server needs neither video backend.
+#[cfg(all(target_os = "linux", feature = "linux-hw-encode"))]
+pub mod ffmpeg_encoder;
 // …and the third backend, same surface again: ScreenCaptureKit on macOS.
 #[cfg(all(target_os = "macos", feature = "mac-capture"))]
 #[path = "capture_mac.rs"]

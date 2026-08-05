@@ -160,6 +160,8 @@ pub enum VideoEncoder {
     Vp9Cpu(crate::video::vp9::Vp9Encoder),
     #[cfg(target_os = "windows")]
     Av1Gpu(crate::video::mf_encoder::MfEncoder),
+    #[cfg(all(target_os = "linux", feature = "linux-hw-encode"))]
+    Av1Gpu(crate::video::ffmpeg_encoder::FfmpegAv1Encoder),
 }
 
 impl VideoEncoder {
@@ -225,20 +227,43 @@ impl VideoEncoder {
                 Err(e) => tracing::info!("video: no GPU AV1 encoder ({e:#}); using software SVT-AV1"),
             }
         }
-        // Non-Windows has no GPU encoder at all, so "GPU only" cannot be honoured anywhere.
-        //
-        // Unreachable as of today — local video capture is Windows-only, so media.rs drops video
-        // before a Linux run ever builds an encoder ("video capture is Windows-only for now;
-        // serving audio only"). Kept because it is the correct answer the moment that changes: the
-        // PipeWire ScreenCast capture on the roadmap would otherwise reach the software encoder
-        // below and quietly ignore an explicit GPU-only request.
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(all(target_os = "linux", feature = "linux-hw-encode"))]
+        if device != EncodeDevice::Cpu {
+            match crate::video::ffmpeg_encoder::FfmpegAv1Encoder::new(
+                width,
+                height,
+                fps,
+                bitrate_kbps,
+            ) {
+                Ok(hw) => {
+                    tracing::info!(backend = hw.backend_label(), "video: GPU AV1 encoder active");
+                    return Ok(VideoEncoder::Av1Gpu(hw));
+                }
+                Err(e) if device == EncodeDevice::Gpu => {
+                    return Err(e).context(
+                        "GPU-only video encoding was requested but this machine has no usable \
+                         hardware AV1 encoder. Switch the encode device to Auto or CPU, or turn \
+                         video off",
+                    );
+                }
+                Err(e) => tracing::info!("video: no GPU AV1 encoder ({e:#}); using software SVT-AV1"),
+            }
+        }
+        // Linux hardware encode is deliberately feature-gated: the normal Flatpak and headless
+        // packages remain audio-only/small, while the screencast Flatpak opts in below.
+        #[cfg(all(target_os = "linux", not(feature = "linux-hw-encode")))]
         if device == EncodeDevice::Gpu {
-            // Fully qualified: `bail!` is used only in this cfg-gated arm, so importing it would be
-            // an unused-import warning on Windows — where this block does not compile at all.
             anyhow::bail!(
-                "GPU-only video encoding was requested, but hardware encoding is Windows-only in \
-                 this build. Use Auto or CPU."
+                "GPU-only video encoding was requested, but this Linux build has no hardware \
+                 encoder. Install the screencast Flatpak build or rebuild with \
+                 --features linux-hw-encode. Use Auto or CPU."
+            );
+        }
+        #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
+        if device == EncodeDevice::Gpu {
+            anyhow::bail!(
+                "GPU-only video encoding was requested, but hardware encoding is unavailable \
+                 in this build. Use Auto or CPU."
             );
         }
         let e = Av1Encoder::new(width, height, fps, bitrate_kbps)
@@ -254,6 +279,8 @@ impl VideoEncoder {
             VideoEncoder::Vp9Cpu(e) => e.encode_bgra(bgra),
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(e) => e.encode_bgra(bgra),
+            #[cfg(all(target_os = "linux", feature = "linux-hw-encode"))]
+            VideoEncoder::Av1Gpu(e) => e.encode_bgra(bgra),
         }
     }
 
@@ -263,6 +290,8 @@ impl VideoEncoder {
             #[cfg(feature = "vp9")]
             VideoEncoder::Vp9Cpu(e) => e.force_keyframe(),
             #[cfg(target_os = "windows")]
+            VideoEncoder::Av1Gpu(e) => e.force_keyframe(),
+            #[cfg(all(target_os = "linux", feature = "linux-hw-encode"))]
             VideoEncoder::Av1Gpu(e) => e.force_keyframe(),
         }
     }
@@ -278,6 +307,8 @@ impl VideoEncoder {
             VideoEncoder::Vp9Cpu(_) => crate::video::vp9::vp9_frame_is_keyframe(au),
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(e) => obu_has_av1_keyframe(au) || e.last_was_keyframe(),
+            #[cfg(all(target_os = "linux", feature = "linux-hw-encode"))]
+            VideoEncoder::Av1Gpu(_) => obu_has_av1_keyframe(au),
         }
     }
 
@@ -289,7 +320,23 @@ impl VideoEncoder {
             VideoEncoder::Vp9Cpu(_) => "CPU (VP9/libvpx)",
             #[cfg(target_os = "windows")]
             VideoEncoder::Av1Gpu(_) => "GPU AV1 (Media Foundation)",
+            #[cfg(all(target_os = "linux", feature = "linux-hw-encode"))]
+            VideoEncoder::Av1Gpu(e) => e.backend_label(),
         }
+    }
+
+    /// Replace a failed Linux hardware encoder with the known-good CPU AV1 encoder. This is only
+    /// reachable for Auto mode; GPU-only deliberately exposes the failure to the caller instead.
+    pub fn fall_back_to_cpu(&mut self) -> Result<bool> {
+        #[cfg(all(target_os = "linux", feature = "linux-hw-encode"))]
+        if let VideoEncoder::Av1Gpu(e) = self {
+            let (width, height, fps, bitrate_kbps) = e.cpu_fallback_config();
+            let cpu = Av1Encoder::new(width, height, fps, bitrate_kbps)
+                .context("switch from failed GPU AV1 to software SVT-AV1")?;
+            *self = VideoEncoder::Av1Cpu(cpu);
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 

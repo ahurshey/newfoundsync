@@ -108,8 +108,9 @@ impl Fps {
 /// codec it's told to), so this lives apart from the negotiated [`VideoConfig`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncoderBackend {
-    /// AV1 (royalty-free, default): GPU via Media Foundation where the hardware supports it
-    /// (Intel Arc/Xe, NVIDIA RTX 40+, AMD RX 7000+), else CPU (SVT-AV1).
+    /// AV1 (royalty-free, default): GPU via Media Foundation on Windows or VA-API/NVENC in the
+    /// Linux screencast Flatpak where the hardware supports it (Intel Arc/Xe, NVIDIA RTX 40+,
+    /// AMD RX 7000+), else CPU (SVT-AV1).
     Av1,
     /// VP9 (royalty-free fallback): CPU via libvpx. Broader decode reach than AV1 on older
     /// Apple / Android / smart TVs; no hardware VP9 encode except recent Intel QuickSync.

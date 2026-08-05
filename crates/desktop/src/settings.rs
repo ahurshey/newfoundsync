@@ -79,10 +79,7 @@ pub fn load_encode_device() -> Option<newfoundsync_core::video::EncodeDevice> {
 
 /// Persist the chosen video encode device (preserving other settings).
 ///
-/// Only ever called from the GUI's encode-device picker, which is Windows-only (no other platform
-/// has a GPU encoder to choose). The loader above stays cross-platform so a value set on Windows is
-/// still honoured if the same config file is read elsewhere.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// Called by the Windows GUI and by the Linux screencast Flatpak's hardware-encoder picker.
 pub fn save_encode_device(d: newfoundsync_core::video::EncodeDevice) -> Result<(), String> {
     save_key("encode_device", d.as_str())
 }

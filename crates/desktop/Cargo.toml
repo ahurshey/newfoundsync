@@ -56,6 +56,10 @@ video-encode-source = ["video-encode", "shiguredo_svt_av1/source-build"]
 # portal backend (xdg-desktop-portal-kde / -gnome). A headless server can never satisfy that, which
 # is why this is opt-in rather than on for the Linux packages.
 linux-capture = ["video-encode-source", "dep:ashpd", "dep:pipewire"]
+# `linux-hw-encode`: hardware AV1 on a Linux desktop through the Flatpak FFmpeg backends:
+# VA-API (AMD/Intel) and NVENC (NVIDIA). It implies `linux-capture` because local video is the
+# only producer that can feed it, and because Auto must always have SVT-AV1 as its CPU fallback.
+linux-hw-encode = ["linux-capture"]
 # `mac-capture` (NOT default): real screen capture on macOS via ScreenCaptureKit. Implies the
 # encoder, since captured frames are useless without one.
 #

@@ -61,8 +61,9 @@ via a CoreAudio process tap (no driver, no BlackHole); local *screen* capture is
   offset. **Calibrate all** orchestrates several devices at once (distinct codes + TDMA
   slots so their self-tests don't collide). Each client reports its measured sync back to
   the server so the mixer shows every device's *actual* offset.
-- **Optional screen video.** Share the screen alongside audio: royalty-free **AV1** (GPU
-  via Media Foundation where the hardware supports it, else CPU SVT-AV1) with a **VP9**
+- **Optional screen video.** Share the screen alongside audio: royalty-free **AV1** (GPU via
+  Media Foundation on Windows or VA-API/NVENC in the Linux screencast Flatpak where hardware
+  supports it, else CPU SVT-AV1) with a **VP9**
   (libvpx, CPU) fallback, decoded via WebCodecs and kept aligned to the same master clock.
 
 ## The server app

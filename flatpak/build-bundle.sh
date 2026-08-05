@@ -12,7 +12,9 @@ set -euo pipefail
 VER="$(grep -m1 '^version' crates/desktop/Cargo.toml | cut -d'"' -f2)"
 if [ -z "$VER" ]; then echo "cannot read the version from crates/desktop/Cargo.toml" >&2; exit 1; fi
 APP=ca.newfoundsync.Newfoundsync
-MANIFEST="${1:-flatpak/$APP.yml}"
+# The desktop bundle includes PipeWire capture and the VA-API AV1 Auto/CPU fallback. Pass a
+# manifest explicitly only when intentionally making the smaller audio/web-relay-only Flatpak.
+MANIFEST="${1:-flatpak/$APP.screencast.yml}"
 BUILD="${BUILD_DIR:-$HOME/nfs-flatpak-build}"
 REPO="${REPO_DIR:-$HOME/nfs-flatpak-repo}"
 OUT="${OUT_DIR:-$HOME/Desktop}/Newfoundsync-${VER}.flatpak"

@@ -356,8 +356,8 @@ fn c_surface() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0xff, 0xff, 
 fn c_surface_alt() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0xee, 0xf1, 0xf6) } else { egui::Color32::from_rgb(0x1d, 0x25, 0x31) } }
 fn c_border() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0xd6, 0xdd, 0xe6) } else { egui::Color32::from_rgb(0x2a, 0x33, 0x40) } }
 fn c_text() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0x16, 0x20, 0x2e) } else { egui::Color32::from_rgb(0xe8, 0xee, 0xf5) } }
-fn c_text2() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0x3a, 0x46, 0x57) } else { egui::Color32::from_rgb(0xd6, 0xe0, 0xea) } }
-fn c_dim() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0x5c, 0x68, 0x78) } else { egui::Color32::from_rgb(0xad, 0xbd, 0xcd) } }
+fn c_text2() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0x3a, 0x46, 0x57) } else { egui::Color32::from_rgb(0xc9, 0xd4, 0xe0) } }
+fn c_dim() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0x5c, 0x68, 0x78) } else { egui::Color32::from_rgb(0x94, 0xa1, 0xb2) } }
 fn c_accent() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0x25, 0x63, 0xeb) } else { egui::Color32::from_rgb(0x3b, 0x8e, 0xff) } }
 fn c_accent_hi() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0x1d, 0x4e, 0xd8) } else { egui::Color32::from_rgb(0x5a, 0xa2, 0xff) } }
 fn c_ok() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0x1a, 0x9c, 0x3e) } else { egui::Color32::from_rgb(0x3f, 0xb9, 0x50) } }
@@ -462,42 +462,6 @@ const MASTER_MIN_INLINE: f32 = 260.0;
 /// Apply the theme + desktop-tuned spacing/fonts/zoom once at startup.
 fn setup_style(ctx: &egui::Context) {
     use egui::{FontId, TextStyle};
-    #[cfg(any(target_os = "windows", all(target_os = "linux", feature = "linux-hw-encode")))]
-    use egui::{FontData, FontDefinitions, FontFamily};
-
-    // egui embeds Ubuntu Light only. The Flatpak carries Ubuntu Regular; the Windows test build
-    // keeps the same file beside its EXE. Neither path relies on a host-installed font.
-    #[cfg(any(target_os = "windows", all(target_os = "linux", feature = "linux-hw-encode")))]
-    let font_path = {
-        #[cfg(target_os = "windows")]
-        {
-            std::env::current_exe()
-                .ok()
-                .and_then(|path| path.parent().map(|dir| dir.join("Ubuntu-Regular.ttf")))
-                .unwrap_or_else(|| std::path::PathBuf::from("Ubuntu-Regular.ttf"))
-        }
-        #[cfg(all(target_os = "linux", feature = "linux-hw-encode"))]
-        {
-            std::path::PathBuf::from("/app/share/newfoundsync/Ubuntu-Regular.ttf")
-        }
-    };
-    #[cfg(any(target_os = "windows", all(target_os = "linux", feature = "linux-hw-encode")))]
-    match std::fs::read(&font_path) {
-        Ok(bytes) => {
-            let mut fonts = FontDefinitions::default();
-            let name = "Newfoundsync Ubuntu Regular".to_owned();
-            fonts
-                .font_data
-                .insert(name.clone(), std::sync::Arc::new(FontData::from_owned(bytes)));
-            fonts
-                .families
-                .get_mut(&FontFamily::Proportional)
-                .expect("egui's default proportional font family")
-                .insert(0, name);
-            ctx.set_fonts(fonts);
-        }
-        Err(e) => tracing::warn!(path = %font_path.display(), "could not load regular UI font: {e}"),
-    }
 
     let mut s = (*ctx.style()).clone();
     s.visuals = theme_visuals();

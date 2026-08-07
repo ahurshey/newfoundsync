@@ -5,6 +5,7 @@
   <project_license>GPL-3.0-or-later</project_license>
   <name>Newfoundsync</name>
   <summary>LAN audio sharing with tight multi-room sync</summary>
+  <icon type="stock">ca.newfoundsync.Newfoundsync</icon>
   <description>
     <p>
       Newfoundsync streams this PC's audio to any browser on the local network and keeps every

@@ -462,6 +462,29 @@ const MASTER_MIN_INLINE: f32 = 260.0;
 /// Apply the theme + desktop-tuned spacing/fonts/zoom once at startup.
 fn setup_style(ctx: &egui::Context) {
     use egui::{FontId, TextStyle};
+    #[cfg(all(target_os = "linux", feature = "linux-hw-encode"))]
+    use egui::{FontData, FontDefinitions, FontFamily};
+
+    // egui's bundled proportional face is Ubuntu Light. The screencast Flatpak installs the
+    // matching Ubuntu Bold face so this test build can give the native controls more weight
+    // without relying on the host's font set. Keep egui's own faces as fallbacks for emoji/script.
+    #[cfg(all(target_os = "linux", feature = "linux-hw-encode"))]
+    match std::fs::read("/app/share/newfoundsync/Ubuntu-Bold.ttf") {
+        Ok(bytes) => {
+            let mut fonts = FontDefinitions::default();
+            let name = "Newfoundsync Ubuntu Bold".to_owned();
+            fonts
+                .font_data
+                .insert(name.clone(), std::sync::Arc::new(FontData::from_owned(bytes)));
+            fonts
+                .families
+                .get_mut(&FontFamily::Proportional)
+                .expect("egui's default proportional font family")
+                .insert(0, name);
+            ctx.set_fonts(fonts);
+        }
+        Err(e) => tracing::warn!("could not load bundled bold UI font: {e}"),
+    }
 
     let mut s = (*ctx.style()).clone();
     s.visuals = theme_visuals();

@@ -78,6 +78,17 @@ modules:
         url: https://github.com/FFmpeg/FFmpeg.git
         tag: n7.1.2
         commit: 7003a8c4544b780eb0ab5c02ac4ad89d2132f2a2
+  # egui bundles Ubuntu Light but no bold proportional face. Ship the matching Ubuntu Bold face
+  # (Ubuntu Font Licence 1.0) so the desktop UI can use it consistently instead of a host font.
+  - name: ubuntu-bold-font
+    buildsystem: simple
+    build-commands:
+      - install -Dm644 Ubuntu-Bold.ttf /app/share/newfoundsync/Ubuntu-Bold.ttf
+    sources:
+      - type: file
+        url: https://github.com/google/fonts/raw/main/ufl/ubuntu/Ubuntu-Bold.ttf
+        sha256: 679b5c1e09cab3156bb8ef529735f9382bf31ca7ac737382ab959297f8d82ad4
+        dest-filename: Ubuntu-Bold.ttf
   - name: newfoundsync
     buildsystem: simple
     build-commands:

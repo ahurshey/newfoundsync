@@ -6,6 +6,11 @@
   <name>Newfoundsync</name>
   <summary>LAN audio sharing with tight multi-room sync</summary>
   <icon type="stock">ca.newfoundsync.Newfoundsync</icon>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Network</category>
+  </categories>
   <description>
     <p>
       Newfoundsync streams this PC's audio to any browser on the local network and keeps every

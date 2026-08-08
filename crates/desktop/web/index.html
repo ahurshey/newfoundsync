@@ -205,6 +205,9 @@ window.__NFS_BUILD = "__NFS_BUILD__";
   .vstage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
   .vstage img { width: 112px; height: 112px; position: relative; z-index: 1; filter: drop-shadow(0 6px 18px rgba(0,0,0,.55)); }
   #vlogo.viz-off .vstage canvas { display: none; }
+  /* …except while the buffering ring is running: it is drawn on that same canvas, and a user who
+     turned the visualizer off must still get a loading indicator. */
+  #vlogo.viz-off.buffering .vstage canvas { display: block; }
   #vlogo.viz-off .vstage img { animation: none; } /* visualizer off → logo fully static */
   .vizbtn {
     border: 1px solid var(--border); background: var(--surface-alt); color: var(--text); cursor: pointer;
@@ -213,6 +216,14 @@ window.__NFS_BUILD = "__NFS_BUILD__";
   }
   .vizbtn:hover { background: var(--surface); border-color: var(--accent); color: var(--accent); }
   .vizbtn:focus-visible { outline: none; box-shadow: var(--focus); }
+  /* While connecting/buffering this button IS the loading label ("Buffering… 1.6s"), so it reads as
+     status rather than a control: dimmed, inert, and tabular so the ticking countdown doesn't make
+     the pill breathe. It reverts to "Visualizer: On/Off" the moment playback starts. */
+  .vizbtn.busy { color: var(--dim); letter-spacing: 1.4px; cursor: default; font-variant-numeric: tabular-nums; }
+  .vizbtn.busy:hover { background: var(--surface-alt); border-color: var(--border); color: var(--dim); }
+  .vizbtn:disabled { opacity: 1; }
+  .vizbtn.restored { animation: vizpop .34s ease; }
+  @keyframes vizpop { from { opacity: 0; transform: translateY(5px) scale(.94); } to { opacity: 1; transform: none; } }
   #hero {
     width: 132px; height: 132px; border-radius: 50%; flex: none;
     display: flex; align-items: center; justify-content: center;
@@ -231,27 +242,11 @@ window.__NFS_BUILD = "__NFS_BUILD__";
   button#start:focus-visible { outline: none; box-shadow: var(--focus), var(--shadow-glow); }
   #hint { color: var(--dim); max-width: 460px; text-align: center; font-size: 14px; line-height: 1.5; }
 
-  /* ---- buffering loading bar (centered inside the header strip, top-center) ---- */
-  /* Absolutely centered within the position:relative <header>, so it floats in the empty
-     middle of the header bar. Out of flow → showing/hiding it never reflows the header or
-     the logo/controls below it (no layout jump). */
-  #buffering {
-    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
-    display: none; flex-direction: column; align-items: stretch; gap: 4px;
-    width: clamp(120px, 22vw, 240px); pointer-events: none;
-  }
-  #buftext { color: var(--dim); font-size: 11px; font-weight: 600; letter-spacing: .3px; text-align: center; }
-  #bufbar {
-    width: 100%; height: 6px; border-radius: 999px; overflow: hidden;
-    background: var(--surface-alt); border: 1px solid var(--border); box-shadow: var(--slot);
-  }
-  #bufbarfill {
-    height: 100%; width: 0%; border-radius: 999px;
-    background: linear-gradient(90deg, var(--accent), var(--accent-hi));
-    box-shadow: 0 0 10px rgba(59,142,255,.5); transition: width .1s linear;
-  }
-  #bufbar.indeterminate #bufbarfill { width: 38% !important; transition: none; animation: bufslide 1.15s ease-in-out infinite; }
-  @keyframes bufslide { 0% { transform: translateX(-110%); } 100% { transform: translateX(285%); } }
+  /* ---- buffering: see the ring around the logo, drawn in app.js ------------- */
+  /* There is deliberately no loading-bar markup here any more. It used to be a bar absolutely
+     centred inside the <header>, which on a narrow phone drew straight over the title and the
+     theme/zoom buttons. Progress is now the ring around the logo — the one element guaranteed to
+     be on screen for the whole connect+buffer window — and #viztoggle is its label. */
 
   /* ---- controls card ------------------------------------------------------ */
   #controls {
@@ -357,7 +352,8 @@ window.__NFS_BUILD = "__NFS_BUILD__";
 
   @media (min-width: 720px) { footer { justify-content: flex-start; } }
   @media (max-width: 480px) { header h1 { font-size: 16px; } button#start { width: calc(100% - 20px); max-width: 360px; } }
-  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } #dot, #bufbar.indeterminate #bufbarfill { animation: none !important; } }
+  /* The buffering ring's own spin is suppressed in app.js (it is canvas, not CSS). */
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } #dot, .vizbtn.restored { animation: none !important; } }
 
   /* immersive ("fill the screen") fallback for iPhone canvas video */
   body.immersive header, body.immersive footer, body.immersive #hint, body.immersive #warn { display: none !important; }
@@ -378,12 +374,6 @@ window.__NFS_BUILD = "__NFS_BUILD__";
     <button id="zoomout" class="zoombtn" type="button" title="Smaller (zoom out)" aria-label="Zoom out">−</button>
     <button id="zoomin" class="zoombtn" type="button" title="Larger (zoom in)" aria-label="Zoom in">+</button>
     <button id="fsbtn" class="iconbtn" title="Fullscreen" aria-label="Fullscreen">⛶</button>
-    <!-- Buffering loading bar — absolutely centered in the header strip (top-center), out of
-         flow so showing/hiding it never reflows the header or the content below it. -->
-    <div id="buffering">
-      <div id="buftext">Buffering…</div>
-      <div id="bufbar"><div id="bufbarfill"></div></div>
-    </div>
   </header>
   <main>
     <div id="stage"><canvas id="video"></canvas></div>

@@ -92,10 +92,6 @@ const els = {
   viztoggle: document.getElementById("viztoggle"),
   hero: document.getElementById("hero"),
   biglogo: document.getElementById("biglogo"),
-  buffering: document.getElementById("buffering"),
-  bufbar: document.getElementById("bufbar"),
-  bufbarfill: document.getElementById("bufbarfill"),
-  buftext: document.getElementById("buftext"),
   canvas: document.getElementById("video"),
   state: document.getElementById("state"),
   sync: document.getElementById("sync"),
@@ -419,8 +415,23 @@ if (window.caches) {
 // "breathe" on the logo. Toggleable (button under the logo), default on, persisted.
 const VIZ = { raf: 0, enabled: true, ctx: null, freq: null };
 
+// The buffering ring shares that canvas (see showBuffering, down in the stats section). Declared
+// HERE, above applyVizUI, because applyVizUI runs at module top-level a few dozen lines below —
+// reading a `const` declared further down would be a temporal-dead-zone ReferenceError that kills
+// app.js during startup, which is precisely how this client broke once before.
+// frac      — the single clockwise fill, 0..1, monotonic for the whole connect+buffer sweep
+// det       — is the buffer countdown currently known? (derived each tick, never passed in)
+// handoff   — frac at the moment `det` last went true; the buffer maps onto what is left of the ring
+// everKnown — have we ever had a countdown? distinguishes "Connecting…" from "Reconnecting…"
+// t0        — rAF timestamp the ring came up, for the connect ease
+const BUF = { raf: 0, active: false, frac: 0, det: false, handoff: 0, everKnown: false, t0: 0, drawnFrac: -1 };
+// Honour the OS "reduce motion" setting: the ring is canvas, so no CSS media query can reach it.
+const REDUCED_MOTION = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+
 function applyVizUI() {
-  if (els.viztoggle) els.viztoggle.textContent = "Visualizer: " + (VIZ.enabled ? "On" : "Off");
+  // While the ring is running this button is the buffering LABEL, not the toggle — leave its text
+  // alone or the countdown gets overwritten (the toggle can't be pressed then anyway).
+  if (els.viztoggle && !BUF.active) els.viztoggle.textContent = "Visualizer: " + (VIZ.enabled ? "On" : "Off");
   if (els.vlogo) els.vlogo.classList.toggle("viz-off", !VIZ.enabled);
 }
 function vizStop() {
@@ -430,6 +441,7 @@ function vizStop() {
 }
 function vizStart() {
   if (!VIZ.enabled || !analyser || VIZ.raf) return;
+  if (BUF.active) return; // the buffering ring owns the canvas until it finishes
   if (!els.vlogo || els.vlogo.style.display === "none") return; // only while the logo is shown
   if (!VIZ.ctx && els.viz) VIZ.ctx = els.viz.getContext("2d");
   if (!VIZ.ctx) return;
@@ -438,6 +450,8 @@ function vizStart() {
 }
 function vizDraw() {
   VIZ.raf = 0;
+  // Yield WITHOUT clearing: the ring is mid-paint on this canvas and a clear here would strobe it.
+  if (BUF.active) return;
   if (!VIZ.enabled || !analyser || !els.vlogo || els.vlogo.style.display === "none") { vizStop(); return; }
   analyser.getByteFrequencyData(VIZ.freq);
   const c = els.viz, x = VIZ.ctx, W = c.width, H = c.height, cx = W / 2, cy = H / 2;
@@ -743,7 +757,7 @@ function onStart() {
   els.vlogo.style.display = "flex";
   vizStart();
   els.controls.style.display = "flex";
-  showBuffering(true, 0, "Connecting…"); // show the loading bar immediately
+  showBuffering(true, "Connecting…"); // ring starts spinning immediately
   setState("connecting", "warn");
 
   if (!wired) {
@@ -1800,38 +1814,163 @@ function toggleFullscreen() {
 // =============================================================================
 // Stats
 // =============================================================================
-// Drive the buffering loading bar. indeterminate=null → hide.
-// The determinate fill is animated per-frame (requestAnimationFrame) off the deterministic
-// countdown so it glides smoothly instead of stepping every stats tick.
-let bufRaf = 0;
-function bufAnimStop() {
-  if (bufRaf) { cancelAnimationFrame(bufRaf); bufRaf = 0; }
+// ---- buffering ring ---------------------------------------------------------
+// Progress is the ring AROUND THE LOGO: the visualizer's own 56 bars, lit clockwise from twelve
+// o'clock. Same canvas, same centre, same radii as vizDraw() — so when the buffer fills, the bars
+// don't move, they just start reacting to the audio. The loader turns into the visualizer.
+//
+// The logo is the right host for it because start() shows #vlogo immediately ("branding while we
+// connect/buffer") and the video stage only replaces it once real frames render — so it is the one
+// element guaranteed to be on screen for the entire connect+buffer window.
+//
+// Canvas ownership is exclusive (vizStop() on entry, vizStart() on exit): two rAF loops painting
+// one canvas would flicker.
+// Connecting and buffering are ONE clockwise sweep, not two animations. Connecting owns the first
+// quarter of the circle and eases toward it asymptotically — always moving forward, never able to
+// claim more than its share however long the clock handshake takes — and the buffer countdown picks
+// the fill up from exactly where the creep left it and carries it to the top. The fill is monotonic
+// by construction (see bufTick), so the ring never jumps backwards.
+const BUF_BARS = 56; // must match vizDraw()'s bar count, or the hand-off would visibly jump
+const BUF_CONNECT_ARC = 0.25; // the share of the circle the unbounded connect phase may occupy
+const BUF_CONNECT_TAU = 0.9; // seconds; time constant of the ease toward that share
+// The wake: a ripple trailing back from the leading edge. This is what carries LIVENESS — the fill
+// itself is nearly still during a slow connect, and a static ring reads as hung. Splitting the two
+// jobs is what lets the fill be honest about position instead of spinning to prove it is alive.
+const BUF_WAKE_DECAY = 9; // bars; how fast the ripple fades behind the head
+const BUF_WAKE_FREQ = 0.62; // radians per bar
+const BUF_WAKE_SPEED = 5.5; // radians per second
+
+function bufLabel(text) {
+  if (els.viztoggle && els.viztoggle.textContent !== text) els.viztoggle.textContent = text;
 }
-function bufAnimTick() {
-  bufRaf = 0;
-  if (!started || ac == null || offsetNs === null || firstPlayoutAc === null) return;
-  const remain = firstPlayoutAc - ac.currentTime;
-  const total = Math.max(0.2, bufferMs / 1000);
-  const pct = Math.max(0, Math.min(100, (1 - remain / total) * 100));
-  els.bufbarfill.style.width = pct.toFixed(2) + "%";
-  els.buftext.textContent = "Buffering… " + Math.max(0, remain).toFixed(1) + "s";
-  if (remain > 0.02) bufRaf = requestAnimationFrame(bufAnimTick); // keep gliding until full
+
+function bufDraw(nowMs) {
+  if (!VIZ.ctx && els.viz) VIZ.ctx = els.viz.getContext("2d");
+  const x = VIZ.ctx;
+  if (!x || !els.viz) return;
+  const W = els.viz.width, H = els.viz.height, cx = W / 2, cy = H / 2;
+  x.clearRect(0, 0, W, H);
+  const inner = W * 0.37, maxLen = W * 0.105; // identical to vizDraw()
+  const edge = BUF.frac * BUF_BARS; // leading edge, in bar units
+  const t = nowMs / 1000;
+  x.lineCap = "round";
+  x.lineWidth = 3.4;
+  for (let i = 0; i < BUF_BARS; i++) {
+    const ang = (i / BUF_BARS) * Math.PI * 2 - Math.PI / 2; // -90° = twelve o'clock
+    const ca = Math.cos(ang), sa = Math.sin(ang);
+    // Fractional at the edge, so a bar lights gradually rather than snapping — 56 bars over a 3 s
+    // buffer is one step every 54 ms, which would be visibly steppy as a hard threshold.
+    let on = Math.min(1, Math.max(0, edge - i));
+    let gain = 1;
+    const behind = edge - i; // >0 for bars the fill has already passed
+    if (!REDUCED_MOTION && behind > 0) {
+      // Reduced motion keeps the fill (real progress is allowed to move) and drops only the ripple.
+      const amp = Math.exp(-behind / BUF_WAKE_DECAY);
+      const w = Math.sin(behind * BUF_WAKE_FREQ - t * BUF_WAKE_SPEED);
+      gain = 1 + 0.42 * w * amp; // stays within [0.58, 1.42] — length can never go negative
+      on = Math.min(1, Math.max(0, on * (1 + 0.35 * w * amp) + 0.3 * amp * Math.max(0, w)));
+    }
+    const len = maxLen * (0.3 + 0.7 * on) * gain; // unlit bars stay faintly present, so it reads as a ring
+    x.strokeStyle = "rgba(108,182,255," + (0.14 + 0.76 * on).toFixed(3) + ")";
+    x.beginPath();
+    x.moveTo(cx + ca * inner, cy + sa * inner);
+    x.lineTo(cx + ca * (inner + len), cy + sa * (inner + len));
+    x.stroke();
+  }
 }
-function showBuffering(indeterminate, pct, text) {
+
+function bufTick(nowMs) {
+  BUF.raf = 0;
+  if (!BUF.active) return;
+  if (BUF.t0 === 0) BUF.t0 = nowMs; // rAF's clock, so the creep is measured on the frame timeline
+
+  // The countdown exists once the clock is anchored and audio is scheduled: firstPlayoutAc is the
+  // AudioContext time the first buffered frame will sound, so the remaining wait is exact.
+  const known = started && ac != null && offsetNs !== null && firstPlayoutAc !== null;
+  let target;
+  if (known) {
+    const remain = firstPlayoutAc - ac.currentTime;
+    const total = Math.max(0.2, bufferMs / 1000);
+    const progress = Math.max(0, Math.min(1, 1 - remain / total));
+    // Rising edge: remember where the creep got to and map the buffer onto what's LEFT of the
+    // circle. That is what makes the two phases one sweep with no visible seam — and, after a
+    // reconnect, what stops a fresh countdown from dragging the ring backwards.
+    if (!BUF.det) { BUF.det = true; BUF.everKnown = true; BUF.handoff = BUF.frac; }
+    target = BUF.handoff + (1 - BUF.handoff) * progress;
+    bufLabel("Buffering… " + Math.max(0, remain).toFixed(1) + "s");
+  } else {
+    // Connecting — or the countdown vanished mid-fill, which is what a dropped socket looks like:
+    // teardownConnection() nulls offsetNs/firstPlayoutAc AND clears statsTimer, so updateStats
+    // (showBuffering's only periodic caller) stops running until the backoff fires connect() again.
+    // Nothing else would notice, so this branch has to.
+    //
+    // The ease approaches BUF_CONNECT_ARC and stops: a phase of unknown length must never be able
+    // to claim more than its share of the circle. During a reconnect the target computes lower than
+    // the fill already reached, and the monotonic clamp below turns that into "hold" — the ring
+    // keeps its position and the wake keeps rippling to show it is alive.
+    BUF.det = false;
+    const elapsed = (nowMs - BUF.t0) / 1000;
+    target = BUF_CONNECT_ARC * (1 - Math.exp(-elapsed / BUF_CONNECT_TAU));
+    bufLabel(BUF.everKnown ? "Reconnecting…" : "Connecting…");
+  }
+  // Monotonic, always: the ring only ever advances clockwise.
+  BUF.frac = Math.max(BUF.frac, Math.min(1, target));
+
+  // With the wake running there is something new to draw every frame. Under reduced motion the
+  // ripple is off, so a still fill is a still image — skip the repaint, but keep ticking, because
+  // the tick is what notices the countdown arriving.
+  if (!REDUCED_MOTION || BUF.frac !== BUF.drawnFrac) {
+    bufDraw(nowMs);
+    BUF.drawnFrac = BUF.frac;
+  }
+  BUF.raf = requestAnimationFrame(bufTick);
+}
+
+// Drive the buffering ring. indeterminate=null → done: hand the canvas back to the visualizer and
+// restore the button to its "Visualizer: On/Off" self.
+function showBuffering(indeterminate, text) {
   if (indeterminate === null) {
-    bufAnimStop();
-    els.buffering.style.display = "none";
+    if (!BUF.active) return; // already idle — don't re-fire the restore animation every stats tick
+    BUF.active = false;
+    if (BUF.raf) { cancelAnimationFrame(BUF.raf); BUF.raf = 0; }
+    if (VIZ.ctx && els.viz) VIZ.ctx.clearRect(0, 0, els.viz.width, els.viz.height);
+    if (els.vlogo) els.vlogo.classList.remove("buffering");
+    if (els.viztoggle) {
+      els.viztoggle.disabled = false;
+      els.viztoggle.classList.remove("busy", "restored");
+      void els.viztoggle.offsetWidth; // reflow so the animation replays on a back-to-back swap
+      els.viztoggle.classList.add("restored");
+    }
+    applyVizUI(); // button becomes the toggle again
+    vizStart(); // …and the bars pick up the audio from exactly where the ring left them
     return;
   }
-  els.buffering.style.display = "flex";
-  if (text != null) els.buftext.textContent = text;
-  if (indeterminate) {
-    bufAnimStop();
-    els.bufbar.classList.add("indeterminate");
-  } else {
-    els.bufbar.classList.remove("indeterminate");
-    if (!bufRaf) bufRaf = requestAnimationFrame(bufAnimTick); // rAF drives width + text
+  // `indeterminate` is advisory only. Which phase we are in is DERIVED in bufTick from the same
+  // state updateStats reads (offsetNs / firstPlayoutAc), so the two can never disagree — and so the
+  // socket-drop case, where nothing calls in at all, is still handled.
+  if (text != null) bufLabel(text);
+  if (!BUF.active) {
+    BUF.active = true;
+    BUF.frac = 0;
+    BUF.det = false;
+    BUF.handoff = 0;
+    BUF.everKnown = false;
+    BUF.t0 = 0; // stamped on the first tick
+    BUF.drawnFrac = -1; // force the first paint of this run
+    vizStop(); // take the canvas
+    // Force the canvas visible even for a user who turned the visualizer off (that state hides it),
+    // otherwise they would get no loading indicator at all.
+    if (els.vlogo) els.vlogo.classList.add("buffering");
+    if (els.viztoggle) {
+      // Drop `restored` too. It is the class carrying the "pop back into a button" animation, and
+      // stop() hides #vlogo — taking an element display:none and back RESTARTS its CSS animations,
+      // so a leftover `restored` would pop the "Connecting…" label on every Start after the first.
+      els.viztoggle.classList.remove("restored");
+      els.viztoggle.classList.add("busy");
+      els.viztoggle.disabled = true;
+    }
   }
+  if (!BUF.raf) BUF.raf = requestAnimationFrame(bufTick);
 }
 
 // How long without a decoded audio frame counts as stalled. Frames arrive every 20 ms, so seconds of
@@ -1882,12 +2021,19 @@ function updateStats() {
       showBuffering(null);
       setState("no audio", "warn");
     } else {
-      everPlayed = true;
+      // Latch only once audio has ACTUALLY sounded. Reaching here means the clock is anchored, not
+      // that anything played: connect to a relay with nobody casting yet (or an iPhone whose
+      // AudioContext hasn't unlocked) and firstPlayoutAc is still null, so this branch runs ~0.5 s
+      // after Start. Latching there would permanently suppress the buffering ring — every call site
+      // is gated `everPlayed ? null : …` — so when a caster finally starts, the real 3 s pre-roll
+      // would run with no ring at all. `aPlayable` counts frames that got past the playability
+      // guard, i.e. sound, which is exactly the condition `everPlayed` is meant to name.
+      if (aPlayable > 0) everPlayed = true;
       showBuffering(null);
       setState("playing", "ok");
     }
   } else if (started) {
-    showBuffering(everPlayed ? null : true, 0, offsetNs === null ? "Connecting…" : "Buffering…");
+    showBuffering(everPlayed ? null : true, offsetNs === null ? "Connecting…" : "Buffering…");
   }
   els.sync.textContent = offsetNs === null ? "…" : "✔ ±" + syncJitterMs().toFixed(1) + "ms";
   const vbuf = cfg && cfg.video ? " · vid enc " + evq.length + "/dec " + vq.length : "";

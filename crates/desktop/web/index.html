@@ -349,6 +349,11 @@ window.__NFS_BUILD = "__NFS_BUILD__";
   }
   footer span { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 5px 9px; }
   footer b { color: var(--text); font-weight: 600; }
+  /* Version sits apart from the stat chips: pushed to the far right, and unboxed so it reads as a
+     quiet build stamp rather than another live statistic. `margin-left: auto` eats the free space, so
+     it lands on the right edge on a wide window and simply wraps to the end of the strip on a narrow
+     one -- no absolute positioning to fight the flex-wrap or the iOS safe-area padding. */
+  footer #ver { margin-left: auto; background: none; border: none; padding: 5px 0; opacity: .75; }
 
   @media (min-width: 720px) { footer { justify-content: flex-start; } }
   @media (max-width: 480px) { header h1 { font-size: 16px; } button#start { width: calc(100% - 20px); max-width: 360px; } }
@@ -431,6 +436,9 @@ window.__NFS_BUILD = "__NFS_BUILD__";
     <span>buffer: <b id="buf">—</b></span>
     <span>audio: <b id="ai">—</b></span>
     <span>video: <b id="vi">—</b></span>
+    <!-- Server stamps __NFS_VERSION__ (see webserver.rs shell_body). Last child + margin-left:auto in
+         the CSS pins it to the lower right, so a bug report can name the build it came from. -->
+    <span id="ver">v__NFS_VERSION__</span>
   </footer>
   <div id="namemodal">
     <div class="modalcard">

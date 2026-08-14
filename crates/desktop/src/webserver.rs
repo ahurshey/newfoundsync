@@ -154,13 +154,24 @@ fn build_tag() -> std::borrow::Cow<'static, str> {
     std::borrow::Cow::Borrowed(TAG.get_or_init(compute).as_str())
 }
 
-/// A shell file with the `__NFS_BUILD__` placeholder stamped with the current build tag, so it carries
-/// the version its client-side self-heal check compares against. Cached in normal operation;
-/// re-read + re-stamped per request under `NFS_WEB_DIR`.
+/// The RELEASE version (`0.1.3`), as shown in the client's footer so a bug report can name the build.
+///
+/// Deliberately NOT `build_tag()`, which is a content hash of the web shell used for cache-busting and
+/// is blind to Rust-side changes. This is the crate version, which is what a tag corresponds to.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A shell file with its placeholders stamped: `__NFS_BUILD__` with the current build tag (what the
+/// client-side self-heal check compares against) and `__NFS_VERSION__` with the release version (what
+/// the footer displays). Cached in normal operation; re-read + re-stamped per request under
+/// `NFS_WEB_DIR`.
 fn shell_body(which: Shell) -> std::borrow::Cow<'static, str> {
     if dev_web_dir().is_some() {
         let tag = build_tag();
-        return std::borrow::Cow::Owned(shell_source(which).replace("__NFS_BUILD__", &tag));
+        return std::borrow::Cow::Owned(
+            shell_source(which)
+                .replace("__NFS_BUILD__", &tag)
+                .replace("__NFS_VERSION__", APP_VERSION),
+        );
     }
     // Normal path: substitute once, then hand out a borrow forever.
     macro_rules! once {
@@ -168,7 +179,12 @@ fn shell_body(which: Shell) -> std::borrow::Cow<'static, str> {
             static $slot: std::sync::OnceLock<String> = std::sync::OnceLock::new();
             std::borrow::Cow::Borrowed(
                 $slot
-                    .get_or_init(|| which.embedded().replace("__NFS_BUILD__", &build_tag()))
+                    .get_or_init(|| {
+                        which
+                            .embedded()
+                            .replace("__NFS_BUILD__", &build_tag())
+                            .replace("__NFS_VERSION__", APP_VERSION)
+                    })
                     .as_str(),
             )
         }};

@@ -2375,9 +2375,36 @@ impl eframe::App for ServerApp {
         } else {
             c_dim()
         };
-        // Truncate (ellipsize) — a long `Couldn't …` anyhow chain must stay one line, not wrap
-        // off the bottom of the (non-scrolling) window.
-        ui.add(egui::Label::new(egui::RichText::new(st).monospace().size(13.0).color(col)).truncate());
+        // Status on the left, build version pinned to the lower-right corner.
+        //
+        // Right-to-left OUTER with a left-to-right INNER is the egui idiom for "pin one thing to the
+        // right, give the rest to the left": the outer layout places the version first (so it lands on
+        // the right edge), then the inner child receives whatever width is left and fills it normally.
+        // Doing it the other way round — status first, then a right-aligned version — does not work,
+        // because the truncating label below claims the full remaining width and leaves the version
+        // nothing to sit in.
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // The crate version, i.e. what a release tag corresponds to, so a user reporting a bug
+                // can read their build straight off the window. Matches the web client's footer stamp.
+                ui.label(
+                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .monospace()
+                        .size(12.0)
+                        .color(c_dim()),
+                );
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    // Truncate (ellipsize) — a long `Couldn't …` anyhow chain must stay one line, not
+                    // wrap off the bottom of the (non-scrolling) window.
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(st).monospace().size(13.0).color(col),
+                        )
+                        .truncate(),
+                    );
+                });
+            });
+        });
     }
 }
 

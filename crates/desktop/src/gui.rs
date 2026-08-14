@@ -333,6 +333,50 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
     }
     let options = eframe::NativeOptions {
         viewport,
+        // WHY THIS EXISTS: dragging the window corner used to leave the frame trailing well behind
+        // the pointer, and the further you dragged the further behind it got.
+        //
+        // It is a latency bug in the present path, not slow layout. Our `App::ui` is cheap and the
+        // QR texture is cached, so the frame itself costs a millisecond or two. What costs the rest:
+        //
+        //   1. egui-wgpu reconfigures the surface SYNCHRONOUSLY on every single WindowEvent::Resized
+        //      (`Painter::on_window_resized` -> `configure_surface`), with no coalescing. On Vulkan
+        //      `Surface::configure` calls `release_resources`, which is a full `vkDeviceWaitIdle` --
+        //      it blocks until every frame still queued for presentation has actually been shown.
+        //   2. With the default `desired_maximum_frame_latency` (wgpu's `get_default_config` picks 2)
+        //      there are up to TWO frames queued at any moment, so that wait is up to two monitor
+        //      refreshes -- ~33 ms at 60 Hz -- BEFORE the swapchain rebuild even starts.
+        //   3. With the default `present_mode` (AutoVsync -> Fifo) the queue is drained strictly on
+        //      the refresh clock, which is what makes the wait that long in the first place.
+        //
+        // Wayland makes the result visible in a way X11 and Windows do not: a resize is client-driven
+        // there, so the window edge does not move until WE commit a buffer at the new size. Every
+        // millisecond of present latency is a millisecond of the frame lagging the mouse.
+        //
+        // Note that `NativeOptions::vsync` is NOT the knob -- it is documented as "only affects the
+        // `glow` backend", and eframe 0.34 defaults to wgpu. Setting it does nothing here, which is
+        // most of why this is hard to find.
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            // wgpu's own docs recommend exactly this for our shape of program: "Choose `1` to
+            // minimize latency above all else. [...] For applications like GUIs doing a small amount
+            // of GPU work each frame that need low latency, this is a reasonable choice." One frame
+            // in flight instead of two halves the `vkDeviceWaitIdle` above.
+            desired_maximum_frame_latency: Some(1),
+            // Do not gate the queue on the refresh clock. This is the term that actually kills the
+            // stall: with nothing waiting on vblank, the wait-idle inside the resize reconfigure
+            // returns as soon as the GPU is done (~1 ms) instead of at the next refresh.
+            //
+            // This does NOT mean tearing on a Wayland session -- the compositor composites whole
+            // frames, and we never ask for the tearing-control protocol. The real cost is that while
+            // egui is asking for continuous repaints (a hover animation, a slider drag) frames are no
+            // longer capped at the refresh rate, so a core works harder than it needs to. That is an
+            // acceptable trade for a window that is idle almost all the time -- it repaints once a
+            // second when nothing is happening. If the idle/hover CPU ever matters more than resize
+            // smoothness, drop THIS line and keep the frame-latency one above; that alone recovers
+            // roughly half the win.
+            present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(

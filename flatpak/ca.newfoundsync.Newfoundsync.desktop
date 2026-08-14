@@ -1,3 +1,4 @@
+#!/usr/bin/env xdg-open
 [Desktop Entry]
 Name=Newfoundsync
 Comment=LAN audio sharing with tight multi-room sync

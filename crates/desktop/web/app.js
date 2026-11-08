@@ -287,7 +287,13 @@ function markAligned(v) {
   const changed = v !== aligned;
   aligned = v;
   try { localStorage.setItem("nfs_aligned", v ? "1" : "0"); } catch (e) {}
-  if (changed) flushVideo(); // re-time the video queue to the new audible-instant map
+  if (changed) {
+    flushVideo(); // re-time the video queue to the new audible-instant map
+    // The flag also moves AUDIO: an un-aligned device's anchor is pulled earlier by outLat (onAudioData).
+    // Aligning drops that pull (play outLat later); un-aligning restores it. Shift the buffered lead now
+    // rather than leaving the step correction to notice it ~160 ms (plus a whole buffer) later.
+    shiftAudio(((v ? 1 : -1) * outLatMs) / 1000);
+  }
 }
 function loadTrim() {
   try {
@@ -304,6 +310,7 @@ function loadTrim() {
 }
 function setTrim(ms) {
   if (!Number.isFinite(ms)) return; // a NaN would poison serverPtsToPerfMs → all scheduling stops (unrecoverable without reload)
+  const before = effTrimMs();
   trimMs = Math.max(-2000, Math.min(3000, Math.round(ms * 10) / 10)); // 0.1 ms resolution (calibration is sub-ms)
   els.trim.value = String(trimMs);
   els.trimval.textContent = (trimMs >= 0 ? "+" : "") + trimMs.toFixed(1) + " ms";
@@ -311,7 +318,7 @@ function setTrim(ms) {
   try {
     localStorage.setItem("nfs_trim", String(trimMs));
   } catch (e) {}
-  reanchorAudio(); // re-anchor audio so the change takes effect immediately (+ cancel the stale buffered lead)
+  shiftAudio((effTrimMs() - before) / 1000); // takes effect within ~20 ms, keeping the buffered lead
   flushVideo(); // re-time the video queue to the new offset
   reportSync(); // let the server GUI reflect this device's real sync
 }
@@ -329,7 +336,7 @@ els.trimup.addEventListener("click", () => { setTrim(trimMs + 10); markAligned(e
 // Does NOT touch the server's pushed offset (remoteTrimMs): that belongs to the operator, and the
 // server would re-push it on the next state sweep anyway. The server's own reset clears both ends.
 function resetSync(note) {
-  setTrim(0); //          re-anchors audio, flushes the video queue, reports the new sync upstream
+  setTrim(0); //          shifts audio, flushes the video queue, reports the new sync upstream
   markAligned(false); //  re-enables the output-latency model for an un-calibrated device
   // Replaces any stale "✔ Aligned to the reference…" text, which would otherwise still be sitting
   // there claiming an alignment that was just thrown away.
@@ -517,6 +524,8 @@ let liveSources = new Set(); // scheduled playout AudioBufferSourceNodes, so re-
 let firstPlayoutAc = null; // ac time the first buffered audio is scheduled to sound
 let aRateInt = 0; // playout drift servo: integral accumulator (rate units, anti-windup clamped)
 let aRatePrev = 1.0; // last applied playback rate (per-frame slew limiting → smooth pitch)
+let aStepRun = 0; // signed count of consecutive frames whose playout error exceeded A_STEP (see onAudioData)
+let aSteps = 0; // step corrections applied this session (diagnostics: nfsDebug().audioSteps)
 let evq = []; // ENCODED video queue [{key, tsUs, data}] — cheap, holds the whole buffer
 let vq = []; // DECODED render queue [{frame, targetPerf}] — small, kept just ahead
 let maxEvq = 400; // encoded queue cap (recomputed from fps + bufferMs)
@@ -1153,9 +1162,10 @@ function onMessage(ev) {
     if (Number.isFinite(ms)) {
       const next = Math.max(-5000, Math.min(5000, ms));
       if (next !== remoteTrimMs) {
+        const before = effTrimMs();
         remoteTrimMs = next;
+        shiftAudio((effTrimMs() - before) / 1000); // apply the new offset now, keeping the buffered lead
         markAligned(effTrimMs() !== 0); // server push (or reset to 0) re-evaluates whether we're aligned
-        reanchorAudio(); // re-anchor audio so the new offset takes effect immediately (+ cancel stale lead)
         flushVideo(); // re-time the video queue too (mirror setTrim, so A/V stay aligned)
         reportSync(); // report the new effective total back so the GUI reflects it
       }
@@ -1210,10 +1220,9 @@ function onMessage(ev) {
   if (type === MSG_AUDIO) {
     if (!audioDecoder || offsetNs === null) return;
     if (audioDecoder.decodeQueueSize > 200) {
-      // Device fell behind: shed this frame. Re-anchor so the next decoded frame snaps back
-      // to its true PTS instead of butting against the playhead and drifting permanently
-      // ahead of the other clients (a silent desync is worse than one brief gap).
-      reanchorAudio(); // shed: cancel the buffered lead and hard re-anchor the next frame
+      // Device fell behind: shed this frame. The hole it leaves is healed by onAudioData's step
+      // correction (the next frames land early by the hole → shiftAudio within ~160 ms). This used to
+      // reanchorAudio(), which also cancelled the whole buffered lead: seconds of silence per shed.
       return;
     }
     const ptsNs = dv.getBigInt64(1, false);
@@ -1658,10 +1667,65 @@ function stopAudioSources() {
   liveSources.clear();
 }
 // Re-anchor the audio scheduler at a discontinuity: drop the buffered lead (cancel scheduled sources) AND
-// force the next frame to hard re-anchor (aPlayhead === null).
+// force the next frame to hard re-anchor (aPlayhead === null). Costs a full buffer of silence (the next
+// frame lands bufferMs out) — reserve it for when the lead itself is invalid (Stop, a stale context, a
+// failing decoder). To MOVE playout in time, use shiftAudio(), which keeps the lead.
 function reanchorAudio() {
   stopAudioSources();
   aPlayhead = null;
+}
+
+// Schedule one decoded frame. Tags the node with its start time and playout length so shiftAudio()
+// can re-time it later.
+function scheduleAudioBuf(buf, rate, at) {
+  const src = ac.createBufferSource();
+  src.buffer = buf;
+  src.playbackRate.value = rate;
+  src.connect(gain);
+  src._at = at;
+  src._len = buf.duration / rate;
+  src.onended = () => liveSources.delete(src);
+  liveSources.add(src); // track so stop()/re-anchor can cancel this scheduled node (suspend() won't)
+  src.start(at);
+}
+
+// Move this device's playout by `deltaSec` (+ = later, − = earlier) WITHOUT throwing away the buffered
+// lead. Every frame not yet sounding is rescheduled at its old start + delta (a scheduled
+// AudioBufferSourceNode can't be moved, so each is replaced by a new node on the same buffer).
+//
+// Later → a delta-long silence opens between the frame now sounding and the rest.
+// Earlier → frames that would now land in the past, or under the frame still sounding, are skipped:
+// "play earlier" means skipping that much content, and skipping is the only overlap-free way to do it.
+//
+// This is what lets a trim change, a server push, a calibration step, or the drift step-correction in
+// onAudioData take effect within ~20 ms. reanchorAudio() did the same job by cancelling everything,
+// which meant a full buffer (~3 s) of silence on every slider nudge.
+function shiftAudio(deltaSec) {
+  if (!ac || aPlayhead === null || !Number.isFinite(deltaSec) || deltaSec === 0) return;
+  const now = ac.currentTime;
+  const MARGIN = 0.02; // a frame starting this soon may already be in the render pipeline — leave it
+  let floor = now + MARGIN;
+  const move = [];
+  for (const s of liveSources) {
+    if (s._at === undefined || s._at <= now + MARGIN) floor = Math.max(floor, (s._at || now) + (s._len || 0));
+    else move.push(s);
+  }
+  move.sort((a, b) => a._at - b._at);
+  for (const s of move) {
+    liveSources.delete(s);
+    try {
+      s.onended = null;
+      s.stop();
+      s.disconnect();
+    } catch (e) {}
+  }
+  for (const s of move) {
+    const at = s._at + deltaSec;
+    if (at < floor - 0.001) continue; // would overlap what's sounding (or is past) → skip this frame
+    scheduleAudioBuf(s.buffer, s.playbackRate.value, at);
+  }
+  aPlayhead += deltaSec;
+  if (firstPlayoutAc !== null && firstPlayoutAc > now) firstPlayoutAc += deltaSec;
 }
 
 function onAudioData(ad) {
@@ -1691,23 +1755,50 @@ function onAudioData(ad) {
   const outLatSec = aligned ? 0 : outLatMs / 1000;
   const targetAc = ac.currentTime + (serverPtsToPerfMs(ad.timestamp * 1000) - performance.now()) / 1000 - outLatSec;
 
-  // Drift correction: hard re-anchor ONLY on the first frame or a real discontinuity (resume / gap /
-  // trim change). Otherwise nudge the playback RATE a hair instead of jumping — a ±1% change is
-  // essentially inaudible. The servo is PI: the Proportional term reacts to the current drift, and a
-  // slow Integral term removes the standing crystal-ppm offset that a P-only loop would park just
-  // outside the deadband and never close. The integrator is clamped + frozen on every re-anchor
-  // (anti-windup), and the steady offsetNs (now EMA-smoothed) keeps it from chasing clock noise.
+  // Two tiers of correction. DRIFT (crystal ppm, offset slewing) is small and continuous: nudge the
+  // playback RATE a hair — a ±1% change is essentially inaudible. The servo is PI: the Proportional term
+  // reacts to the current drift, and a slow Integral term removes the standing crystal-ppm offset that a
+  // P-only loop would park just outside the deadband and never close.
+  //
+  // A DISCONTINUITY (frames the server dropped for a slow link, a clock snap, an output-latency jump) is
+  // a step, and a step must be stepped. The scheduler is gapless, so a missing 20 ms frame lands every
+  // later frame 20 ms EARLY; at the ±1% rate cap the servo needs ~2 s per 20 ms to crawl that back,
+  // so a burst of drops left one device audibly ahead of the room for tens of seconds — the classic
+  // "one speaker echoes until someone presses Reset". So once the error has sat beyond A_STEP for
+  // A_STEP_FRAMES frames in a row (persistence rides out currentTime quantization noise), shiftAudio()
+  // moves the whole lead by exactly the error: silence when early, a skip when late.
   const A_DEADBAND = 0.002; // ±2 ms: P-term dead-zone (anti-hunt only; the I-term carries steady state)
-  const A_HARD_RESET = 0.4; // beyond this it's a discontinuity, not drift → jump
+  const A_STEP = 0.015; //    a persistent error beyond ±15 ms is a step, not drift → shift, don't slew
+  const A_STEP_FRAMES = 8; // …once it has held on the same side for 8 frames (~160 ms)
+  const A_HARD_RESET = 0.4; // beyond this, act at once and restart the servo
   const A_MAX_ADJ = 0.01; //  cap the TOTAL rate change at ±1%
   const A_DRIFT_K = 0.1; //   proportional gain (reach the cap at ~100 ms of drift)
   const A_INT_K = 0.02; //    integral gain (per second of drift) — converges the standing offset
   const A_INT_LEAK = 0.999; // slow leak: keeps the I-term from sustaining a pure limit cycle inside the deadband
   const A_RATE_SLEW = 0.0008; // max rate change per frame → playbackRate moves smoothly (no pitch step)
-  if (aPlayhead === null || Math.abs(aPlayhead - targetAc) > A_HARD_RESET) {
+  if (aPlayhead === null) {
     aPlayhead = Math.max(targetAc, ac.currentTime + 0.03);
     aRateInt = 0; // anti-windup: clear the integrator on every hard re-anchor
     aRatePrev = 1.0;
+    aStepRun = 0;
+  } else {
+    const err = targetAc - aPlayhead; // + ⇒ playing early (move later); − ⇒ playing late (move earlier)
+    if (Math.abs(err) > A_HARD_RESET) {
+      shiftAudio(err);
+      aRateInt = 0; // a jump this size invalidates what the integrator learned
+      aRatePrev = 1.0;
+      aStepRun = 0;
+    } else if (Math.abs(err) > A_STEP) {
+      const dir = err > 0 ? 1 : -1;
+      aStepRun = Math.sign(aStepRun) === dir ? aStepRun + dir : dir;
+      if (Math.abs(aStepRun) >= A_STEP_FRAMES) {
+        shiftAudio(err); // keep the integrator: it carries the crystal ppm, which a step doesn't change
+        aStepRun = 0;
+        aSteps++;
+      }
+    } else {
+      aStepRun = 0;
+    }
   }
   // Never schedule in the past (would drop or pile up at "now" → clicks).
   if (aPlayhead < ac.currentTime + 0.005) {
@@ -1737,31 +1828,37 @@ function onAudioData(ad) {
   }
   ad.close();
   if (firstPlayoutAc === null) firstPlayoutAc = aPlayhead; // for the "buffering" countdown
-  const src = ac.createBufferSource();
-  src.buffer = buf;
-  src.playbackRate.value = rate; // gentle PI catch-up/slow-down (slew-limited, ≤±1%)
-  src.connect(gain);
-  src.onended = () => liveSources.delete(src);
-  liveSources.add(src); // track so stop()/re-anchor can cancel this scheduled node (suspend() won't)
-  src.start(aPlayhead);
+  scheduleAudioBuf(buf, rate, aPlayhead); // rate: gentle PI catch-up/slow-down (slew-limited, ≤±1%)
   aPlayhead += dur / rate; // advance by the ACTUAL playout time (rate changes it)
 }
 
 // =============================================================================
 // Mobile lifecycle: visibility, wake lock, fullscreen
 // =============================================================================
+// Background intervals longer than this re-anchor from scratch on return, even if audio kept running:
+// the clock samples are minutes old (hidden-tab timers are throttled) and the device may have slept.
+const VIS_KEEP_LEAD_MS = 60000;
+let hiddenAtWallMs = 0; // Date.now() when the page was last hidden (wall clock: advances across sleep)
 function onVisibility() {
   if (document.visibilityState === "visible") {
+    // Did audio keep playing while we were away? A desktop tab switch leaves the context running and the
+    // stream flowing, so the buffered lead is still valid — re-anchoring it threw a full buffer (~3 s)
+    // of silence at the user every time they came back to the tab. Keep it, and just refresh the clock;
+    // any error the fresh samples reveal is healed by onAudioData's step correction. Only a context the
+    // OS suspended (mobile), a long absence, or no anchor yet still re-anchors from scratch.
+    const awayMs = hiddenAtWallMs ? Date.now() - hiddenAtWallMs : Infinity;
+    const keepLead = !!ac && ac.state === "running" && awayMs < VIS_KEEP_LEAD_MS && aPlayhead !== null && offsetNs !== null;
     if (ac && ac.state !== "running") ac.resume().catch(() => {});
     refreshOutLat(); // output latency can change across a background interval (device switch)
     requestWakeLock();
-    // After a background interval the clock and queue are stale: re-anchor.
-    flushVideo();
+    flushVideo(); // video isn't buffered while hidden
     gotParams = false; // re-wait for the next keyframe
-    reanchorAudio(); // re-anchor audio (+ cancel the stale buffered lead from before backgrounding)
-    firstPlayoutAc = null;
-    offsets = [];
-    offsetNs = null;
+    if (!keepLead) {
+      reanchorAudio(); // re-anchor audio (+ cancel the stale buffered lead from before backgrounding)
+      firstPlayoutAc = null;
+      offsets = [];
+      offsetNs = null;
+    }
     if (ws && ws.readyState <= 1) {
       // OPEN → re-anchor the clock; CONNECTING → its onopen will sync. Either way don't
       // open a second socket on top of a live/in-flight one.
@@ -1775,6 +1872,7 @@ function onVisibility() {
     }
     scheduleDraw();
   } else {
+    hiddenAtWallMs = Date.now();
     flushVideo(); // stop holding decoded surfaces while hidden
   }
 }
@@ -2067,6 +2165,7 @@ window.nfsDebug = function () {
     // picture used to lead the lips by on an aligned device — read it here to size a sync complaint.
     avCorrectionMs: +(videoPresentMs(0) - serverPtsToPerfMs(0)).toFixed(1),
     audioFrames: aFrames,
+    audioSteps: aSteps, // step corrections (dropped frames / clock snaps healed by shiftAudio)
     evq: evq.length,
     vq: vq.length,
     acState: ac ? ac.state : null,
@@ -2882,8 +2981,7 @@ async function startListen() {
       if (trimMs !== bestTrim) setTrim(bestTrim);
       committed = true;
       markAligned(true); // calibration folds full output latency into trim → don't also model outLat (persisted)
-      reanchorAudio(); // re-anchor NOW: if bestTrim==current trim, setTrim above was skipped, so the
-      //                   outLatSec→0 transition would otherwise be slewed in over seconds (a brief desync)
+      //                    (markAligned itself shifts the buffered audio for the outLatSec→0 transition)
       const moved = Math.round(bestTrim - startTrim);
       const latNote = selfLoopSec != null ? " (own latency " + Math.round(selfLoopMs) + " ms)" : " (own latency estimated — accuracy limited)";
       setCalibStatus("✔ Aligned to the reference — nudged this device " + (moved >= 0 ? "+" : "") + moved + " ms." + latNote);

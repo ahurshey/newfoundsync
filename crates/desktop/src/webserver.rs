@@ -277,9 +277,17 @@ const MSG_CAST_GRANT: u8 = 0x33;
 const MSG_CAST_STOP: u8 = 0x34;
 
 // --- Cast / uplink safety limits ----------------------------------------------------------------
-/// Bounded per-client outbound queue, drained by a dedicated write task so a slow reader can never
+/// Bounded per-client outbound queues, drained by a dedicated write task so a slow reader can never
 /// block the serve() loop (which must stay live to free the caster slot + registry entry on drop).
-const OUT_QUEUE: usize = 256;
+///
+/// Two queues, drained with priority. Everything small and timing-critical — config, control, clock
+/// replies and AUDIO — goes on `OUT_QUEUE`; video on `VIDEO_QUEUE`. With one shared 256-slot queue a
+/// video keyframe burst or a brief Wi-Fi stall filled it in ~2.5 s (less than the client's 3 s buffer)
+/// and then dropped audio as readily as video; every dropped audio frame is a hole the client has to
+/// heal. Video is the one to shed: a dropped video frame costs a stutter, a dropped audio frame costs
+/// sync. 512 slots is ~10 s of 20 ms audio frames (~1 MB at 510 kbps), covering the deepest sane buffer.
+const OUT_QUEUE: usize = 512;
+const VIDEO_QUEUE: usize = 256;
 /// Per-socket write deadline: a wedged / half-open peer is evicted within this, not held forever.
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Max caster uplink payload (AFTER the tag byte). Opus stays well under 8 KiB even at 510 kbps; 4 MiB
@@ -315,6 +323,9 @@ pub struct StreamState {
     /// This stream's liveness/failure counters, reported by `/health`. Rides on the stream (rather
     /// than `AppState`) so a source swap automatically publishes the NEW pipeline's counters.
     pub health: Arc<crate::media::MediaHealth>,
+    /// The playout buffer every client was told to use (config `bufferMs`). A media frame still queued
+    /// for a client this long after its PTS can no longer be played on time, so the write task drops it.
+    pub buffer_ms: i64,
 }
 
 impl StreamState {
@@ -325,6 +336,7 @@ impl StreamState {
             video_tx: media.video_tx.clone(),
             cast_relay: media.cast_relay.clone(),
             health: media.health.clone(),
+            buffer_ms: media.config.buffer_ms,
         }
     }
 }
@@ -1050,6 +1062,17 @@ impl Exit {
     }
 }
 
+/// True when `b` is an audio/video frame whose PTS is more than `deadline_ns` in the past at `now_ns`:
+/// every client schedules a frame to play at PTS + its buffer, so by then it is useless to send.
+fn media_frame_expired(b: &[u8], now_ns: i64, deadline_ns: i64) -> bool {
+    use crate::media::{MSG_AUDIO, MSG_VIDEO};
+    if b.len() < 9 || (b[0] != MSG_AUDIO && b[0] != MSG_VIDEO) {
+        return false;
+    }
+    let pts = i64::from_be_bytes(b[1..9].try_into().unwrap());
+    now_ns > pts.saturating_add(deadline_ns)
+}
+
 /// Classify a failed `out_tx.try_send`. A FULL queue means this client is too far behind; a CLOSED
 /// channel means the write task already died (write error or `WRITE_TIMEOUT`). Collapsing both into
 /// "queue full" blames a slow client for what is really a dead peer — the exact kind of
@@ -1077,17 +1100,6 @@ async fn serve(
     // non-reading client can never block this loop — it must stay live to observe disconnects and free
     // the caster slot + registry entry (via ClientGuard) on return. Each socket write is timeout-bounded,
     // so a wedged / half-open peer is evicted within WRITE_TIMEOUT rather than holding the slot forever.
-    let (out_tx, mut out_rx) = mpsc::channel::<Message>(OUT_QUEUE);
-    let mut write_handle = tokio::spawn(async move {
-        let mut sender = sender;
-        while let Some(msg) = out_rx.recv().await {
-            match tokio::time::timeout(WRITE_TIMEOUT, sender.send(msg)).await {
-                Ok(Ok(())) => {}
-                _ => break, // write error OR deadline exceeded → peer is dead (drops sender → socket closes)
-            }
-        }
-    });
-
     // Per-connection counters + a start instant, so the exit line can report how long this client
     // lasted and how many frames it never got.
     let started = std::time::Instant::now();
@@ -1097,6 +1109,43 @@ async fn serve(
         .ok()
         .and_then(|reg| reg.get(&conn_id).map(|e| e.frames_dropped.clone()))
         .unwrap_or_default();
+
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(OUT_QUEUE);
+    let (video_tx, mut video_rx) = mpsc::channel::<Message>(VIDEO_QUEUE);
+    let deadline_ns = active.buffer_ms.max(0) * 1_000_000;
+    let write_dropped = dropped.clone();
+    let mut write_handle = tokio::spawn(async move {
+        let mut sender = sender;
+        loop {
+            // `biased`: drain the priority queue (config/control/clock/audio) before any video.
+            let mut msg = tokio::select! {
+                biased;
+                Some(m) = out_rx.recv() => m,
+                Some(m) = video_rx.recv() => m,
+                else => break,
+            };
+            // Clock reply: re-stamp t3 (the server's send instant) HERE, at the socket, not where the
+            // reply was queued. Time spent waiting in the queue happens after t3 was taken, so the
+            // client counted it as downlink delay — biasing its clock offset by half the wait, by a
+            // different amount on every device (it scales with each link's backlog).
+            if let Message::Binary(b) = &mut msg {
+                if b.len() == 17 && b[0] == MSG_CLOCK_RSP {
+                    b[9..17].copy_from_slice(&mono_now().to_be_bytes());
+                }
+                // Past its playout deadline: the client would only skip it (or worse, play it late
+                // until it noticed). The queues are deep enough to hold more than a buffer's worth, so
+                // this — not the queue size — is what keeps a slow link from delivering stale media.
+                if media_frame_expired(b, mono_now(), deadline_ns) {
+                    write_dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
+            match tokio::time::timeout(WRITE_TIMEOUT, sender.send(msg)).await {
+                Ok(Ok(())) => {}
+                _ => break, // write error OR deadline exceeded → peer is dead (drops sender → socket closes)
+            }
+        }
+    });
 
     // Config must be the client's first frame; the queue is empty so it lands immediately.
     if out_tx
@@ -1171,7 +1220,8 @@ async fn serve(
                         // True 4-timestamp NTP: t2 = the instant we dequeued the request, t3 = the
                         // instant just before we send the reply. The client cancels (t3 - t2) server
                         // dwell out of BOTH its offset and its RTT, removing the per-device DC bias the
-                        // old single-stamp scheme baked in. Reply: [tag][t2 i64 BE][t3 i64 BE].
+                        // old single-stamp scheme baked in. Reply: [tag][t2 i64 BE][t3 i64 BE]. The t3
+                        // stamped here is provisional: the write task re-stamps it at the socket.
                         let t2 = mono_now();
                         let mut r = Vec::with_capacity(17);
                         r.push(MSG_CLOCK_RSP);
@@ -1331,7 +1381,7 @@ async fn serve(
             }
             video = vrx.recv() => {
                 match video {
-                    Ok(frame) => match out_tx.try_send(Message::Binary((*frame).clone())) {
+                    Ok(frame) => match video_tx.try_send(Message::Binary((*frame).clone())) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => { dropped.fetch_add(1, Ordering::Relaxed); }
                         Err(mpsc::error::TrySendError::Closed(_)) => { exit = Exit::WriteFailed; break }
@@ -1364,5 +1414,30 @@ async fn serve(
         // Surfaced separately at warn: a client that dropped frames is the answer to "why does it
         // stutter on my phone" — and it's invisible if the disconnect itself was normal.
         tracing::warn!(conn_id, dropped = n_dropped, secs, "client fell behind and lost frames");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::{MSG_AUDIO, MSG_VIDEO};
+
+    #[test]
+    fn media_past_its_playout_deadline_is_expired_and_nothing_else_is() {
+        let pts: i64 = 10_000_000_000;
+        let buf = 3_000_000_000;
+        let mut audio = vec![MSG_AUDIO];
+        audio.extend_from_slice(&pts.to_be_bytes());
+        audio.push(0xAA);
+        assert!(!media_frame_expired(&audio, pts + buf, buf), "exactly at the deadline is still playable");
+        assert!(media_frame_expired(&audio, pts + buf + 1, buf));
+        let mut video = audio.clone();
+        video[0] = MSG_VIDEO;
+        assert!(media_frame_expired(&video, pts + buf + 1, buf));
+        let mut clock = vec![MSG_CLOCK_RSP];
+        clock.extend_from_slice(&0i64.to_be_bytes());
+        clock.extend_from_slice(&0i64.to_be_bytes());
+        assert!(!media_frame_expired(&clock, i64::MAX, buf), "control frames are never dropped");
+        assert!(!media_frame_expired(&[MSG_AUDIO, 1, 2], i64::MAX, buf), "a short frame is not parsed");
     }
 }

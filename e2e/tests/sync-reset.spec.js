@@ -12,6 +12,8 @@ test('reset clears the trim AND the aligned flag', async ({ page, browserName })
   await expect(page.locator('#start')).toBeVisible();
   await page.locator('#start').click();
   try { await page.locator('#nameskip').click({ timeout: 3000 }); } catch { /* not shown */ }
+  // Reset lives in the Sync panel, which opens from the Sync button.
+  await page.locator('#syncbtn').click();
   await expect(page.locator('#trimreset')).toBeVisible();
   const before = await page.evaluate(() => {
     setTrim(250);

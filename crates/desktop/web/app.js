@@ -38,6 +38,7 @@ const MSG_HELLO = 0x21; // client→server: identify with a stable id + friendly
 const MSG_SET_TRIM = 0x23; // server→client: set this device's sync offset, ms (i32 LE)
 const MSG_CLIENT_SYNC = 0x24; // client→server: report this device's ACTUAL effective sync, ms (i32 LE)
 const MSG_RESET_SYNC = 0x25; // server→client: clear this device's OWN trim back to 0 (no payload)
+const MSG_STREAM_INFO = 0x26; // server→client: what the SOURCE is doing, [0x26][flags] (see srvInfo)
 const MSG_CALIB_CTRL = 0x22; // server↔client: calibration orchestration (ROLE / STATUS sub-types)
 const MSG_UP_AUDIO = 0x30; // client→server: a casting client's Opus packet [0x30][opus]
 const MSG_UP_VIDEO = 0x31; // client→server: a casting client's H.264 access unit [0x31][key u8][annexb] (Phase 2)
@@ -56,6 +57,25 @@ const DEFAULT_BUFFER_MS = 3000;
 const els = {
   dot: document.getElementById("dot"),
   srv: document.getElementById("srv"),
+  devline: document.getElementById("devline"),
+  status: document.getElementById("status"),
+  statushead: document.getElementById("statushead"),
+  statusline: document.getElementById("statusline"),
+  statussub: document.getElementById("statussub"),
+  castbar: document.getElementById("castbar"),
+  morebtn: document.getElementById("morebtn"),
+  morepanel: document.getElementById("morepanel"),
+  devname: document.getElementById("devname"),
+  devnamesave: document.getElementById("devnamesave"),
+  zoomval: document.getElementById("zoomval"),
+  syncbtn: document.getElementById("syncbtn"),
+  syncpanel: document.getElementById("syncpanel"),
+  synclabel: document.getElementById("synclabel"),
+  trimdown1: document.getElementById("trimdown1"),
+  trimup1: document.getElementById("trimup1"),
+  volpct: document.getElementById("volpct"),
+  detailsbtn: document.getElementById("detailsbtn"),
+  details: document.getElementById("details"),
   start: document.getElementById("start"),
   hint: document.getElementById("hint"),
   warn: document.getElementById("warn"),
@@ -109,9 +129,12 @@ const isIOS =
   /iP(hone|od|ad)/.test(navigator.platform) ||
   (/Mac/.test(navigator.userAgent) && "ontouchend" in document); // iPadOS masquerades as Mac
 
+// `s` is the terse state for the diagnostics chip (and the tests); the listener reads the same
+// thing in plain words in the middle of the screen — see renderStatus().
 function setState(s, cls) {
   els.state.textContent = s;
   els.dot.className = cls || "";
+  renderStatus();
 }
 function showWarn(html) {
   els.warn.innerHTML = html;
@@ -149,7 +172,7 @@ let remoteVol = 1; // 0..1, server-controlled (SET_VOLUME); multiplies the local
 // is a property of the SCREEN you watch on, not of the stream.
 let fitMode = "contain";
 const FIT_MODES = ["contain", "cover", "fill"];
-const FIT_LABEL = { contain: "🖥 Fit", cover: "🔲 Fill", fill: "↔ Stretch" };
+const FIT_LABEL = { contain: "Fit", cover: "Fill", fill: "Stretch" };
 let trimMs = 0; // per-device sync trim (ms), persisted: + = play later, - = earlier
 let remoteTrimMs = 0; // server-controlled sync offset (SET_TRIM, ms); ADDS to the local trim
 // MUST be declared before loadTrim() runs (~line 313): loadTrim() writes `aligned` when restoring a
@@ -158,6 +181,80 @@ let remoteTrimMs = 0; // server-controlled sync offset (SET_TRIM, ms); ADDS to t
 // clearing site data (which also wipes nfs_trim) "fixes". Keep it with the other persisted-state vars.
 let aligned = false; // true once an alignment is established (calibration / manual trim / server push)
 let chosenName = null; // in-memory device name; survives a failed localStorage write this session
+// What the server last said about its SOURCE (MSG_STREAM_INFO), which this client cannot work out
+// for itself: frames keep arriving through digital silence, and "no frames" looks the same whether
+// the source died or nobody has pressed Cast yet. bit 0 = the source is silent; bit 1 = the server
+// relays casts and nobody is casting. 0 until told (and with an older server, forever).
+let srvInfo = 0;
+
+// ---- the state, in words -----------------------------------------------------
+// Declared up here with the rest of the top-level state on purpose: renderStatus() runs from
+// setState(), which is reachable from the earliest handlers. It only READS later-declared state
+// (cfg, bufferMs, BUF, offsetNs) at call time, never at load time.
+function renderStatus() {
+  if (!els.statusline) return;
+  const raw = els.state.textContent || "";
+  const who = (cfg && cfg.name) || "the server";
+  const secs = (bufferMs / 1000).toFixed(bufferMs % 1000 ? 1 : 0);
+  // While the ring is running, the pill under the logo is already the headline ("Connecting…",
+  // "Buffering… 1.6s") — so this line only adds the explanation, not a second headline.
+  const ring = BUF.active;
+  let head = "", sub = "", tone = "";
+  if (casting) {
+    head = "You are the source";
+    tone = "ok";
+    sub = "Everyone hears this device. It is muted here so it does not echo.";
+  } else if (raw === "playing") {
+    if (srvInfo & 2) {
+      head = "Waiting for a cast";
+      sub = who + " plays whatever a device casts, and nobody is casting yet.";
+    } else if (srvInfo & 1) {
+      head = "Nothing is playing";
+      sub = who + " is not sending any sound right now.";
+    } else {
+      head = "Playing in sync";
+      tone = "ok";
+      sub = secs + " s behind the source" + (offsetNs !== null ? ", clock steady to ±" + syncJitterMs().toFixed(1) + " ms" : "");
+    }
+  } else if (raw === "no audio") {
+    if (srvInfo & 2) {
+      head = "Waiting for a cast";
+      sub = who + " plays whatever a device casts, and nobody is casting yet.";
+    } else {
+      head = "No sound is arriving";
+      tone = "warn";
+      sub = "Connected to " + who + ", but it has stopped sending audio.";
+    }
+  } else if (ring) {
+    // Which half of the ring's sweep we are in comes from the ring itself (BUF.det), not from the
+    // diagnostics string: that one is refreshed twice a second and would lag the countdown.
+    sub = BUF.det
+      ? "Filling a " + secs + " s buffer so a Wi-Fi hiccup cannot be heard."
+      : raw.indexOf("reconnecting") === 0
+        ? "Lost the server. Playback resumes on its own."
+        : "Finding the server and matching clocks.";
+  } else if (raw.indexOf("buffering") === 0) {
+    head = "Buffering";
+    tone = "warn";
+    sub = "Filling a " + secs + " s buffer so a Wi-Fi hiccup cannot be heard.";
+  } else if (raw === "connecting" || raw === "syncing clock") {
+    head = "Reconnecting";
+    tone = "warn";
+    sub = "Playback resumes on its own.";
+  } else if (raw.indexOf("reconnecting") === 0) {
+    head = "Reconnecting";
+    tone = "warn";
+    sub = "Lost the server. Playback resumes on its own.";
+  }
+  // The dot beside the headline follows setState's colour, except where the headline was just
+  // re-read above (casting, or the server's word on its source): there the two would disagree —
+  // an amber "no audio" dot next to a calm "Waiting for a cast".
+  if (casting || (srvInfo && (raw === "playing" || raw === "no audio"))) els.dot.className = tone;
+  els.statushead.hidden = !head;
+  els.statusline.textContent = head;
+  els.statusline.className = tone;
+  els.statussub.textContent = sub;
+}
 
 // The playout offset that actually drives scheduling = this device's own trim plus the
 // server-pushed offset. Used everywhere we translate a server PTS / shared-clock tick into
@@ -253,9 +350,21 @@ function applyGain() {
   // perceptual taper (so the master/per-client server sliders feel right too — they fold into remoteVol).
   // While casting, force-mute the downlink so the caster doesn't hear its own stream ~buffer late.
   if (gain) gain.gain.value = muted || casting ? 0 : volGain(volume) * volGain(remoteVol);
+  paintVolume();
+}
+// The mute button shows the speaker as it IS, and its label says what a tap does. (It used to read
+// "Sound on" — a state, on a button — so it was a guess whether tapping it would mute or unmute.)
+const ICON_SPEAKER =
+  '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7.5v5h3.2l4.3 3.5V4L6.2 7.5z"/><path d="M13.6 7.2c1.4 1.5 1.4 4.1 0 5.6M15.8 5.2c2.6 2.7 2.6 6.9 0 9.6"/></svg>';
+const ICON_MUTED =
+  '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7.5v5h3.2l4.3 3.5V4L6.2 7.5z"/><path d="M13.6 7.8l4 4.4M17.6 7.8l-4 4.4"/></svg>';
+function paintVolume() {
   const off = muted || volume === 0;
-  els.mute.textContent = off ? "🔇 Muted" : "🔊 Sound on";
+  els.mute.innerHTML = off ? ICON_MUTED : ICON_SPEAKER;
+  els.mute.setAttribute("aria-pressed", off ? "true" : "false");
+  els.mute.setAttribute("aria-label", off ? "Unmute" : "Mute");
   els.mute.classList.toggle("muted", off);
+  if (els.volpct) els.volpct.textContent = off ? "off" : Math.round(volume * 100) + "%";
 }
 els.vol.addEventListener("input", () => {
   const v = parseFloat(els.vol.value);
@@ -304,17 +413,35 @@ function loadTrim() {
   } catch (e) {}
   try { if (localStorage.getItem("nfs_aligned") === "1") aligned = true; } catch (e) {}
   if (trimMs !== 0) aligned = true; // legacy: a saved nonzero trim predates the flag → still aligned
+  paintTrim();
+}
+// Show the current trim on the slider, its readout, and the Sync button.
+//
+// The slider covers ±500 ms — the range anyone sets by hand, Bluetooth speakers included — so that
+// its travel is worth something: the old −2000…3000 span was 38 ms per pixel on a desktop and left
+// a 7-pixel stub on a phone. A trim outside that (calibration can land anywhere in the full range)
+// widens the slider to the full range rather than pinning the thumb at an end, where the first
+// touch would throw the calibrated value away.
+function paintTrim() {
+  const wide = Math.abs(trimMs) > 500;
+  const min = wide ? -2000 : -500, max = wide ? 3000 : 500;
+  if (+els.trim.min !== min || +els.trim.max !== max) {
+    els.trim.min = String(min);
+    els.trim.max = String(max);
+    els.trim.style.setProperty("--zero", ((-min / (max - min)) * 100).toFixed(1) + "%");
+  }
   els.trim.value = String(trimMs);
-  els.trimval.textContent = (trimMs >= 0 ? "+" : "") + trimMs.toFixed(1) + " ms";
+  const text = (trimMs >= 0 ? "+" : "") + trimMs.toFixed(1) + " ms";
+  els.trimval.textContent = text;
+  // The button has less room than the readout: whole milliseconds lose their ".0" there.
+  if (els.synclabel) els.synclabel.textContent = Number.isInteger(trimMs) ? (trimMs >= 0 ? "+" : "") + trimMs + " ms" : text;
   paintSlider(els.trim);
 }
 function setTrim(ms) {
   if (!Number.isFinite(ms)) return; // a NaN would poison serverPtsToPerfMs → all scheduling stops (unrecoverable without reload)
   const before = effTrimMs();
   trimMs = Math.max(-2000, Math.min(3000, Math.round(ms * 10) / 10)); // 0.1 ms resolution (calibration is sub-ms)
-  els.trim.value = String(trimMs);
-  els.trimval.textContent = (trimMs >= 0 ? "+" : "") + trimMs.toFixed(1) + " ms";
-  paintSlider(els.trim);
+  paintTrim();
   try {
     localStorage.setItem("nfs_trim", String(trimMs));
   } catch (e) {}
@@ -325,6 +452,9 @@ function setTrim(ms) {
 els.trim.addEventListener("input", () => { setTrim(parseFloat(els.trim.value)); markAligned(effTrimMs() !== 0); });
 els.trimdown.addEventListener("click", () => { setTrim(trimMs - 10); markAligned(effTrimMs() !== 0); });
 els.trimup.addEventListener("click", () => { setTrim(trimMs + 10); markAligned(effTrimMs() !== 0); });
+// Lining speakers up by ear is judged in single milliseconds; ±10 alone could only ever get close.
+els.trimdown1.addEventListener("click", () => { setTrim(trimMs - 1); markAligned(effTrimMs() !== 0); });
+els.trimup1.addEventListener("click", () => { setTrim(trimMs + 1); markAligned(effTrimMs() !== 0); });
 
 // Back to square one: this device's OWN trim to 0, and NOT aligned any more.
 //
@@ -382,9 +512,12 @@ if (els.themebtn) {
 loadVolume();
 loadTrim();
 
-// ---- page scaling (header − / + buttons, like browser zoom) -----------------
+// ---- page scaling (More → Text size, like browser zoom) ---------------------
 let pageZoom = 1; // 1 = 100%; persisted
-function applyZoom() { try { document.documentElement.style.zoom = String(pageZoom); } catch (e) {} }
+function applyZoom() {
+  try { document.documentElement.style.zoom = String(pageZoom); } catch (e) {}
+  if (els.zoomval) els.zoomval.textContent = Math.round(pageZoom * 100) + "%";
+}
 function setZoom(z) {
   pageZoom = Math.min(2, Math.max(0.5, Math.round(z * 20) / 20)); // 5% grid, clamp 50%–200%
   try { localStorage.setItem("nfs_zoom", String(pageZoom)); } catch (e) {}
@@ -418,9 +551,10 @@ if (window.caches) {
 }
 
 // ---- audio visualizer (the logo, shown for audio-only sources) --------------
-// A circular spectrum drawn around the logo from the AnalyserNode, plus a bass-driven
-// "breathe" on the logo. Toggleable (button under the logo), default on, persisted.
-const VIZ = { raf: 0, enabled: true, ctx: null, freq: null };
+// A circular spectrum drawn around the logo from the AnalyserNode. Toggleable (button under the
+// logo), default on, persisted.
+const VIZ = { raf: 0, enabled: true, ctx: null, freq: null, bands: null, lvl: null };
+const VIZ_BARS = 56; // the buffering ring draws these same bars — see BUF_BARS
 
 // The buffering ring shares that canvas (see showBuffering, down in the stats section). Declared
 // HERE, above applyVizUI, because applyVizUI runs at module top-level a few dozen lines below —
@@ -435,6 +569,26 @@ const BUF = { raf: 0, active: false, frac: 0, det: false, handoff: 0, everKnown:
 // Honour the OS "reduce motion" setting: the ring is canvas, so no CSS media query can reach it.
 const REDUCED_MOTION = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
 
+// The ring's colour as "r,g,b". The light-blue it has always been is nearly invisible on the light
+// theme's pale background, so that theme gets the accent blue instead.
+function ringRGB() {
+  return document.documentElement.classList.contains("light") ? "37,99,235" : "108,182,255";
+}
+
+// Give the canvas as many pixels as the screen will show. It was a fixed 300-pixel square laid
+// over a 168-point box: about right at 1×, but stretched by two thirds on a 3× phone, where every
+// bar came out soft. Never below 300 (so 1× looks exactly as it did), and capped so a huge zoom
+// cannot ask for a canvas the size of the screen. Returns the scale relative to that 300 px design,
+// which the two draw routines multiply their stroke width by.
+function vizFit() {
+  const c = els.viz;
+  if (!c) return 1;
+  const want = Math.max(300, Math.min(900, Math.round((c.clientWidth || 168) * (window.devicePixelRatio || 1))));
+  if (c.width !== want) { c.width = want; c.height = want; } // (resizing also clears it)
+  return c.width / 300;
+}
+window.addEventListener("resize", () => { if (VIZ.raf || BUF.active) vizFit(); });
+
 function applyVizUI() {
   // While the ring is running this button is the buffering LABEL, not the toggle — leave its text
   // alone or the countdown gets overwritten (the toggle can't be pressed then anyway).
@@ -445,6 +599,26 @@ function vizStop() {
   if (VIZ.raf) { cancelAnimationFrame(VIZ.raf); VIZ.raf = 0; }
   if (VIZ.ctx && els.viz) VIZ.ctx.clearRect(0, 0, els.viz.width, els.viz.height);
   if (els.vlogoimg) els.vlogoimg.style.transform = "";
+  if (VIZ.lvl) VIZ.lvl.fill(0); // next start rises from rest instead of from a stale frame
+}
+// Which slice of the spectrum each bar shows: equal steps in PITCH, low at twelve o'clock and
+// rising clockwise.
+//
+// The bars used to take equal steps in frequency, across bins 94 Hz wide. Music is not spread that
+// way — most of it sits below a few kHz — so the first handful of bars did all the moving and the
+// rest of the circle sat nearly still. Stepping by pitch (and analysing with bins fine enough to
+// tell the low notes apart, see the fftSize in onStart) spreads the same sound around the whole ring.
+function vizBands() {
+  const n = analyser.frequencyBinCount;
+  // The analyser's own context is the authority on its rate; `ac` is the same thing in practice,
+  // and 48 kHz is what this client pins — so the fallbacks only matter to a stand-in analyser.
+  const rate = (analyser.context && analyser.context.sampleRate) || (ac && ac.sampleRate) || 48000;
+  const hzPerBin = rate / 2 / n;
+  const F0 = 45, F1 = 15000;
+  const edge = (i) => (F0 * Math.pow(F1 / F0, i / VIZ_BARS)) / hzPerBin;
+  const bands = [];
+  for (let i = 0; i < VIZ_BARS; i++) bands.push([Math.min(n - 1, edge(i)), Math.min(n - 1, edge(i + 1))]);
+  return bands;
 }
 function vizStart() {
   if (!VIZ.enabled || !analyser || VIZ.raf) return;
@@ -452,7 +626,12 @@ function vizStart() {
   if (!els.vlogo || els.vlogo.style.display === "none") return; // only while the logo is shown
   if (!VIZ.ctx && els.viz) VIZ.ctx = els.viz.getContext("2d");
   if (!VIZ.ctx) return;
-  if (!VIZ.freq) VIZ.freq = new Uint8Array(analyser.frequencyBinCount);
+  if (!VIZ.freq || VIZ.freq.length !== analyser.frequencyBinCount) {
+    VIZ.freq = new Uint8Array(analyser.frequencyBinCount);
+    VIZ.bands = vizBands();
+  }
+  if (!VIZ.lvl) VIZ.lvl = new Float32Array(VIZ_BARS);
+  vizFit();
   VIZ.raf = requestAnimationFrame(vizDraw);
 }
 function vizDraw() {
@@ -462,22 +641,45 @@ function vizDraw() {
   if (!VIZ.enabled || !analyser || !els.vlogo || els.vlogo.style.display === "none") { vizStop(); return; }
   analyser.getByteFrequencyData(VIZ.freq);
   const c = els.viz, x = VIZ.ctx, W = c.width, H = c.height, cx = W / 2, cy = H / 2;
+  const k = W / 300; // stroke scale: the geometry below is already proportional to W
   x.clearRect(0, 0, W, H);
-  const bars = 56, inner = W * 0.37, maxLen = W * 0.105; // tight ring hugging the logo
-  const usable = Math.floor(VIZ.freq.length * 0.62); // skip the near-empty top bins
+  const inner = W * 0.37, maxLen = W * 0.105; // tight ring hugging the logo
+  const rgb = ringRGB(), freq = VIZ.freq, lvl = VIZ.lvl, last = freq.length - 1;
   x.lineCap = "round";
-  x.lineWidth = 3.4;
-  for (let i = 0; i < bars; i++) {
-    const bin = 2 + Math.floor((i / bars) * usable);
-    const mag = VIZ.freq[bin] / 255;
-    const len = maxLen * Math.pow(mag, 1.45);
-    const ang = (i / bars) * Math.PI * 2 - Math.PI / 2;
-    const ca = Math.cos(ang), sa = Math.sin(ang);
-    x.strokeStyle = "rgba(108,182,255," + (0.3 + 0.55 * mag).toFixed(3) + ")";
-    x.beginPath();
-    x.moveTo(cx + ca * inner, cy + sa * inner);
-    x.lineTo(cx + ca * (inner + len), cy + sa * (inner + len));
-    x.stroke();
+  for (let pass = 0; pass < 2; pass++) {
+    // Two passes over the same bars: a wide, faint stroke under the loud ones, then the bars
+    // themselves. The under-stroke reads as glow without a canvas shadow, which is slow on phones.
+    x.lineWidth = (pass === 0 ? 8.5 : 3.4) * k;
+    for (let i = 0; i < VIZ_BARS; i++) {
+      if (pass === 0) {
+        const lo = VIZ.bands[i][0], hi = VIZ.bands[i][1];
+        let m;
+        if (hi - lo < 1.5) {
+          // Narrower than a bin (the lowest bars): read between the two nearest bins, so neighbours
+          // differ instead of several bars showing one bin's value as a flat block.
+          const mid = (lo + hi) / 2, b = Math.floor(mid), f = mid - b;
+          m = freq[b] * (1 - f) + freq[Math.min(last, b + 1)] * f;
+        } else {
+          m = 0;
+          for (let b = Math.floor(lo); b < hi; b++) if (freq[b] > m) m = freq[b];
+        }
+        // High notes carry far less energy than low ones; lift them a little so the top of the
+        // range is not permanently short.
+        m = Math.min(1, (m / 255) * (0.9 + 0.45 * (i / VIZ_BARS)));
+        // Rise fast, fall slower: a beat should land on time and then ease back, not flicker.
+        lvl[i] += (m - lvl[i]) * (m > lvl[i] ? 0.6 : 0.22);
+      }
+      const mag = lvl[i];
+      if (pass === 0 && mag < 0.35) continue;
+      const len = maxLen * Math.pow(mag, 1.45);
+      const ang = (i / VIZ_BARS) * Math.PI * 2 - Math.PI / 2;
+      const ca = Math.cos(ang), sa = Math.sin(ang);
+      x.strokeStyle = "rgba(" + rgb + "," + (pass === 0 ? 0.16 * (mag - 0.35) / 0.65 : 0.3 + 0.55 * mag).toFixed(3) + ")";
+      x.beginPath();
+      x.moveTo(cx + ca * inner, cy + sa * inner);
+      x.lineTo(cx + ca * (inner + len), cy + sa * (inner + len));
+      x.stroke();
+    }
   }
   // The logo no longer scales with audio — its size is identical whether the visualizer
   // is on or off (only the ring reacts). The ring around it is the visualizer.
@@ -729,8 +931,11 @@ function onStart() {
       gain = ac.createGain();
       gain.connect(ac.destination);
       analyser = ac.createAnalyser(); // tap for the visualizer (analyses; no onward connection needed)
-      analyser.fftSize = 512;
-      analyser.smoothingTimeConstant = 0.82;
+      // 2048 → 23 Hz bins at 48 kHz, fine enough for the visualizer's low bars to tell bass notes
+      // apart (512 gave 94 Hz bins: everything under ~200 Hz was two numbers). The bars do their own
+      // rise/fall easing in vizDraw, so the analyser's own smoothing is lighter than it was.
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.7;
       gain.connect(analyser);
       applyGain(); // honor the saved volume / mute
       const s = ac.createBufferSource(); // 1-sample silent blip unlocks the session
@@ -766,6 +971,7 @@ function onStart() {
   els.vlogo.style.display = "flex";
   vizStart();
   els.controls.style.display = "flex";
+  els.status.style.display = "flex";
   showBuffering(true, "Connecting…"); // ring starts spinning immediately
   setState("connecting", "warn");
 
@@ -796,6 +1002,9 @@ function stop() {
   }
   showBuffering(null);
   els.controls.style.display = "none";
+  els.status.style.display = "none";
+  openPanel(null);
+  srvInfo = 0;
   els.stage.style.display = "none";
   els.vlogo.style.display = "none";
   vizStop();
@@ -892,17 +1101,27 @@ function maybePromptName() {
   els.namemodal.style.display = "flex";
   setTimeout(() => { try { els.nameinput.focus(); els.nameinput.select(); } catch (e) {} }, 60);
 }
+// Take a new name for this device: remember it, tell the server, show it in the header.
+function saveDeviceName(raw) {
+  const nm = (raw || "").trim().slice(0, 40);
+  if (nm) {
+    chosenName = nm; // remember in memory first, so a storage failure can't lose it
+    try { localStorage.setItem("nfs_cname", nm); } catch (e) {}
+    sendHello(); // re-announce with the chosen name (clientIdentity prefers chosenName)
+  }
+  try { localStorage.setItem("nfs_named", "1"); } catch (e) {} // named (or asked once); don't nag
+  paintIdentity();
+}
+// The header's second line, and the name field under More.
+function paintIdentity() {
+  const name = clientIdentity().name;
+  if (els.devline) els.devline.textContent = "This device: " + name;
+  if (els.devname && document.activeElement !== els.devname) els.devname.value = name;
+}
 function closeNameModal(save) {
   if (!els.namemodal) return;
-  if (save) {
-    const nm = (els.nameinput.value || "").trim().slice(0, 40);
-    if (nm) {
-      chosenName = nm; // remember in memory first, so a storage failure can't lose it
-      try { localStorage.setItem("nfs_cname", nm); } catch (e) {}
-      sendHello(); // re-announce with the chosen name (clientIdentity prefers chosenName)
-    }
-  }
-  try { localStorage.setItem("nfs_named", "1"); } catch (e) {} // asked once; don't nag
+  if (save) saveDeviceName(els.nameinput.value);
+  else { try { localStorage.setItem("nfs_named", "1"); } catch (e) {} } // asked once; don't nag
   els.namemodal.style.display = "none";
 }
 if (els.namesave) els.namesave.addEventListener("click", () => closeNameModal(true));
@@ -1173,6 +1392,14 @@ function onMessage(ev) {
     return;
   }
 
+  if (type === MSG_STREAM_INFO) {
+    if (ev.data.byteLength >= 2) {
+      srvInfo = dv.getUint8(1);
+      renderStatus();
+    }
+    return;
+  }
+
   if (type === MSG_RESET_SYNC) {
     // The operator pressed reset for this device (or "Reset all") in the server GUI. Same path as
     // the client's own ⟲ button, so a server-driven reset and a local one cannot diverge. The
@@ -1263,7 +1490,7 @@ function onConfig(text) {
     return;
   }
   cfg = c;
-  els.srv.textContent = c.name ? "· " + c.name : "";
+  els.srv.textContent = c.name || ""; // the header's title; the app's own name shows while this is empty
   // Honor the full server buffer. It's cheap now: video is buffered as ENCODED chunks and only
   // decoded just-in-time, so a deep buffer no longer means a wall of decoded surfaces.
   // Clamped to the same range the server enforces (config::MIN/MAX_BUFFER_MS + clamp_buffer_ms) —
@@ -1928,7 +2155,7 @@ function toggleFullscreen() {
 // claim more than its share however long the clock handshake takes — and the buffer countdown picks
 // the fill up from exactly where the creep left it and carries it to the top. The fill is monotonic
 // by construction (see bufTick), so the ring never jumps backwards.
-const BUF_BARS = 56; // must match vizDraw()'s bar count, or the hand-off would visibly jump
+const BUF_BARS = VIZ_BARS; // must match vizDraw()'s bar count, or the hand-off would visibly jump
 const BUF_CONNECT_ARC = 0.25; // the share of the circle the unbounded connect phase may occupy
 const BUF_CONNECT_TAU = 0.9; // seconds; time constant of the ease toward that share
 // The wake: a ripple trailing back from the leading edge. This is what carries LIVENESS — the fill
@@ -1951,8 +2178,9 @@ function bufDraw(nowMs) {
   const inner = W * 0.37, maxLen = W * 0.105; // identical to vizDraw()
   const edge = BUF.frac * BUF_BARS; // leading edge, in bar units
   const t = nowMs / 1000;
+  const rgb = ringRGB();
   x.lineCap = "round";
-  x.lineWidth = 3.4;
+  x.lineWidth = 3.4 * (W / 300);
   for (let i = 0; i < BUF_BARS; i++) {
     const ang = (i / BUF_BARS) * Math.PI * 2 - Math.PI / 2; // -90° = twelve o'clock
     const ca = Math.cos(ang), sa = Math.sin(ang);
@@ -1969,7 +2197,7 @@ function bufDraw(nowMs) {
       on = Math.min(1, Math.max(0, on * (1 + 0.35 * w * amp) + 0.3 * amp * Math.max(0, w)));
     }
     const len = maxLen * (0.3 + 0.7 * on) * gain; // unlit bars stay faintly present, so it reads as a ring
-    x.strokeStyle = "rgba(108,182,255," + (0.14 + 0.76 * on).toFixed(3) + ")";
+    x.strokeStyle = "rgba(" + rgb + "," + (0.14 + 0.76 * on).toFixed(3) + ")";
     x.beginPath();
     x.moveTo(cx + ca * inner, cy + sa * inner);
     x.lineTo(cx + ca * (inner + len), cy + sa * (inner + len));
@@ -1993,7 +2221,7 @@ function bufTick(nowMs) {
     // Rising edge: remember where the creep got to and map the buffer onto what's LEFT of the
     // circle. That is what makes the two phases one sweep with no visible seam — and, after a
     // reconnect, what stops a fresh countdown from dragging the ring backwards.
-    if (!BUF.det) { BUF.det = true; BUF.everKnown = true; BUF.handoff = BUF.frac; }
+    if (!BUF.det) { BUF.det = true; BUF.everKnown = true; BUF.handoff = BUF.frac; renderStatus(); }
     target = BUF.handoff + (1 - BUF.handoff) * progress;
     bufLabel("Buffering… " + Math.max(0, remain).toFixed(1) + "s");
   } else {
@@ -2041,6 +2269,7 @@ function showBuffering(indeterminate, text) {
     }
     applyVizUI(); // button becomes the toggle again
     vizStart(); // …and the bars pick up the audio from exactly where the ring left them
+    renderStatus(); // the pill is no longer the headline, so the status line takes over
     return;
   }
   // `indeterminate` is advisory only. Which phase we are in is DERIVED in bufTick from the same
@@ -2056,6 +2285,7 @@ function showBuffering(indeterminate, text) {
     BUF.t0 = 0; // stamped on the first tick
     BUF.drawnFrac = -1; // force the first paint of this run
     vizStop(); // take the canvas
+    vizFit(); // …at the screen's real resolution
     // Force the canvas visible even for a user who turned the visualizer off (that state hides it),
     // otherwise they would get no loading indicator at all.
     if (els.vlogo) els.vlogo.classList.add("buffering");
@@ -2176,8 +2406,8 @@ window.nfsDebug = function () {
 // Acoustic auto-calibration (microphone) — 100% client-side, no server.
 //
 // Role-based, for speakers in the SAME ROOM. One device plays a distinctive dial-up
-// tone on the shared-clock beat ("🔊 Play sync tone" / reference). Another device
-// listens for that tone with its mic ("🎤 Listen & align" / follower) and nudges ITS
+// tone on the shared-clock beat ("Play the tone here" / reference). Another device
+// listens for that tone with its mic ("Listen and line up" / follower) and nudges ITS
 // OWN trim so the reference's sound lands when it plays the matching content.
 //
 // The shared clock is the coordinator: both devices key the tone to the same server-
@@ -2602,13 +2832,13 @@ function calibAbort(msg) {
   calib.selfSeed = null;
   calib.slot = 0;
   applyGain(); // un-mute our music (a listen/ref session muted it)
-  if (els.caliblisten) { els.caliblisten.textContent = "🎤 Listen & align"; els.caliblisten.disabled = false; }
+  if (els.caliblisten) { setChoice(els.caliblisten, CHOICE.listen); els.caliblisten.disabled = false; }
   if (els.calibref) els.calibref.disabled = false;
   // Collapse the role panel on every abort/cancel/error path (the startListen finally only covers
   // a normal run-completion). Without this, the mic-denied / mic-setup-fail early returns leave the
   // panel open, so the next top-level Calibrate tap just toggles it closed and emits no tone.
   // calibOnRole re-reveals the panel immediately after it calls calibAbort, so orchestration is fine.
-  if (els.calibroles) els.calibroles.style.display = "none";
+  showCalibRoles(false);
   if (was && msg) setCalibStatus(msg);
 }
 
@@ -2658,7 +2888,7 @@ function startRef() {
   if (gain) { try { gain.gain.cancelScheduledValues(ac.currentTime); } catch (e) {} gain.gain.value = 0; } // mute music — only the tone should sound
   refTick();
   calib.refTimer = setInterval(refTick, 400);
-  els.calibref.textContent = "⏹ Stop tone";
+  setChoice(els.calibref, CHOICE.refStop);
   els.caliblisten.disabled = true;
   setCalibStatus(
     (calibCoded()
@@ -2666,7 +2896,7 @@ function startRef() {
       : "Playing the sync tone every " + CALCFG.TICK_S + "s (music muted here). ") +
       (calib.orchestrated
         ? "Other devices are aligning to this one."
-        : "On another device in the room, tap 🎤 Listen & align.")
+        : "On each other device in the room, choose Listen and line up.")
   );
 }
 
@@ -2682,7 +2912,7 @@ function stopRef() {
   calib.toneBuf = null;
   calib.codePeriodS = null;
   if (wasRef) applyGain(); // restore music to the saved volume/mute
-  if (els.calibref) els.calibref.textContent = "🔊 Play sync tone";
+  if (els.calibref) setChoice(els.calibref, CHOICE.ref);
   if (els.caliblisten) els.caliblisten.disabled = false;
 }
 
@@ -2862,7 +3092,7 @@ async function startListen() {
   calib.running = true;
   const myRun = ++calib.runSeq; // identity for the stale-finally / supersede guard
   const owns = () => calib.running && calib.runSeq === myRun; // still this session's turn?
-  els.caliblisten.textContent = "✕ Cancel";
+  setChoice(els.caliblisten, CHOICE.listenCancel);
   els.calibref.disabled = true;
   els.warn.style.display = "none";
   setCalibStatus("Requesting microphone…");
@@ -3006,14 +3236,14 @@ async function startListen() {
       calib.role = null;
       calib.running = false;
       calib.orchestrated = false; // an orchestrated follower session is now finished
-      els.caliblisten.textContent = "🎤 Listen & align";
+      setChoice(els.caliblisten, CHOICE.listen);
       els.caliblisten.disabled = false;
       els.calibref.disabled = false;
       // Collapse the role panel now the run is over: the top-level "Calibrate" button is a
       // toggle, so if we leave the panel open the NEXT tap just closes it and starts nothing
       // ("no tone on the 2nd calibrate"). Hiding it here makes the next tap re-open + re-run.
       // (#calibstatus is a separate sibling, so the "✔ Aligned" result stays visible.)
-      if (els.calibroles) els.calibroles.style.display = "none";
+      showCalibRoles(false);
     }
   }
 }
@@ -3039,7 +3269,8 @@ function calibOnRole(role, refSeed, selfSeed, slot) {
   calib.refSeed = refSeed >>> 0;
   calib.selfSeed = selfSeed >>> 0;
   calib.slot = slot | 0;
-  if (els.calibroles) els.calibroles.style.display = ""; // reveal the calibrate panel so it's visible
+  openPanel("sync"); // the server started this: bring the sync panel up so it can be seen…
+  showCalibRoles(true); // …with the calibrate choices open
   if (role === 1) {
     startRef(); // reference: loop the shared code continuously
   } else if (role === 2) {
@@ -3047,16 +3278,40 @@ function calibOnRole(role, refSeed, selfSeed, slot) {
   }
 }
 
-// ---- UI wiring: Calibrate reveals the two role buttons ------------------------------
+// ---- UI wiring: "Line up with the microphone" reveals the two role choices ----------
+// The two choices carry their own instructions (which one goes on which device), so opening them
+// needs no status line telling the listener what the buttons already say.
+const CHOICE = {
+  ref: ["Play the tone here", "Choose this on one device. The others listen to it."],
+  refStop: ["Stop the tone", "Press when the other devices have finished lining up."],
+  listen: ["Listen and line up", "Choose this on each of the other devices."],
+  listenCancel: ["Cancel", "Stop listening and put the sync back as it was."],
+};
+// Set a two-line choice button's title + description. (These buttons used to be relabelled with
+// textContent, which would flatten the two lines into one.)
+function setChoice(el, pair) {
+  if (!el) return;
+  el.textContent = "";
+  const b = document.createElement("b");
+  b.textContent = pair[0];
+  const sp = document.createElement("span");
+  sp.textContent = pair[1];
+  el.append(b, sp);
+}
+function showCalibRoles(show) {
+  if (!els.calibroles) return;
+  els.calibroles.style.display = show ? "" : "none";
+  if (els.calib) els.calib.setAttribute("aria-expanded", show ? "true" : "false");
+}
 els.calib.addEventListener("click", () => {
   const showing = els.calibroles.style.display !== "none";
   if (showing) {
-    if (calib.role) calibAbort(""); // tapping Calibrate again closes/cancels
-    els.calibroles.style.display = "none";
+    if (calib.role) calibAbort(""); // tapping it again closes/cancels
+    showCalibRoles(false);
     setCalibStatus("");
   } else {
-    els.calibroles.style.display = "";
-    setCalibStatus("Same-room sync: on one device tap 🔊 Play sync tone, on another tap 🎤 Listen & align.");
+    showCalibRoles(true);
+    setCalibStatus("Put the devices in the same room. It takes about a minute.");
   }
 });
 els.calibref.addEventListener("click", () => {
@@ -3067,7 +3322,7 @@ els.caliblisten.addEventListener("click", () => {
   if (calib.role !== "listen") { calib.orchestrated = false; calib.refSeed = null; calib.selfSeed = null; calib.slot = 0; }
   startListen();
 });
-els.calibcancel.addEventListener("click", () => { calibAbort(""); els.calibroles.style.display = "none"; setCalibStatus(""); });
+els.calibcancel.addEventListener("click", () => { calibAbort(""); showCalibRoles(false); setCalibStatus(""); });
 
 // =============================================================================
 // Web-client cast (uplink): capture a tab/screen/mic in the browser and "cast" it
@@ -3080,6 +3335,10 @@ function setCastStatus(text) {
   if (!els.caststatus) return;
   els.caststatus.textContent = text || "";
   els.caststatus.style.display = text ? "" : "none";
+  // Every step of a cast starting, failing or ending passes through here, so this is where the
+  // rest of the page catches up: the bar across the top, the Cast button, the status line.
+  paintPanels();
+  renderStatus();
 }
 function castSupported() {
   return typeof AudioEncoder !== "undefined" && typeof MediaStreamTrackProcessor !== "undefined";
@@ -3113,6 +3372,7 @@ function stopCast(notifyServer) {
   if (els.castroles) els.castroles.style.display = "none";
   applyGain(); // un-mute the downlink
   if (was) setCastStatus("");
+  else paintPanels();
 }
 // Transport dropped WHILE casting (network blip, or the operator changed the stream → a StreamState
 // republish reconnects every socket). Tear down the encoders/graph but KEEP the captured stream +
@@ -3135,7 +3395,7 @@ function suspendCastForReconnect() {
   castSrcNode = null;
   castDestNode = null;
   // castStream tracks are LEFT RUNNING on purpose so the screen/mic share survives the reconnect.
-  setCastStatus("📡 Reconnecting — your cast will resume automatically…");
+  setCastStatus("Reconnecting — your cast will resume automatically…");
 }
 // Capture the chosen source INSIDE the click gesture, then ask the server for the caster slot.
 async function startCast(source) {
@@ -3212,7 +3472,8 @@ function onCastGrant(granted, p) {
   castSource = castPending || castSource; // remember the source so a reconnect can auto re-claim it
   castPending = null;
   applyGain(); // mute downlink immediately (echo)
-  setCastStatus("📡 Casting audio to everyone — tap Stop cast to end.");
+  openPanel(null); // the choice is made; the bar across the top takes over from here
+  setCastStatus("Casting audio to everyone — tap Stop cast to end.");
   // Force 48 kHz stereo regardless of the source via a destination node, then Opus-encode at the
   // server-dictated bitrate. Receivers decode this verbatim (the server only re-stamps + relays).
   // Keep refs to both nodes so stopCast can disconnect them (otherwise they leak per cast).
@@ -3263,9 +3524,9 @@ function onCastGrant(granted, p) {
 // audio-only — never tear down the working audio path for a video problem.
 async function startVideoCast(p) {
   const vtrack = castStream && castStream.getVideoTracks()[0];
-  if (!vtrack) { setCastStatus("📡 Casting audio to everyone (no screen was shared) — tap Stop cast to end."); return; }
+  if (!vtrack) { setCastStatus("Casting audio to everyone (no screen was shared) — tap Stop cast to end."); return; }
   if (typeof VideoEncoder === "undefined" || typeof MediaStreamTrackProcessor === "undefined") {
-    setCastStatus("📡 Casting audio (this browser can't encode video) — tap Stop cast to end.");
+    setCastStatus("Casting audio (this browser can't encode video) — tap Stop cast to end.");
     return;
   }
   // Constrain the captured surface to the server's resolution/fps so every receiver gets the
@@ -3290,7 +3551,7 @@ async function startVideoCast(p) {
   if (VideoEncoder.isConfigSupported) {
     const r = await VideoEncoder.isConfigSupported(vcfg).catch(() => null);
     if (!casting) return;
-    if (r && !r.supported) { setCastStatus("📡 Casting audio (this browser can't H.264-encode video) — tap Stop cast to end."); return; }
+    if (r && !r.supported) { setCastStatus("Casting audio (this browser can't H.264-encode video) — tap Stop cast to end."); return; }
   }
   try {
     castVidEnc = new VideoEncoder({
@@ -3303,13 +3564,13 @@ async function startVideoCast(p) {
         // track immediately (audio-only fallback) rather than holding it until stopCast().
         try { if (castVidReader) castVidReader.cancel(); } catch (x) {}
         castVidReader = null;
-        setCastStatus("📡 Casting audio (video encode failed: " + e.message + ") — tap Stop cast to end.");
+        setCastStatus("Casting audio (video encode failed: " + e.message + ") — tap Stop cast to end.");
       },
     });
     castVidEnc.configure(vcfg);
   } catch (e) {
     castVidEnc = null;
-    setCastStatus("📡 Casting audio (couldn't start video encode: " + e.message + ") — tap Stop cast to end.");
+    setCastStatus("Casting audio (couldn't start video encode: " + e.message + ") — tap Stop cast to end.");
     return;
   }
   let lastKeyMs = 0; // 0 ⇒ the first encoded frame is forced to a keyframe
@@ -3321,10 +3582,10 @@ async function startVideoCast(p) {
     // keep audio flowing and drop video rather than throwing an uncaught error.
     try { if (castVidEnc && castVidEnc.state !== "closed") castVidEnc.close(); } catch (x) {}
     castVidEnc = null;
-    setCastStatus("📡 Casting audio (couldn't attach video capture: " + e.message + ") — tap Stop cast to end.");
+    setCastStatus("Casting audio (couldn't attach video capture: " + e.message + ") — tap Stop cast to end.");
     return;
   }
-  setCastStatus("📡 Casting screen + audio to everyone — tap Stop cast to end.");
+  setCastStatus("Casting screen + audio to everyone — tap Stop cast to end.");
   castVidReader = proc.readable.getReader();
   (async () => {
     try {
@@ -3366,14 +3627,78 @@ function sendUpVideo(chunk) {
   try { ws.send(msg); } catch (e) {}
 }
 els.castbtn.addEventListener("click", () => {
-  if (casting || castPending) { stopCast(true); return; } // tapping Cast again stops it
-  const showing = els.castroles.style.display !== "none";
-  els.castroles.style.display = showing ? "none" : "";
-  setCastStatus(showing ? "" : "Cast this device: pick a source — it becomes the source for everyone (one caster at a time).");
+  if (casting || castPending) { stopCast(true); return; } // while casting this button reads "Stop cast"
+  openPanel(panelOpen("cast") ? null : "cast");
+  setCastStatus("");
 });
 els.casttab.addEventListener("click", () => startCast("tab"));
 els.castmic.addEventListener("click", () => startCast("mic"));
 els.caststop.addEventListener("click", () => stopCast(true));
+
+// =============================================================================
+// Panels: Sync and Cast open in place under the buttons; More drops from the header.
+// =============================================================================
+// One at a time — on a phone there is no room for two, and each is a different job.
+const PANELS = { sync: ["syncbtn", "syncpanel"], cast: ["castbtn", "castroles"], more: ["morebtn", "morepanel"] };
+function panelOpen(name) {
+  const el = els[PANELS[name][1]] || document.getElementById(PANELS[name][1]);
+  // #castroles is shown/hidden through style.display (the cast code does that itself in several
+  // places); the other two use the `hidden` attribute.
+  return name === "cast" ? el.style.display !== "none" : !el.hidden;
+}
+function openPanel(name) {
+  for (const key in PANELS) {
+    const el = els[PANELS[key][1]] || document.getElementById(PANELS[key][1]);
+    if (key === "cast") el.style.display = key === name ? "" : "none";
+    else el.hidden = key !== name;
+  }
+  if (name === "more") paintIdentity();
+  paintPanels();
+}
+// Bring the buttons in line with what is open, and with whether this device is casting.
+function paintPanels() {
+  for (const key in PANELS) {
+    const btn = els[PANELS[key][0]];
+    if (btn) btn.setAttribute("aria-expanded", panelOpen(key) ? "true" : "false");
+  }
+  if (els.castbar) els.castbar.hidden = !casting;
+  if (els.castbtn) {
+    els.castbtn.textContent = casting ? "Stop cast" : castPending ? "Cancel" : "Cast";
+    els.castbtn.classList.toggle("danger", casting);
+  }
+}
+els.syncbtn.addEventListener("click", () => openPanel(panelOpen("sync") ? null : "sync"));
+els.morebtn.addEventListener("click", () => openPanel(panelOpen("more") ? null : "more"));
+// More floats over the page, so it also closes the way a menu does: a tap elsewhere, or Escape.
+document.addEventListener("click", (e) => {
+  if (!panelOpen("more")) return;
+  if (els.morepanel.contains(e.target) || els.morebtn.contains(e.target)) return;
+  els.morepanel.hidden = true;
+  paintPanels();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && panelOpen("more")) { els.morepanel.hidden = true; paintPanels(); els.morebtn.focus(); }
+});
+els.devnamesave.addEventListener("click", () => saveDeviceName(els.devname.value));
+els.devname.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); saveDeviceName(els.devname.value); els.devname.blur(); }
+});
+
+// The diagnostics chips: one link opens them, and they stay open on this device once opened —
+// whoever wanted them for a bug report will want them again.
+function showDetails(on) {
+  els.details.hidden = !on;
+  els.detailsbtn.setAttribute("aria-expanded", on ? "true" : "false");
+  els.detailsbtn.textContent = on ? "Hide details" : "Details for a bug report";
+  try { localStorage.setItem("nfs_details", on ? "1" : "0"); } catch (e) {}
+}
+els.detailsbtn.addEventListener("click", () => showDetails(els.details.hidden));
+try { if (localStorage.getItem("nfs_details") === "1") showDetails(true); } catch (e) {}
+
+// First paint of everything above that has no other caller at load.
+paintVolume();
+paintIdentity();
+paintPanels();
 
 // =============================================================================
 // Readiness stamp — MUST be the last statement in this file.

@@ -62,7 +62,8 @@ via a CoreAudio process tap (no driver, no BlackHole); local *screen* capture is
   rate servo**: a deadbanded proportional term plus a leaky integrator trim the playback
   rate by at most ±1 %, slew-limited so corrections stay inaudible. Audio decodes via
   **WebCodecs Opus** and plays through a gapless **Web Audio** scheduler.
-- **Per-device alignment.** A **sync** slider (ms) per device, set by ear, or…
+- **Per-device alignment.** A **sync** offset (ms) per device, set by ear with ±1 / ±10 ms steps
+  and a slider, or…
 - **Auto-calibration (mic).** A device emits a coded spread-spectrum signal (MLS / Gold
   code) and listens on its own microphone to measure and correct its real speaker→ear
   offset. **Calibrate all** orchestrates several devices at once (distinct codes + TDMA
@@ -353,6 +354,18 @@ Things to know:
 2. Accept the **one-time self-signed certificate** ("Advanced → proceed") — required so the
    browser grants the secure context WebCodecs needs. The cert is persisted, so it's once per device.
 3. Tap **Start** and it joins the sync.
+
+**What the page shows.** The header names the server and this device. Under the logo and its
+visualizer ring, one line says what the device is doing in plain words: *Playing in sync*,
+*Buffering*, *Nothing is playing*, *Waiting for a cast*, *Reconnecting*. Below that:
+
+- **Volume**, with a mute button and a readout.
+- **Sync** — opens ±1 / ±10 ms steps, a slider, a reset, and **Line up with the microphone**
+  (one device plays the tone, each of the others listens).
+- **Cast** — send this device's tab, screen or microphone to everyone. While casting, a bar across
+  the top says so and carries the Stop casting button.
+- **More** (in the header) — the device's name, light / dark theme, text size.
+- **Details for a bug report** (in the footer) — the state, clock, buffer and frame counters.
 
 > Clients must be on the same LAN/subnet as the server. Some corporate/guest Wi-Fi isolates
 > wireless devices from each other — if a phone can't reach the server but a wired PC can,

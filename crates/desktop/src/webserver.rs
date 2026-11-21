@@ -255,6 +255,37 @@ const MSG_SET_TRIM: u8 = 0x23;
 /// of only the value the server commanded (which is 0 until the operator touches it).
 const MSG_CLIENT_SYNC: u8 = 0x24;
 
+/// Server→client: what the SOURCE is doing right now, `[0x26][flags: u8]`.
+///
+/// A client cannot work this out for itself. Frames keep arriving through digital silence, so a
+/// paused player looks exactly like music; and "no frames" looks the same whether the source died
+/// or nobody has pressed Cast yet. The server knows both (the capture level, and the cast slot), so
+/// it says — and the client can show "nothing is playing" or "waiting for a cast" instead of
+/// "playing" over silence or "no audio" over a perfectly healthy idle relay.
+const MSG_STREAM_INFO: u8 = 0x26;
+/// The source is being captured and is carrying only digital silence.
+const INFO_SILENT: u8 = 1;
+/// The source is a web cast and no client holds the cast slot.
+const INFO_AWAITING_CAST: u8 = 2;
+/// How many consecutive one-second checks of silence before a client is told. Long enough that the
+/// gap between two songs is not announced as "nothing is playing".
+const SILENT_AFTER_TICKS: u32 = 5;
+
+/// The [`MSG_STREAM_INFO`] flags for a stream.
+fn stream_info_flags(is_cast: bool, cast_held: bool, stalled: bool, silent_ticks: u32) -> u8 {
+    if is_cast {
+        // A relayed cast is never decoded here, so there is no level to call silent.
+        return if cast_held { 0 } else { INFO_AWAITING_CAST };
+    }
+    // A stalled pipeline is not "silent", it is broken — and the client's own stall detection
+    // already reports that, more precisely than a flag sent over the same failing path could.
+    if !stalled && silent_ticks >= SILENT_AFTER_TICKS {
+        INFO_SILENT
+    } else {
+        0
+    }
+}
+
 /// Server→client: reset this client's OWN sync trim to 0 and clear its "aligned" state. No payload.
 ///
 /// Distinct from [`MSG_SET_TRIM`] 0, which only clears the SERVER's offset — the device's own
@@ -368,6 +399,9 @@ pub struct ClientEntry {
     pub calib_status: String,
     /// True once HELLO has been received (so `stable_id`/`name` are meaningful).
     pub identified: bool,
+    /// The [`MSG_STREAM_INFO`] flags last sent to this client; `None` until the first send, so a
+    /// newly connected client is always told the current state.
+    pub stream_info: Option<u8>,
     /// Frames this client never received: shed because its outbound queue was full, plus frames the
     /// broadcast ring overwrote before this task could read them (tokio reports the latter count and
     /// it used to be discarded). Non-zero is the objective signal that stuttering is THIS client
@@ -611,6 +645,10 @@ fn spawn_stall_watchdog(state: Arc<AppState>) {
         let mut video_bad = false;
         // Which stream's capture-closed we already logged (its health allocation, as an address).
         let mut capture_closed_logged: usize = 0;
+        // Consecutive ticks the current stream's capture level has read zero, and which stream that
+        // count belongs to (a source swap starts the count again).
+        let mut silent_ticks: u32 = 0;
+        let mut silent_stream: usize = 0;
         loop {
             tick.tick().await;
             // Clone out immediately — never hold a watch borrow across an await.
@@ -637,6 +675,28 @@ fn spawn_stall_watchdog(state: Arc<AppState>) {
                     tracing::info!("audio recovered — frames are flowing again");
                 } else {
                     tracing::info!("audio stall cleared — this stream is no longer expected to produce audio");
+                }
+            }
+
+            // ---- TELL THE CLIENTS WHAT THE SOURCE IS DOING ------------------------------------
+            // See MSG_STREAM_INFO. Sent to a client only when it differs from what that client was
+            // last told, so this costs nothing on a steady stream.
+            {
+                let stream_id = Arc::as_ptr(h) as usize;
+                if silent_stream != stream_id {
+                    silent_stream = stream_id;
+                    silent_ticks = 0;
+                }
+                let producing = h.audio_stall_ms().is_some();
+                silent_ticks = if producing && h.level() == [0.0, 0.0] { silent_ticks.saturating_add(1) } else { 0 };
+                let cast_held = state.cast.lock().map(|c| c.is_some()).unwrap_or(false);
+                let flags = stream_info_flags(s.cast_relay.is_some(), cast_held, stalled, silent_ticks);
+                if let Ok(mut reg) = state.clients_reg.lock() {
+                    for e in reg.values_mut() {
+                        if e.stream_info != Some(flags) && e.ctrl_tx.send(vec![MSG_STREAM_INFO, flags]).is_ok() {
+                            e.stream_info = Some(flags);
+                        }
+                    }
                 }
             }
 
@@ -993,6 +1053,7 @@ async fn ws_client(socket: WebSocket, state: Arc<AppState>) {
                 reported_trim_ms: None,
                 calib_status: String::new(),
                 identified: false,
+                stream_info: None,
                 frames_dropped: Arc::new(AtomicU64::new(0)),
             },
         );
@@ -1442,6 +1503,21 @@ async fn serve(
 mod tests {
     use super::*;
     use crate::media::{MSG_AUDIO, MSG_VIDEO};
+
+    #[test]
+    fn clients_are_told_what_the_source_is_doing() {
+        // Local source, sound flowing: nothing to say.
+        assert_eq!(stream_info_flags(false, false, false, 0), 0);
+        // The gap between two songs is not "nothing is playing" ...
+        assert_eq!(stream_info_flags(false, false, false, SILENT_AFTER_TICKS - 1), 0);
+        // ... but several seconds of silence is.
+        assert_eq!(stream_info_flags(false, false, false, SILENT_AFTER_TICKS), INFO_SILENT);
+        // A stalled pipeline is a fault, which the client reports itself; never "just silent".
+        assert_eq!(stream_info_flags(false, false, true, 60), 0);
+        // A cast source: waiting until somebody holds the slot, and never judged silent.
+        assert_eq!(stream_info_flags(true, false, false, 60), INFO_AWAITING_CAST);
+        assert_eq!(stream_info_flags(true, true, false, 60), 0);
+    }
 
     #[test]
     fn media_past_its_playout_deadline_is_expired_and_nothing_else_is() {

@@ -382,10 +382,11 @@ test("ring is visible even when the visualizer is toggled off", async ({ page })
 
   await page.evaluate(() => showBuffering(true, "Connecting…"));
   await expect(page.locator("#viz")).toBeVisible();
-  // The unlit stubs paint immediately; the bright leading edge appears as the creep travels.
-  expect((await ringStats(page)).sum).toBeGreaterThan(0);
-  await page.waitForTimeout(300);
-  expect((await ringStats(page)).lit).toBeGreaterThan(0);
+  // The ring paints on the next animation frame, not synchronously — so POLL for it. Reading the
+  // canvas straight after showBuffering() raced that first frame and failed about one run in three.
+  // The unlit stubs come first; the bright leading edge appears as the creep travels.
+  await expect.poll(async () => (await ringStats(page)).sum).toBeGreaterThan(0);
+  await expect.poll(async () => (await ringStats(page)).lit).toBeGreaterThan(0);
 
   // …and hidden again afterwards, since the visualizer is still off.
   await page.evaluate(() => showBuffering(null));

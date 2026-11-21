@@ -40,6 +40,13 @@ via a CoreAudio process tap (no driver, no BlackHole); local *screen* capture is
     browser playing YouTube Music). Pick it from the live app list.
   - **Full system output** — WASAPI endpoint loopback (cpal). Mirrors the speakers, so it
     **goes silent when Windows is muted**.
+- **Capture (Linux).** A PipeWire/PulseAudio monitor of the default output (whole system), one
+  application's stream, or:
+  - **"Newfoundsync" output device** — the server adds a virtual output device while this source
+    is live. Set an app's output to it in your volume mixer and that app is streamed **and silent
+    on the server PC**. Use it when the server PC is also where the music plays: the direct sound
+    is a whole buffer *ahead* of every synced client, so hearing both doubles the audio. To listen
+    on the server PC too, open the web client there like any other device.
 - **Codec.** Opus, 48 kHz stereo, **510 kbps by default** (libopus' transparent max; tune
   with `--bitrate` or the UI), or uncompressed **PCM**. One 20 ms frame per message.
 - **Transport.** **HTTPS + WebSocket** (TLS via a persisted self-signed cert). Reliable
@@ -270,6 +277,7 @@ newfoundsync
 newfoundsync --headless                          # all apps + system sounds, Opus 510k, 3s buffer
 newfoundsync --headless --capture system         # mirror the speakers (respects mute)
 newfoundsync --headless --capture app --app-pid 1234
+newfoundsync --headless --capture sink           # Linux: a "Newfoundsync" output device (see below)
 newfoundsync --headless --video --resolution 1440p --fps 60
 ```
 
@@ -281,7 +289,7 @@ newfoundsync --headless --video --resolution 1440p --fps 60
 | `--codec` | `opus` | `opus` or `pcm` |
 | `--bitrate` | `510000` | Opus bits/sec (ignored for PCM) |
 | `--buffer-ms` | `3000` | Client buffer = end-to-end latency **and** dropout cushion (≤ 15000) |
-| `--capture` | `allapps` | `allapps` (all but us, survives mute) · `system` (endpoint) · `app` · `web` (a web client casts audio/video up to this server) |
+| `--capture` | `allapps` | `allapps` (all but us, survives mute) · `system` (endpoint) · `app` · `sink` (Linux: only apps sent to a "Newfoundsync" output device, silent on this PC) · `web` (a web client casts audio/video up to this server) |
 | `--app-pid` | — | Target PID when `--capture app` |
 | `--video` | off | Also share the screen |
 | `--resolution` | `1080p` | `720p` · `1080p` · `1440p` · `2160p` |
@@ -290,6 +298,39 @@ newfoundsync --headless --video --resolution 1440p --fps 60
 | `--insecure-http` | off | Plain HTTP (WebCodecs then only works via localhost / a TLS proxy) |
 
 Run `newfoundsync --help` for the full list.
+
+### Playing on the server PC without hearing it twice (Linux)
+
+If the app you want to share runs on the server PC itself, the PC's own speakers play it
+immediately while every client plays it one buffer later. `--capture sink` (GUI: **"Newfoundsync"
+output device**) removes the early copy:
+
+1. Start the server with that source. An output device named **Newfoundsync** appears.
+2. In the server window, tick the app in the list under that source. It goes quiet on this PC and
+   starts streaming. The tick is remembered, so the app is sent there again on later launches.
+   (Headless, or if you prefer: set the app's output to **Newfoundsync** in your desktop's volume
+   mixer, or `pavucontrol` → Playback.)
+3. To hear it here as well, open the server's URL in a browser on this PC. It joins the sync like
+   any other client and plays through your real speakers.
+
+Things to know:
+
+- **Keep your real speakers as the default output.** If *Newfoundsync* is the default, the browser
+  from step 3 plays into it too, gets re-captured, and echoes every buffer length. The server
+  warns in its log and status line when it detects this.
+- **Apps are listed by the name their audio stream reports**, which is not always the app's own:
+  Finamp plays through libmpv and shows up as `mpv — Finamp`. A tick applies to every app
+  reporting that name.
+- **Don't tick the browser you listen in.** Its playback of the stream would be captured again
+  and echo.
+- **The Flatpak moves apps by declaring itself an audio manager** (`media.category = Manager`) on
+  the short connection it uses for that, which is how WirePlumber lets a sandboxed app re-route
+  other apps' audio. No extra Flatpak permission is involved.
+- **The device is removed** when you switch source, close the window, or stop the server
+  (Ctrl-C / `SIGTERM`). Apps that were sent to it fall back to your default output.
+- **A hard kill (`SIGKILL`, power loss) leaves it behind**, and an app still routed to it plays to
+  nobody. Starting the server again reuses the leftover device; to clear it by hand:
+  `pactl unload-module module-null-sink`.
 
 ## Connect a client
 
@@ -407,8 +448,8 @@ tested**: the clock-offset selection, the PI servo, and the calibration correlat
 `app.js`, where the browser suite only asserts that playback *starts*, not that it lands at the
 right instant. Sync regressions are still caught by a human standing between two speakers.
 
-**Since shipped:** the Linux server (PipeWire/PulseAudio monitor capture — whole-system *or* a
-single application — plus `.deb`, `.rpm` and Flatpak packaging), the PI rate servo, web-client
+**Since shipped:** the Linux server (PipeWire/PulseAudio monitor capture — whole-system, a
+single application, *or* a dedicated "Newfoundsync" output device — plus `.deb`, `.rpm` and Flatpak packaging), the PI rate servo, web-client
 casting (a browser becomes the source), and the `/health` diagnostic endpoint.
 
 **Planned:** native Linux *screen* capture via the PipeWire ScreenCast portal, VA-API GPU encode,

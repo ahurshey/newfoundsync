@@ -196,6 +196,10 @@ pub enum CaptureSource {
     /// A single application (and its child processes), via process loopback.
     /// Survives output mute.
     App { pid: u32 },
+    /// Linux only: a virtual "Newfoundsync" output device the server creates. Only apps whose
+    /// output is set to it are streamed, and they are silent on this machine — the direct path
+    /// plays a whole buffer ahead of the synced clients, so hearing both doubles the audio.
+    VirtualSink,
     /// No local capture — the audio/video is cast UP from a web client over the
     /// WebSocket and relayed (via [`CastRelay`]) onto the same broadcast channels.
     WebUplink,
@@ -644,6 +648,24 @@ impl AudioCapture {
                     .context("start per-application PulseAudio/PipeWire capture")?;
                 let name = c.device_name.clone();
                 Ok((AudioCapture::Pulse(c), name))
+            }
+
+            // Linux: create the "Newfoundsync" output device and record only what is played into
+            // it. The capture owns the device's lifetime (see `VirtualSinkHandle`).
+            #[cfg(target_os = "linux")]
+            CaptureSource::VirtualSink => {
+                tracing::info!("[capture] starting audio source = NEWFOUNDSYNC OUTPUT DEVICE (virtual sink)");
+                let c = crate::capture::pulse::PulseCapture::start_virtual_sink(on_frame)
+                    .context("start the Newfoundsync output device")?;
+                let name = c.device_name.clone();
+                Ok((AudioCapture::Pulse(c), name))
+            }
+            // Refused rather than quietly broadened: falling back to a whole-system capture would
+            // stream everything on the machine under a label promising only the chosen apps.
+            #[cfg(not(target_os = "linux"))]
+            CaptureSource::VirtualSink => {
+                let _ = on_frame;
+                anyhow::bail!("the Newfoundsync output device needs PipeWire/PulseAudio (Linux only)")
             }
 
             #[cfg(not(target_os = "linux"))]

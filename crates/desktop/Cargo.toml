@@ -167,6 +167,10 @@ pipewire = { version = "0.9", optional = true }
 # via `package =` so the `use pulse::…` / `use psimple::…` in capture/pulse.rs resolve.
 pulse = { package = "libpulse-binding", version = "2" }
 psimple = { package = "libpulse-simple-binding", version = "2" }
+# `signal` on Linux only (features unify with the base tokio dependency above): the "Newfoundsync"
+# output device is a sound-server module that outlives this process, so SIGINT/SIGTERM/SIGHUP have
+# to remove it before exiting — see capture/pulse.rs `install_exit_cleanup`.
+tokio = { version = "1", features = ["signal"] }
 
 # Embed branding/icon.ico into newfoundsync.exe (Explorer / Start menu icon).
 [target.'cfg(target_os = "windows")'.build-dependencies]

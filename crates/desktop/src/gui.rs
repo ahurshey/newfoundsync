@@ -35,12 +35,44 @@ use crate::webserver::{self, ClientRegistry, StreamState};
 // (see capture/linux_sessions.rs); the picker below is written to tolerate both.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 use crate::capture::sessions::{self, AudioApp};
+#[cfg(target_os = "linux")]
+use crate::capture::pulse::{self, RouteSnapshot};
+
+/// How often the "send to the output device" list is re-read while its source is selected.
+///
+/// Unlike the capture picker, this one DOES poll, because it is not only a list: each pass also
+/// moves a remembered app that is in the wrong place (see `pulse::sync_routes` for why the sound
+/// server cannot be trusted to). It has no button to flicker, and the window already repaints once
+/// a second for the client counts, so the poll costs one short-lived connection per pass.
+#[cfg(target_os = "linux")]
+const ROUTE_SYNC_EVERY: Duration = Duration::from_secs(2);
+
+/// State behind the "send these apps to the output device" checkboxes (Linux).
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct AppRouting {
+    /// Apps the operator ticked, by `pulse::RoutedApp::key`. Persisted across launches.
+    wanted: std::collections::BTreeSet<String>,
+    /// Apps unticked since the last pass; the next pass sends them back to the speakers.
+    release: Vec<String>,
+    /// What the last pass found. `None` until the first one returns.
+    snapshot: Option<RouteSnapshot>,
+    /// A pass in flight on a worker thread — never run on the GUI thread, it talks to the sound
+    /// server.
+    rx: Option<mpsc::Receiver<Result<RouteSnapshot, String>>>,
+    last_sync: Option<std::time::Instant>,
+    /// A box was toggled: run a pass now rather than at the next tick.
+    dirty: bool,
+    error: String,
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum SourceKind {
     AllApps,
     App,
     System,
+    /// Linux: the "Newfoundsync" output device — only apps sent to it, silent on this machine.
+    VirtualSink,
     /// No local capture — a web client casts its screen/audio up and the server relays it.
     WebUplink,
 }
@@ -205,6 +237,7 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
     let (source, selected_pid) = match init.capture_source {
         CaptureSource::AllExceptSelf => (SourceKind::AllApps, None),
         CaptureSource::System => (SourceKind::System, None),
+        CaptureSource::VirtualSink => (SourceKind::VirtualSink, None),
         CaptureSource::WebUplink => (SourceKind::WebUplink, None),
         CaptureSource::App { pid } => (SourceKind::App, Some(pid)),
     };
@@ -271,6 +304,11 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         apps_rx: None,
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         refreshing: false,
+        #[cfg(target_os = "linux")]
+        routing: AppRouting {
+            wanted: crate::settings::load_routed_apps().into_iter().collect(),
+            ..Default::default()
+        },
         selected_pid,
         selected_name: String::new(),
         video_kind,
@@ -769,6 +807,8 @@ struct ServerApp {
     apps_rx: Option<mpsc::Receiver<Vec<AudioApp>>>,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     refreshing: bool,
+    #[cfg(target_os = "linux")]
+    routing: AppRouting,
     /// When the Linux app list was last re-enumerated. Windows windows persist, so a manual
     /// refresh is fine there; a Linux list is a snapshot of what is *playing this instant*, so it
     /// has to re-scan on a timer or it will show apps that already stopped and miss ones that
@@ -1053,11 +1093,152 @@ impl ServerApp {
         }
     }
 
+    /// Collect a finished routing pass and start the next one when it is due. Called once per frame;
+    /// never blocks. Only runs while the output-device source is the one selected — with any other
+    /// source there is no device to send anything to.
+    #[cfg(target_os = "linux")]
+    fn poll_routes(&mut self, ctx: &egui::Context) {
+        let r = &mut self.routing;
+        if let Some(rx) = &r.rx {
+            match rx.try_recv() {
+                Ok(Ok(snap)) => {
+                    // A box toggled while this pass was in flight makes its answer stale; showing it
+                    // would bounce the box back for a moment. The pass that follows has the truth.
+                    if !r.dirty {
+                        r.snapshot = Some(snap);
+                    }
+                    r.error.clear();
+                    r.rx = None;
+                }
+                Ok(Err(e)) => {
+                    r.error = e;
+                    r.rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => r.rx = None,
+            }
+        }
+        if self.source != SourceKind::VirtualSink {
+            return;
+        }
+        let due = r.dirty || r.last_sync.map_or(true, |t| t.elapsed() >= ROUTE_SYNC_EVERY);
+        if r.rx.is_none() && due {
+            let wanted: Vec<String> = r.wanted.iter().cloned().collect();
+            let release = std::mem::take(&mut r.release);
+            let (tx, rx) = mpsc::channel();
+            let spawned = std::thread::Builder::new().name("app-routing".into()).spawn(move || {
+                let _ = tx.send(pulse::sync_routes(&wanted, &release).map_err(|e| format!("{e:#}")));
+            });
+            if spawned.is_ok() {
+                r.rx = Some(rx);
+            }
+            r.dirty = false;
+            r.last_sync = Some(std::time::Instant::now());
+        }
+        ctx.request_repaint_after(if r.rx.is_some() {
+            Duration::from_millis(100) // pick the answer up promptly
+        } else {
+            ROUTE_SYNC_EVERY
+        });
+    }
+
+    /// The operator ticked or unticked an app in the output-device list.
+    #[cfg(target_os = "linux")]
+    fn set_app_routed(&mut self, key: &str, on: bool) {
+        let r = &mut self.routing;
+        r.release.retain(|k| k != key);
+        if on {
+            r.wanted.insert(key.to_string());
+        } else {
+            r.wanted.remove(key);
+            r.release.push(key.to_string());
+        }
+        // Show the choice at once; the pass this triggers makes it true within a moment.
+        if let Some(snap) = r.snapshot.as_mut() {
+            for a in snap.apps.iter_mut().filter(|a| a.key == key) {
+                a.on_device = on;
+            }
+        }
+        r.dirty = true;
+        if let Err(e) = crate::settings::save_routed_apps(&r.wanted) {
+            tracing::debug!("could not save the routed apps: {e}");
+        }
+    }
+
+    /// The checkboxes under the "Newfoundsync" output device source: which apps play into it.
+    #[cfg(target_os = "linux")]
+    fn ui_app_routing(&mut self, ui: &mut egui::Ui) {
+        let dim = |t: &str| egui::RichText::new(t).size(11.0).color(c_dim());
+        if !self.routing.error.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("⚠  Could not reach the sound server: {}", self.routing.error))
+                    .size(11.0)
+                    .color(c_err()),
+            );
+        }
+        let Some(snap) = self.routing.snapshot.clone() else {
+            return; // the first look is still in flight
+        };
+        let remembered: Vec<String> = self
+            .routing
+            .wanted
+            .iter()
+            .filter(|k| !snap.apps.iter().any(|a| a.key == **k))
+            .cloned()
+            .collect();
+        if !snap.device_live {
+            ui.label(dim("Press Apply to create the device  —  then tick the apps to send to it, right here."));
+            if !self.routing.wanted.is_empty() {
+                let names: Vec<&str> = self.routing.wanted.iter().map(|s| s.as_str()).collect();
+                ui.label(dim(&format!("Remembered from last time: {}", names.join(", "))));
+            }
+            return;
+        }
+        let mut toggled: Option<(String, bool)> = None;
+        ui.indent("route_apps", |ui| {
+            ui.label(dim("Send to it  —  streamed, and silent on this PC:"));
+            for app in &snap.apps {
+                // An app someone sent here with the system mixer is shown ticked as well: the box
+                // says where the app plays, and unticking it has to work either way.
+                let mut on = app.on_device || self.routing.wanted.contains(&app.key);
+                if ui.checkbox(&mut on, app.label.as_str()).changed() {
+                    toggled = Some((app.key.clone(), on));
+                }
+            }
+            for key in &remembered {
+                // Ticked earlier, not playing now. Kept visible so it can be unticked — otherwise
+                // the only way to stop an app being sent here would be to catch it mid-song.
+                let mut on = true;
+                if ui
+                    .checkbox(&mut on, egui::RichText::new(format!("{key}  (not playing)")).color(c_dim()))
+                    .on_hover_text("Remembered: it is sent here as soon as it plays.")
+                    .changed()
+                {
+                    toggled = Some((key.clone(), false));
+                }
+            }
+            if snap.apps.is_empty() && remembered.is_empty() {
+                ui.label(dim("(nothing is playing audio right now — press play in your app and it appears here)"));
+            }
+            if let Some(problem) = &snap.problem {
+                ui.label(egui::RichText::new(format!("⚠  {problem}")).size(11.0).color(c_err()));
+            }
+        });
+        ui.label(dim(
+            "To hear it on this PC in sync, open the address above in a browser here.\n\
+             Don't tick that browser, and keep your real speakers as the default output  —  either one echoes.",
+        ));
+        if let Some((key, on)) = toggled {
+            self.set_app_routed(&key, on);
+        }
+    }
+
     /// Build options from the current UI and hand them to the control thread.
     fn apply(&mut self) {
         let capture_source = match self.source {
             SourceKind::AllApps => CaptureSource::AllExceptSelf,
             SourceKind::System => CaptureSource::System,
+            SourceKind::VirtualSink => CaptureSource::VirtualSink,
             SourceKind::WebUplink => CaptureSource::WebUplink,
             SourceKind::App => match self.selected_pid {
                 Some(pid) => CaptureSource::App { pid },
@@ -1793,6 +1974,33 @@ impl ServerApp {
             {
                 self.video_kind = VideoSourceKind::Off;
             }
+            // Linux only: the device is a PipeWire/PulseAudio sink, and no other platform's capture
+            // can host one. Not shown disabled elsewhere: on Windows the all-apps and per-app sources
+            // keep streaming with the output muted, which already answers the same need.
+            #[cfg(target_os = "linux")]
+            {
+                if ui
+                    .radio_value(
+                        &mut self.source,
+                        SourceKind::VirtualSink,
+                        "\"Newfoundsync\" output device  —  only apps you send to it, silent on this PC",
+                    )
+                    .on_hover_text(
+                        "Adds an output device called \"Newfoundsync\" while this source is live. \
+                         Tick an app below (or set its output to the device in your system volume \
+                         mixer): that app is streamed and no longer plays out of this PC's speakers, \
+                         so you don't hear it twice (once now, once a buffer later). The device is \
+                         removed when you switch source or quit.",
+                    )
+                    .clicked()
+                    && self.video_kind == VideoSourceKind::WebCast
+                {
+                    self.video_kind = VideoSourceKind::Off;
+                }
+                if self.source == SourceKind::VirtualSink {
+                    self.ui_app_routing(ui);
+                }
+            }
             if ui
                 .radio_value(
                     &mut self.source,
@@ -2229,6 +2437,8 @@ impl eframe::App for ServerApp {
         }
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
+            #[cfg(target_os = "linux")]
+            self.poll_routes(ui.ctx());
             self.poll_refresh();
             if self.refreshing {
                 ui.ctx().request_repaint_after(Duration::from_millis(50)); // pick up the result promptly

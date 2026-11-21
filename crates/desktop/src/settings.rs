@@ -98,6 +98,30 @@ pub fn save_av_offset_ms(ms: i32) -> Result<(), String> {
     save_key("av_offset_ms", &ms.clamp(-500, 500).to_string())
 }
 
+/// The apps the operator ticked to send to the "Newfoundsync" output device (Linux), by name.
+///
+/// Persisted because the tick is a statement about the APP ("my music player goes to the stream"),
+/// not about a session: having to find and re-tick it on every launch is the chore the list exists
+/// to remove.
+pub fn load_routed_apps() -> Vec<String> {
+    load_all()
+        .get("routed_apps")
+        .map(|v| v.split('|').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// Persist the ticked apps (preserving other settings). A name that could not survive the
+/// `key=value` / `|`-separated file is left out rather than allowed to corrupt its neighbours; that
+/// app simply has to be ticked again next launch.
+pub fn save_routed_apps<'a>(apps: impl IntoIterator<Item = &'a String>) -> Result<(), String> {
+    let kept: Vec<&str> = apps
+        .into_iter()
+        .map(|s| s.as_str())
+        .filter(|s| !s.contains(['|', '\n', '\r']) && s.trim() == *s && !s.is_empty())
+        .collect();
+    save_key("routed_apps", &kept.join("|"))
+}
+
 /// The saved xdg-desktop-portal ScreenCast restore token, if a screen share was previously
 /// approved. `None` ⇒ the portal will show its picker dialog.
 ///

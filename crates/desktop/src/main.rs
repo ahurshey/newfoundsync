@@ -89,7 +89,9 @@ struct Cli {
     /// GUI slider, else 0.
     #[arg(long)]
     av_offset_ms: Option<i32>,
-    /// Audio source: allapps (survives mute) | system | app | web (a web client casts up to here).
+    /// Audio source: allapps (survives mute) | system | app | sink (Linux: a "Newfoundsync" output
+    /// device; only apps sent to it are streamed, and they are silent here) | web (a web client
+    /// casts up to here).
     #[arg(long, default_value = "allapps")]
     capture: String,
     /// PID to capture when --capture app.
@@ -158,7 +160,17 @@ fn main() -> Result<()> {
                 .app_pid
                 .ok_or_else(|| anyhow!("--capture app requires --app-pid <PID>"))?,
         },
-        other => return Err(anyhow!("unknown capture '{other}' (use allapps|system|app|web)")),
+        // Refused up front on other platforms, where there is no sound server to host the device:
+        // accepting it would start a server whose only source can never produce a frame.
+        "sink" | "device" | "virtual" => {
+            if !cfg!(target_os = "linux") {
+                return Err(anyhow!(
+                    "--capture sink creates a PipeWire/PulseAudio output device and is Linux-only"
+                ));
+            }
+            CaptureSource::VirtualSink
+        }
+        other => return Err(anyhow!("unknown capture '{other}' (use allapps|system|app|sink|web)")),
     };
     let video = if cli.video {
         // A request for local screen capture used to be accepted here and then dropped deep in
@@ -214,7 +226,7 @@ fn main() -> Result<()> {
     #[cfg(feature = "gui")]
     {
         if !cli.headless {
-            return gui::run(
+            let result = gui::run(
                 port,
                 name,
                 gui::InitialConfig {
@@ -228,13 +240,20 @@ fn main() -> Result<()> {
                     av_offset_ns: av_offset_ns.clone(),
                 },
             );
+            // Closing the window returns here with the live capture still owned by the
+            // media-control thread, which process exit kills without running its destructors. The
+            // "Newfoundsync" output device belongs to the sound server, not to us, so it has to be
+            // removed by hand or it outlives the app with programs still playing into it.
+            #[cfg(target_os = "linux")]
+            capture::pulse::remove_virtual_sink();
+            return result;
         }
     }
     #[cfg(not(feature = "gui"))]
     if !cli.headless {
         tracing::info!("built without the `gui` feature — running headless (server-only)");
     }
-    run_headless(
+    let result = run_headless(
         name,
         capture_source,
         video,
@@ -246,7 +265,12 @@ fn main() -> Result<()> {
         port,
         !cli.insecure_http,
         av_offset_ns,
-    )
+    );
+    // Normally already gone (run_headless drops its capture on the way out); this covers the paths
+    // that do not, so an early error cannot leave the output device behind.
+    #[cfg(target_os = "linux")]
+    capture::pulse::remove_virtual_sink();
+    result
 }
 
 #[allow(clippy::too_many_arguments)]

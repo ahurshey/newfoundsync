@@ -59,15 +59,19 @@ struct Cli {
     /// Run without the GUI (server-only, driven by the flags below).
     #[arg(long)]
     headless: bool,
-    /// Audio codec: opus (default) or pcm.
-    #[arg(long, default_value = "opus")]
-    codec: String,
-    /// Opus bitrate in bits/sec (ignored for pcm).
-    #[arg(long, default_value_t = config::DEFAULT_BITRATE_BPS)]
-    bitrate: i32,
-    /// Client buffer in ms (= end-to-end latency AND dropout cushion).
-    #[arg(long, default_value_t = config::DEFAULT_BUFFER_MS)]
-    buffer_ms: i64,
+    // The four below are `Option`s rather than clap defaults so "not given" can be told apart from
+    // "given the default": when a flag is omitted, the choice last applied in the server window is
+    // used, and only then the built-in default. A flag always wins for that run.
+    /// Audio codec: opus or pcm. Omitted ⇒ the last choice in the GUI, else opus.
+    #[arg(long)]
+    codec: Option<String>,
+    /// Opus bitrate in bits/sec (ignored for pcm). Omitted ⇒ the last choice in the GUI, else 510000.
+    #[arg(long)]
+    bitrate: Option<i32>,
+    /// Client buffer in ms (= end-to-end latency AND dropout cushion). Omitted ⇒ the last choice in
+    /// the GUI, else 3000.
+    #[arg(long)]
+    buffer_ms: Option<i64>,
     /// Also share the screen (video).
     #[arg(long)]
     video: bool,
@@ -78,8 +82,9 @@ struct Cli {
     #[arg(long, default_value = "30", value_parser = ["30", "60"])]
     fps: String,
     /// Video codec: av1 (royalty-free default; GPU AV1 or CPU SVT-AV1) | vp9 (royalty-free CPU fallback).
-    #[arg(long, default_value = "av1")]
-    encoder: String,
+    /// Omitted ⇒ the last choice in the GUI, else av1.
+    #[arg(long)]
+    encoder: Option<String>,
     /// Where video encodes: auto (GPU if available, else CPU) | gpu (fail if unavailable) | cpu.
     /// Audio is unaffected. Separate from --encoder, which picks the CODEC.
     #[arg(long, default_value = "auto")]
@@ -91,9 +96,10 @@ struct Cli {
     av_offset_ms: Option<i32>,
     /// Audio source: allapps (survives mute) | system | app | sink (Linux: a "Newfoundsync" output
     /// device; only apps sent to it are streamed, and they are silent here) | web (a web client
-    /// casts up to here).
-    #[arg(long, default_value = "allapps")]
-    capture: String,
+    /// casts up to here). Omitted ⇒ the source last applied in the GUI, else allapps. (A single-app
+    /// source is never restored: its PID does not survive a restart.)
+    #[arg(long)]
+    capture: Option<String>,
     /// PID to capture when --capture app.
     #[arg(long, required_if_eq("capture", "app"))]
     app_pid: Option<u32>,
@@ -118,10 +124,14 @@ fn main() -> Result<()> {
 
     // Clamp ONCE, here at the entry point, so every downstream path (headless and GUI seed alike) gets
     // a sane value. The headless path previously passed --buffer-ms through unclamped.
-    let buffer_ms = config::clamp_buffer_ms(cli.buffer_ms);
-    if buffer_ms != cli.buffer_ms {
+    let buffer_req = cli
+        .buffer_ms
+        .or_else(|| settings::get("buffer_ms").and_then(|v| v.parse().ok()))
+        .unwrap_or(config::DEFAULT_BUFFER_MS);
+    let buffer_ms = config::clamp_buffer_ms(buffer_req);
+    if buffer_ms != buffer_req {
         tracing::warn!(
-            requested = cli.buffer_ms,
+            requested = buffer_req,
             using = buffer_ms,
             "--buffer-ms outside the supported range ({}..={} ms); clamped",
             config::MIN_BUFFER_MS,
@@ -130,19 +140,33 @@ fn main() -> Result<()> {
     }
 
     // Parse the media config once; both GUI and headless use it.
-    let codec = CodecKind::parse(&cli.codec)
-        .ok_or_else(|| anyhow!("unknown codec '{}' (use opus or pcm)", cli.codec))?;
-    let encoder = EncoderBackend::parse(&cli.encoder)
-        .ok_or_else(|| anyhow!("unknown encoder '{}' (use av1 or vp9)", cli.encoder))?;
+    // A flag that does not parse is an error; a SAVED value that does not parse (an older or newer
+    // build wrote it, or someone edited the file) is ignored in favour of the default — a stale
+    // settings file must never stop the server from starting.
+    let codec = match &cli.codec {
+        Some(c) => CodecKind::parse(c).ok_or_else(|| anyhow!("unknown codec '{c}' (use opus or pcm)"))?,
+        None => settings::get("codec").and_then(|c| CodecKind::parse(&c)).unwrap_or(CodecKind::Opus),
+    };
+    let bitrate = cli
+        .bitrate
+        .or_else(|| settings::get("bitrate").and_then(|v| v.parse().ok()))
+        .unwrap_or(config::DEFAULT_BITRATE_BPS);
+    let encoder_arg = cli.encoder.clone().unwrap_or_default();
+    let encoder = match &cli.encoder {
+        Some(e) => EncoderBackend::parse(e).ok_or_else(|| anyhow!("unknown encoder '{e}' (use av1 or vp9)"))?,
+        None => settings::get("video_encoder")
+            .and_then(|e| EncoderBackend::parse(&e))
+            .unwrap_or(EncoderBackend::Av1),
+    };
     // `--encoder` has long accepted device-flavoured words (gpu/cpu/hw/auto/...) as aliases for
     // av1. They are kept working so nobody's script breaks, but they never selected a device and
     // still don't -- someone who wrote `--encoder cpu` to keep video off the GPU has been getting
     // GPU encoding this whole time, with nothing in the log to say so. Now there is.
     if matches!(
-        cli.encoder.to_ascii_lowercase().as_str(),
+        encoder_arg.to_ascii_lowercase().as_str(),
         "auto" | "hardware" | "hw" | "gpu" | "cpu" | "software" | "sw"
     ) {
-        let token = cli.encoder.to_ascii_lowercase();
+        let token = encoder_arg.to_ascii_lowercase();
         tracing::warn!(
             "--encoder {token} names the CODEC and is only an alias for av1 — it has never \
              selected GPU vs CPU. Use --encode-device {token} instead."
@@ -151,7 +175,16 @@ fn main() -> Result<()> {
     let encode_device = EncodeDevice::parse(&cli.encode_device).ok_or_else(|| {
         anyhow!("unknown encode device '{}' (use auto, gpu or cpu)", cli.encode_device)
     })?;
-    let capture_source = match cli.capture.as_str() {
+    // Only the sources that mean the same thing after a restart are ever saved (see gui::apply), and
+    // the saved one is re-checked here so a file from another platform cannot name a source this
+    // build would refuse.
+    let saved_capture = settings::get("source").filter(|s| match s.as_str() {
+        "allapps" | "system" | "web" => true,
+        "sink" => cfg!(target_os = "linux"),
+        _ => false,
+    });
+    let capture_arg = cli.capture.clone().or(saved_capture).unwrap_or_else(|| "allapps".to_string());
+    let capture_source = match capture_arg.as_str() {
         "allapps" | "exclude" | "all" => CaptureSource::AllExceptSelf,
         "system" => CaptureSource::System,
         "web" | "uplink" | "cast" => CaptureSource::WebUplink,
@@ -236,7 +269,7 @@ fn main() -> Result<()> {
                     encode_device,
                     buffer_ms,
                     codec,
-                    bitrate: cli.bitrate,
+                    bitrate,
                     av_offset_ns: av_offset_ns.clone(),
                 },
             );
@@ -260,7 +293,7 @@ fn main() -> Result<()> {
         encoder,
         encode_device,
         codec,
-        cli.bitrate,
+        bitrate,
         buffer_ms,
         port,
         !cli.insecure_http,

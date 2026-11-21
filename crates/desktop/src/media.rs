@@ -13,7 +13,7 @@
 //!          H.264 Annex-B for a web-uplink cast; the exact codec is advertised in MediaConfig.video_codec]
 
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -91,7 +91,7 @@ impl LogThrottle {
 /// * `audio_frames` counts frames the pipeline PUBLISHED, not audible sound. The default
 ///   `--capture allapps` source pads silence to keep a steady 20 ms cadence, so this keeps climbing
 ///   through a silent or dead device. It proves the pipeline is turning, not that anyone can hear it.
-///   (A peak-level field would settle that; it belongs with the reliability phase.)
+///   `peak` is the field that settles that: it is the level of the sound itself.
 /// * `video_frames` counts ENCODER output. The producer re-encodes its last captured frame when the
 ///   capture goes idle, so this also climbs while the picture is frozen — which is why
 ///   `capture_frames` is tracked separately: it only advances when a genuinely NEW frame arrives from
@@ -130,6 +130,13 @@ pub struct MediaHealth {
     /// True when this stream is expected to be producing video at all (video on, encoder alive). Lets
     /// the watchdog tell "video is off" from "video died".
     pub video_expected: AtomicBool,
+    /// Recent peak sample level per channel (left, right), 0..=32768, for the server window's level
+    /// meter. This is the one signal that answers "is there actually SOUND in the stream" — every
+    /// frame counter above keeps climbing through digital silence. Held with a short decay so a GUI
+    /// that samples a few times a second still sees a transient that fell between two reads.
+    ///
+    /// Always 0 for a web cast: the server relays the caster's encoded packets and never decodes them.
+    pub peak: [AtomicU32; 2],
 }
 
 impl MediaHealth {
@@ -141,6 +148,34 @@ impl MediaHealth {
     fn note_audio(&self) {
         self.audio_frames.fetch_add(1, Ordering::Relaxed);
         self.last_audio_ns.store(mono_now(), Ordering::Relaxed);
+    }
+
+    /// Fold one captured frame (interleaved stereo `i16`) into the level meter's peaks.
+    fn note_level(&self, frame: &[i16]) {
+        let mut pk = [0u32; 2];
+        for pair in frame.chunks_exact(CHANNELS) {
+            for (c, s) in pair.iter().enumerate().take(2) {
+                pk[c] = pk[c].max(s.unsigned_abs() as u32);
+            }
+        }
+        for c in 0..2 {
+            // Decay the held value by ~1.4 dB per 20 ms frame, so a peak stays readable for a few
+            // hundred ms and then falls away instead of latching.
+            let held = self.peak[c].load(Ordering::Relaxed) * 85 / 100;
+            self.peak[c].store(held.max(pk[c]), Ordering::Relaxed);
+        }
+    }
+
+    /// The level meter's current peaks as 0.0..=1.0 on a dB scale (-54 dBFS and below reads 0).
+    pub fn level(&self) -> [f32; 2] {
+        let norm = |p: u32| -> f32 {
+            if p == 0 {
+                return 0.0;
+            }
+            let db = 20.0 * (p as f32 / 32768.0).log10();
+            ((db + 54.0) / 54.0).clamp(0.0, 1.0)
+        };
+        [norm(self.peak[0].load(Ordering::Relaxed)), norm(self.peak[1].load(Ordering::Relaxed))]
     }
 
     /// Note a published video frame. Same no-timestamp rule as [`MediaHealth::note_audio`].
@@ -458,6 +493,7 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
             // way the video path now does with `captured_ns`.
             let span_ns = (frame.len() / CHANNELS) as i64 * 1_000_000_000 / SAMPLE_RATE as i64;
             let capture_ns = mono_now() - span_ns;
+            audio_health.note_level(frame);
             // FFI callback (cpal/WGC) — trap panics so they can't unwind across C.
             let _ = std::panic::catch_unwind(AssertUnwindSafe(|| match encoder.encode(frame) {
                 Ok(payload) => {

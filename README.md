@@ -77,15 +77,29 @@ via a CoreAudio process tap (no driver, no BlackHole); local *screen* capture is
 
 Run with **no flags** for the GUI; `--headless` runs server-only from the flags.
 
-**GUI**
-- **Connect strip** — the `https://…:47000` URL, a **Copy/Open** button, and a scannable **QR**.
-- **Audio / Video / Buffer** — pick the source, optional screen video (resolution, fps,
-  quality, **AV1 / VP9** encoder), and the buffer depth (**Snappy 1 s / Balanced 3 s / Rock-solid
-  6 s**, slider up to 15 s). Hit **Apply** to switch the live stream.
-- **Connected Clients mixer** — **master** volume + per-client **volume**, **sync**,
-  **mute**, double-click **rename** (remembered across reconnects), each device's
-  **reported actual sync**, and **Calibrate all**.
-- **Light / dark** toggle and zoom controls.
+**GUI** — laid out around who is listening, since that is what the window is open for.
+- **Header** — a status chip that is checked against the audio (**Live**, **Nothing playing**,
+  **Waiting for a cast**, **Sound stopped**) and a stereo **level meter** of the sound going into
+  the stream.
+- **Devices** — **master** volume, then one row per device: its name (double-click to
+  **rename**), its health (connected, falling behind with the dropped-frame count, hearing
+  silence), **mute**, **volume**, and its **actual sync**. Click the sync value for ±1 / ±10 ms
+  nudges and a reset. **Calibrate all** and **Reset sync** sit above the list. Names, volumes and
+  sync offsets are **remembered across restarts**, and devices that are not connected are listed
+  as offline.
+- **Sharing** — first *This computer* or *A device casts*, then the source (all apps, one app,
+  speaker output, the "Newfoundsync" output device on Linux), whether the screen goes along
+  (resolution, fps, quality, **AV1 / VP9**), the **delay** (**Snappy 1 s / Balanced 3 s /
+  Rock-solid 6 s**, slider up to 15 s) and the **sound quality** (Opus bitrate or PCM).
+- **Pending bar** — changing any of those shows a bar across the bottom saying how many changes
+  are waiting and how many devices will reconnect, with **Discard** and **Apply**. If a switch
+  fails, the full error is shown and the change goes back to pending.
+- **Add a device** — the `https://…:47000` address, **Copy / Open** and a scannable **QR**, with
+  the one-time certificate step spelled out. A server with no devices shows this instead of an
+  empty list.
+- **Settings** — port, **light / dark** theme, text size, build id. The theme, text size, last
+  applied source, delay and sound quality are saved and used on the next launch when no flag
+  overrides them. (Screen sharing always starts off.)
 
 **Headless** — `--headless` serves with no window (the stable path on machines whose
 windowed GUI is flaky); everything is driven by flags or the browser-side controls.

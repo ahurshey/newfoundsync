@@ -595,7 +595,7 @@ static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock
 
 /// How long without a published frame counts as a stall. Audio frames arrive every 20 ms, so 2 s of
 /// nothing is unambiguous while still tolerating a scheduling hiccup.
-const STALL_MS: i64 = 2_000;
+pub const STALL_MS: i64 = 2_000;
 
 /// Watch the pipeline and SAY SOMETHING when it stops producing.
 ///
@@ -609,6 +609,8 @@ fn spawn_stall_watchdog(state: Arc<AppState>) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut audio_bad = false;
         let mut video_bad = false;
+        // Which stream's capture-closed we already logged (its health allocation, as an address).
+        let mut capture_closed_logged: usize = 0;
         loop {
             tick.tick().await;
             // Clone out immediately — never hold a watch borrow across an await.
@@ -661,8 +663,16 @@ fn spawn_stall_watchdog(state: Arc<AppState>) {
             // Reported ONLY from the authoritative signal (Windows closed the session), never from
             // frame silence. WGC delivery is change-driven: a static screen produces no frames for an
             // unbounded time, so a silence heuristic fires on a still slide — the most ordinary state
-            // a screen-share has. `capture_closed` is a one-way latch, so this logs once.
-            if h.capture_closed.swap(false, Ordering::Relaxed) {
+            // a screen-share has.
+            //
+            // Logged once PER STREAM, and the flag is left set. It used to be cleared here with a
+            // `swap(false)`, but the capture loop mirrors its own closed latch back into this flag on
+            // every tick — so the swap bought one second of quiet, the line repeated every second for
+            // as long as the stream lived, and `/health`, `/status` and the server window (which only
+            // peek) could each miss it in the gap.
+            let stream_id = Arc::as_ptr(h) as usize;
+            if h.capture_closed.load(Ordering::Relaxed) && capture_closed_logged != stream_id {
+                capture_closed_logged = stream_id;
                 tracing::error!(
                     "SCREEN CAPTURE SESSION CLOSED — the shared window or display is gone (or access \
                      was revoked). Video is now frozen on the last captured frame; re-pick the source."
@@ -684,12 +694,19 @@ fn spawn_stall_watchdog(state: Arc<AppState>) {
 /// Shared by the watchdog, `/health` and `/status` deliberately — three copies of this predicate would
 /// drift and disagree with each other.
 fn audio_stall_is_a_fault(state: &AppState, s: &StreamState) -> bool {
+    audio_stalled(s, state.cast.lock().map(|c| c.is_some()).unwrap_or(false))
+}
+
+/// The predicate itself, free of `AppState` so the server window can ask the same question with the
+/// same answer: the window's status must never disagree with the log, `/health` and `/status`.
+/// `cast_held` is whether a client currently holds the cast slot.
+pub fn audio_stalled(s: &StreamState, cast_held: bool) -> bool {
     if !s.health.audio_stall_ms().map(|ms| ms > STALL_MS).unwrap_or(false) {
         return false; // fresh, or never produced (= waiting, not a fault)
     }
     if s.cast_relay.is_some() {
         // Web uplink: only a currently-held cast slot can stall.
-        return state.cast.lock().map(|c| c.is_some()).unwrap_or(false);
+        return cast_held;
     }
     true // local capture should always be producing
 }
@@ -797,7 +814,11 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut n = 0usize;
     if let Ok(reg) = state.clients_reg.lock() {
         let mut entries: Vec<&ClientEntry> = reg.values().collect();
-        entries.sort_by_key(|e| e.conn_id);
+        // By name, then stable id — NOT by connection id, which is new on every reconnect: an Apply
+        // reconnects every device at once and used to reshuffle this table each time.
+        entries.sort_by(|a, b| {
+            (a.name.to_lowercase(), &a.stable_id, a.conn_id).cmp(&(b.name.to_lowercase(), &b.stable_id, b.conn_id))
+        });
         n = entries.len();
         for e in entries {
             let name = if e.name.trim().is_empty() {

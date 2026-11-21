@@ -40,6 +40,8 @@ SERVE_REPO="${SERVE_REPO_DIR:-/var/tmp/nfs-flatpak-repo}"
 OUT="${OUT_DIR:-$HOME/Desktop}/Newfoundsync-${VER}.flatpak"
 
 echo "== building $APP $VER from $MANIFEST"
+# The manifest skips .git, so hand the commit to build.rs in a file (see stamp-git-sha.sh).
+"$(dirname "$0")/stamp-git-sha.sh"
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 flatpak install --user -y --noninteractive flathub org.flatpak.Builder \
   org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08

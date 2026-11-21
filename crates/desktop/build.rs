@@ -19,6 +19,10 @@ const BINARY_INPUTS: &[&str] = &[
     "../../Cargo.lock", // dependency versions
 ];
 
+/// Where `flatpak/stamp-git-sha.sh` leaves the commit for builds that cannot run git themselves.
+/// Relative to this package, like [`BINARY_INPUTS`]; it sits at the repository root and is gitignored.
+const GIT_SHA_STAMP: &str = "../../.nfs-git-sha";
+
 /// Emit `NFS_GIT_SHA` for the binary to report. Hand-copied builds on several machines are otherwise
 /// indistinguishable, which makes "is that box running the build with the fix?" unanswerable.
 fn emit_git_sha() {
@@ -34,16 +38,36 @@ fn emit_git_sha() {
     for p in BINARY_INPUTS {
         println!("cargo:rerun-if-changed={p}");
     }
+    println!("cargo:rerun-if-changed={GIT_SHA_STAMP}");
 
-    let sha = std::process::Command::new("git")
+    let from_git = std::process::Command::new("git")
         .args(["rev-parse", "--short=12", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
+        .filter(|s| !s.is_empty());
+
+    // No git here. That is the normal case inside flatpak-builder: the manifest skips `.git` when it
+    // copies the source in (it is large and would bust the build cache), so every Flatpak build used
+    // to stamp itself "unknown" — which defeated the point of the stamp on exactly the builds that
+    // get hand-copied between machines. `flatpak/stamp-git-sha.sh` writes the commit into a file
+    // before the build; it already carries its own `-dirty` suffix, since the dirty check below
+    // needs the git it was written to stand in for.
+    let Some(sha) = from_git else {
+        let stamped = std::fs::read_to_string(GIT_SHA_STAMP)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| {
+                !s.is_empty()
+                    && s.len() <= 32
+                    && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        println!("cargo:rustc-env=NFS_GIT_SHA={stamped}");
+        return;
+    };
 
     // Mark a build made on top of uncommitted changes, so a local build can't masquerade as the clean
     // commit it was based on. Scoped with `-- <paths>` to the SAME inputs we watch above: that keeps

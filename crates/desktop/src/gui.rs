@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Alex Hurshman and the Newfoundsync contributors.
 
-//! Native server GUI (eframe). Pick the audio source to share — all apps, one
-//! specific app, or the full system output — optionally share the screen, and see
-//! the URL clients open plus how many are connected.
+//! Native server GUI (eframe): who is listening and how loud, whether sound is actually reaching
+//! the stream, what is being shared, and how a new device connects.
+//!
+//! This file holds the window's state, its threads and everything that ACTS on the stream; the
+//! layout itself is in `gui/view.rs`.
 //!
 //! Threading: the GUI thread only ever sends [`MediaOptions`] (cheap, `Send`) to a
 //! dedicated **media-control thread** that owns the live `Media` (which holds a
@@ -17,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use eframe::egui;
@@ -29,6 +31,8 @@ use newfoundsync_core::{config, net};
 
 use crate::media::{self, CaptureSource, Media, MediaOptions, VideoTarget};
 use crate::webserver::{self, ClientRegistry, StreamState};
+
+mod view;
 
 // Both platforms now supply `sessions::{AudioApp, list_sources}` — Windows from a window/session
 // enumeration, Linux from the live PulseAudio sink-input list. Same types, different semantics
@@ -148,7 +152,7 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
     let cast: webserver::CastState = Arc::new(Mutex::new(None));
     let clients = Arc::new(AtomicUsize::new(0));
     let clients_reg: ClientRegistry = Arc::new(Mutex::new(HashMap::new()));
-    let status = Arc::new(Mutex::new(String::from("Starting…")));
+    let status = Arc::new(Mutex::new(StreamStatus::default()));
     let starting = Arc::new(AtomicBool::new(true));
     let (cmd_tx, cmd_rx) = mpsc::channel::<MediaOptions>();
     let (ready_tx, ready_rx) = mpsc::channel::<Option<watch::Receiver<Arc<StreamState>>>>();
@@ -173,7 +177,7 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
             .spawn(move || match media::start(initial_opts) {
                 Ok(m) => {
                     let (tx, rx) = watch::channel(Arc::new(StreamState::from_media(&m)));
-                    *status.lock().unwrap() = serving_text(&m);
+                    status.lock().unwrap().now_serving(&m);
                     starting.store(false, Ordering::Relaxed);
                     let _ = ready_tx.send(Some(rx));
                     control_loop(m, tx, cmd_rx, status, starting);
@@ -186,16 +190,22 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
                     match media::start(fallback_opts) {
                         Ok(m) => {
                             let (tx, rx) = watch::channel(Arc::new(StreamState::from_media(&m)));
-                            *status.lock().unwrap() = format!(
-                                "⚠ Audio source unavailable ({e}). Relaying web casts — pick a source and Apply."
-                            );
+                            {
+                                let mut st = status.lock().unwrap();
+                                st.now_serving(&m);
+                                st.fell_back = true;
+                                st.error = Some(format!(
+                                    "The audio source could not start: {e:#}. The server is waiting \
+                                     for a device to cast instead. Choose a source and press Apply."
+                                ));
+                            }
                             starting.store(false, Ordering::Relaxed);
                             let _ = ready_tx.send(Some(rx));
                             control_loop(m, tx, cmd_rx, status, starting);
                         }
                         Err(e2) => {
-                            *status.lock().unwrap() =
-                                format!("Couldn't start: {e:#} (fallback also failed: {e2:#})");
+                            status.lock().unwrap().error =
+                                Some(format!("Couldn't start: {e:#} (fallback also failed: {e2:#})"));
                             starting.store(false, Ordering::Relaxed);
                             let _ = ready_tx.send(None);
                         }
@@ -208,6 +218,10 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         Ok(Some(rx)) => rx,
         _ => return Err(anyhow!("could not start audio capture — see console for details")),
     };
+
+    // The window reads the SAME stream handle the web server serves from, so its status, its level
+    // meter and its "sound stopped" banner come from the live pipeline's own counters.
+    let stream_rx = state_rx.clone();
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     {
@@ -228,10 +242,7 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
             })?;
     }
 
-    let lan = net::primary_lan_ipv4()
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "<this-pc>".into());
-    let url = format!("https://{lan}:{port}");
+    let url = connect_url(port);
 
     // Seed UI widgets from the initial config so flags are reflected.
     let (source, selected_pid) = match init.capture_source {
@@ -257,7 +268,25 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
             let kind = if kind == VideoSourceKind::Screen { VideoSourceKind::Off } else { kind };
             (kind, res_to_idx(v.resolution), v.fps == Fps::F60)
         }
-        None => (VideoSourceKind::Off, 1, false),
+        // No `--video`: screen sharing starts OFF every launch (it is never restored — a server that
+        // began sharing the screen because it happened to be on last time would be a nasty surprise),
+        // but the options it would use are the ones last applied.
+        None => (
+            VideoSourceKind::Off,
+            crate::settings::get("video_res")
+                .and_then(|r| RES_LABELS.iter().position(|(_, tok)| *tok == r))
+                .unwrap_or(1),
+            crate::settings::get("video_fps60").as_deref() == Some("1"),
+        ),
+    };
+    // The requested source could not start and the stream is really the cast relay: make the window
+    // SAY that. It used to keep showing the source that failed, with nothing pending, so the one
+    // button that could fix it was disabled until the operator changed something else first.
+    let fell_back = status.lock().unwrap().fell_back;
+    let (source, selected_pid, video_kind) = if fell_back {
+        (SourceKind::WebUplink, None, VideoSourceKind::Off)
+    } else {
+        (source, selected_pid, video_kind)
     };
     // Normalize the seed HERE, not in the UI: VP9 lives behind the non-default `vp9` feature, so on a
     // build without it `enc_idx == 1` must be unrepresentable from the start. Doing this in the codec
@@ -269,35 +298,81 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         _ => 0,
     };
 
+    // What the server remembers about each device (see settings::DeviceMemo).
+    let memos = crate::settings::load_devices();
+    let mut client_vols = HashMap::new();
+    let mut client_trims = HashMap::new();
+    let mut client_names = HashMap::new();
+    let mut client_muted = HashMap::new();
+    let mut known = HashMap::new();
+    for (id, m) in memos {
+        client_vols.insert(id.clone(), m.vol);
+        client_trims.insert(id.clone(), m.trim_ms);
+        client_muted.insert(id.clone(), m.muted);
+        if m.custom_name {
+            client_names.insert(id.clone(), m.name.clone());
+        }
+        known.insert(id, KnownDevice { name: m.name, last_seen: m.last_seen });
+    }
+    let zoom = crate::settings::get("ui_zoom")
+        .and_then(|z| z.parse::<f32>().ok())
+        .filter(|z| z.is_finite())
+        .map(|z| z.clamp(ZOOM_MIN, ZOOM_MAX))
+        .unwrap_or(1.0);
+    LIGHT_THEME.store(crate::settings::get("theme").as_deref() == Some("light"), Ordering::Relaxed);
+    let last_local_source = if source == SourceKind::WebUplink { SourceKind::AllApps } else { source };
+
     let mut app = ServerApp {
         server_name,
         url,
+        last_lan_check: Instant::now(),
         clients,
         clients_reg,
         cast: cast.clone(),
-        master_vol: 1.0,
+        stream_rx,
+        view: MainView::Devices,
+        master_vol: crate::settings::get("master_vol")
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 1.0))
+            .unwrap_or(1.0),
         master_muted: false,
         av_offset_ms: (init.av_offset_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000)
             as i32,
         av_offset_ns: init.av_offset_ns.clone(),
-        client_vols: HashMap::new(),
-        client_trims: HashMap::new(),
-        client_names: HashMap::new(),
+        client_vols,
+        client_trims,
+        client_names,
+        client_muted,
+        known,
+        devices_dirty: false,
+        devices_saved_at: Instant::now(),
+        seen_stamped_at: Instant::now(),
+        connected: std::collections::HashSet::new(),
         editing_client: None,
         edit_name_buf: String::new(),
-        client_muted: HashMap::new(),
+        sync_open: None,
+        drops: HashMap::new(),
         applied: None,
+        applied_before: None,
+        applied_audio_name: String::new(),
+        seen_failures: 0,
+        dismissed_error: None,
+        notice: None,
         qr_tex: None,
-        stream_live: false,
+        meter: [0.0; 2],
+        meter_at: Instant::now(),
+        silent_since: None,
         last_logged_size: None,
         calibrating: false,
         status,
-        capture_is_dummy: false,
         starting,
         cmd_tx,
         codec: init.codec,
         bitrate: init.bitrate,
         source,
+        last_local_source,
+        last_local_video: if video_kind == VideoSourceKind::WebCast { VideoSourceKind::Off } else { video_kind },
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         apps: Vec::new(),
         #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -324,32 +399,33 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         // A saved choice wins over the CLI default: the GUI's picker is the thing the operator
         // last touched, and it is the only way to set this without editing a shortcut.
         encode_device: crate::settings::load_encode_device().unwrap_or(init.encode_device),
-        video_quality_pct: init.video.map(|v| v.quality_pct).unwrap_or(100),
+        video_quality_pct: init
+            .video
+            .map(|v| v.quality_pct)
+            .or_else(|| crate::settings::get("video_quality").and_then(|q| q.parse().ok()))
+            .unwrap_or(100)
+            .clamp(40, 250),
         buffer_ms: init.buffer_ms as i32,
         port,
         port_edit: port,
         port_msg: String::new(),
+        zoom,
         did_initial_zoom: false,
     };
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     app.refresh_apps();
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1024.0, 576.0]) // 16:9 — wide two-column control panel
-        // MIND THE UNITS — confusing them is exactly why this window used to refuse to get small.
-        // These are winit LOGICAL pixels, which the OS display scale multiplies, while egui lays out
-        // in POINTS where points = logical / zoom_factor (UI_ZOOM_BASE = 0.6). So the current
-        // [640, 240] is 1067 x 400 points of layout, and on a 300%-scaled display a 1920 x 720
-        // physical-pixel floor. The old [880, 495] was 2640 x 1485 physical there — most of a 4K
-        // screen, from a number that reads like it should be small.
+        .with_inner_size([1040.0, 720.0])
+        // These are winit LOGICAL pixels, which the OS display scale multiplies. egui lays out in
+        // POINTS, and points = logical / zoom_factor — so at the default text size (zoom 1.0) the
+        // two are the same number, and the floor below is the layout's real minimum: the 300-point
+        // sharing column plus a device row that still has a draggable volume slider. Both columns
+        // scroll vertically, so going below the content's natural height scrolls instead of clipping.
         //
-        // Width matters as much as height: dragging a CORNER stops the moment EITHER axis hits its
-        // floor, so an over-wide minimum makes the whole window feel immovable even while the height
-        // still has room — which is how this actually presented. The floor is kept wide enough for the
-        // client mixer row (icon + Vol slider + % + Sync slider + ms), which does not scroll
-        // horizontally; both body columns scroll vertically and the QR shrinks, so going below the
-        // content's natural height just scrolls instead of clipping.
-        .with_min_inner_size([640.0, 240.0])
+        // Keep the floor modest. Dragging a CORNER stops the moment EITHER axis hits its floor, so an
+        // over-wide minimum makes the whole window feel immovable even while the height has room.
+        .with_min_inner_size([720.0, 440.0])
         .with_title("Newfoundsync server")
         // WAYLAND ICONS COME FROM HERE, NOT FROM with_icon BELOW.
         //
@@ -421,7 +497,7 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         "Newfoundsync",
         options,
         Box::new(|cc| {
-            setup_style(&cc.egui_ctx);
+            setup_style(&cc.egui_ctx, zoom);
             Ok(Box::new(app))
         }),
     )
@@ -444,6 +520,13 @@ fn c_accent() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0x25, 0x63, 0
 fn c_accent_hi() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0x1d, 0x4e, 0xd8) } else { egui::Color32::from_rgb(0x5a, 0xa2, 0xff) } }
 fn c_ok() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0x1a, 0x9c, 0x3e) } else { egui::Color32::from_rgb(0x3f, 0xb9, 0x50) } }
 fn c_err() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0xd1, 0x2d, 0x24) } else { egui::Color32::from_rgb(0xf8, 0x51, 0x49) } }
+fn c_warn() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0xb9, 0x78, 0x1a) } else { egui::Color32::from_rgb(0xd8, 0xa5, 0x31) } }
+// Tinted grounds for a status chip, a banner or the selected option: the semantic colour at low
+// strength, so the text colour above still reads on it in both themes.
+fn c_ok_bg() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0xe6, 0xf5, 0xea) } else { egui::Color32::from_rgb(0x14, 0x30, 0x1c) } }
+fn c_err_bg() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0xfd, 0xec, 0xea) } else { egui::Color32::from_rgb(0x3b, 0x1f, 0x1f) } }
+fn c_warn_bg() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0xfb, 0xf3, 0xe2) } else { egui::Color32::from_rgb(0x36, 0x2b, 0x14) } }
+fn c_accent_bg() -> egui::Color32 { if lt() { egui::Color32::from_rgb(0xe8, 0xef, 0xfd) } else { egui::Color32::from_rgb(0x16, 0x29, 0x4a) } }
 
 /// Build the egui visuals for the CURRENT theme (dark or light). Called at startup and again
 /// whenever the header toggle flips `LIGHT_THEME`, so the whole window re-themes live.
@@ -495,118 +578,73 @@ fn theme_visuals() -> egui::Visuals {
     v
 }
 
-/// The egui zoom factor that the UI is designed around — shown to the user as "100%". The window
-/// opens here, and the −/+ control and the percentage readout are all relative to this baseline,
-/// so 100% means "the size this app is tuned for" rather than the raw 1.0 device scale.
-const UI_ZOOM_BASE: f32 = 0.6;
-
-/// Horizontal inset between the window edge and the panels, in points. Deliberately small — the goal
-/// is just to stop the cards touching the frame (and to stop the leftmost glyphs being clipped), not
-/// to add a wide gutter that eats space we spent effort reclaiming.
 /// The application id, in the reverse-DNS form the desktop stack expects. Must stay identical to
 /// the Flatpak app id, the `.desktop` file's basename, and the installed icon's basename — a
 /// mismatch in any of them is what makes a desktop show a placeholder icon instead of ours.
 const APP_ID: &str = "ca.newfoundsync.Newfoundsync";
 
-const EDGE_PAD: f32 = 10.0;
-
-/// Width of a per-client Vol / Sync slider, in points. Two of them plus their labels and buttons
-/// have to fit a client row even at the window's 880px minimum width.
-const CLIENT_SLIDER_W: f32 = 88.0;
-
-/// Space reserved at the end of the master row for its "100%" / " off" readout, so the slider can
-/// take everything else. Sized for the widest string it has to hold, plus the item spacing.
-const MASTER_READOUT_W: f32 = 52.0;
-
-/// Rail thickness for the master slider, in points — three times the 6.0 the rest of the UI uses.
-/// At full window width a hairline rail reads as a divider rather than something you grab, and this
-/// is the one control that scales every device at once.
-/// Everything on a client row that ISN'T the two sliders: the mute toggle, the "Vol" and "Sync"
-/// captions, the percentage and millisecond readouts, the reset button, and the spacing between
-/// them. Subtracted from the row width so the two bars can split what's actually left.
+/// Text-size range the operator can pick, as an egui zoom factor, and the step of the − / + buttons.
 ///
-/// Deliberately generous — over-reserving costs a few points of bar, while under-reserving pushes
-/// the reset button off the end of the row, and egui does not wrap a horizontal layout.
-const CLIENT_ROW_FIXED_W: f32 = 290.0;
+/// 1.0 is the size the window is designed at: 14-point body text, which is 14 physical pixels on a
+/// display at 1× scale and scales with the OS setting from there. The window used to be designed at
+/// a zoom of 0.6, which looked right on a 150%-scaled Windows laptop and drew 9-pixel body text and
+/// sub-7-pixel hints on an ordinary 1× monitor. The choice is saved, so anyone who wants the compact
+/// window back sets it once.
+const ZOOM_MIN: f32 = 0.7;
+const ZOOM_MAX: f32 = 2.0;
+const ZOOM_STEP: f32 = 0.1;
 
-const MASTER_RAIL_H: f32 = 18.0;
+/// Whether this build can capture this machine's own screen. Windows always can (WGC); Linux and
+/// macOS only with their capture feature. Without it the only way to share a screen is a web cast.
+const LOCAL_SCREEN: bool = cfg!(any(
+    target_os = "windows",
+    all(target_os = "linux", feature = "linux-capture"),
+    all(target_os = "macos", feature = "mac-capture")
+));
 
-/// Row height for the master slider. egui derives the handle radius from the row height
-/// (`rect.height() / 2.5`), so raising this with the rail keeps the grab target in proportion
-/// instead of leaving a small dot riding a thick bar.
-const MASTER_ROW_H: f32 = 34.0;
+/// The sound-quality choices offered in the window: label, codec, Opus bitrate.
+const QUALITY_PRESETS: [(&str, CodecKind, i32); 6] = [
+    ("Opus 510 kbps · transparent", CodecKind::Opus, 510_000),
+    ("Opus 256 kbps · transparent", CodecKind::Opus, 256_000),
+    ("Opus 160 kbps · near-CD", CodecKind::Opus, 160_000),
+    ("Opus 128 kbps · very good", CodecKind::Opus, 128_000),
+    ("Opus 96 kbps · good", CodecKind::Opus, 96_000),
+    ("Lossless PCM · 1.5 Mbps", CodecKind::Pcm, 0),
+];
 
-/// Least room right of the QR worth placing the master into. Below this it goes on its own row:
-/// mute button + a usable slider + the readout do not fit in less, and a horizontal layout that
-/// doesn't fit does not shrink — it runs off the edge of the window.
-const MASTER_MIN_INLINE: f32 = 260.0;
+/// The address devices open, from this machine's current LAN IP.
+fn connect_url(port: u16) -> String {
+    let lan = net::primary_lan_ipv4()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "<this-pc>".into());
+    format!("https://{lan}:{port}")
+}
 
-/// Apply the theme + desktop-tuned spacing/fonts/zoom once at startup.
-fn setup_style(ctx: &egui::Context) {
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Apply the theme + spacing/fonts/text size once at startup.
+fn setup_style(ctx: &egui::Context, zoom: f32) {
     use egui::{FontId, TextStyle};
 
     let mut s = (*ctx.style()).clone();
     s.visuals = theme_visuals();
-    // Denser panels (tighter than the web-derived defaults — this is a desktop window).
-    s.spacing.item_spacing = egui::vec2(8.0, 7.0);
-    s.spacing.button_padding = egui::vec2(12.0, 6.0);
-    s.spacing.interact_size.y = 28.0;
+    s.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    s.spacing.button_padding = egui::vec2(10.0, 5.0);
+    s.spacing.interact_size.y = 26.0;
     s.spacing.indent = 16.0;
     s.spacing.slider_rail_height = 6.0;
-    // Slightly larger, crisper text.
-    s.text_styles.insert(TextStyle::Heading, FontId::proportional(24.0));
-    s.text_styles.insert(TextStyle::Body, FontId::proportional(15.5));
-    s.text_styles.insert(TextStyle::Button, FontId::proportional(15.5));
-    s.text_styles.insert(TextStyle::Monospace, FontId::monospace(15.0));
+    s.text_styles.insert(TextStyle::Heading, FontId::proportional(18.0));
+    s.text_styles.insert(TextStyle::Body, FontId::proportional(14.0));
+    s.text_styles.insert(TextStyle::Button, FontId::proportional(13.5));
+    s.text_styles.insert(TextStyle::Monospace, FontId::monospace(13.0));
     s.text_styles.insert(TextStyle::Small, FontId::proportional(12.0));
     ctx.set_style(s);
-
-    // Open at the design baseline (shown as 100%). The −/+ buttons fine-tune it live.
-    ctx.set_zoom_factor(UI_ZOOM_BASE);
-    // Disable egui's built-in Ctrl+/−/0 zoom: it steps/resets the RAW factor (Ctrl 0 → 1.0), which
-    // would disagree with our rebased readout. The −/+ buttons (relative to UI_ZOOM_BASE) own zoom.
-    ctx.options_mut(|o| o.zoom_with_keyboard = false);
-}
-
-/// An eyebrow section label (uppercase, dim, small).
-fn eyebrow(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).strong().size(13.0).color(c_dim()));
-    ui.add_space(6.0);
-}
-
-/// A sliding light/dark toggle switch: a pill track with an animated knob that slides right
-/// in light mode. Clicking flips `LIGHT_THEME` and re-applies the visuals live.
-fn theme_toggle(ui: &mut egui::Ui) {
-    let light = LIGHT_THEME.load(Ordering::Relaxed);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(40.0, 20.0), egui::Sense::click());
-    if resp.clicked() {
-        LIGHT_THEME.store(!light, Ordering::Relaxed);
-        ui.ctx().set_visuals(theme_visuals());
-        ui.ctx().request_repaint();
-    }
-    if ui.is_rect_visible(rect) {
-        let how_on = ui.ctx().animate_bool(resp.id, light); // 0 = dark (left), 1 = light (right)
-        let radius = 0.5 * rect.height();
-        ui.painter()
-            .rect_filled(rect, radius, if light { c_accent() } else { c_surface_alt() });
-        let cx = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how_on);
-        ui.painter()
-            .circle_filled(egui::pos2(cx, rect.center().y), radius - 2.5, egui::Color32::WHITE);
-    }
-    resp.on_hover_text("Toggle light / dark theme");
-}
-
-/// A bordered "card" container for grouping a section.
-fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) {
-    egui::Frame::group(ui.style())
-        .fill(c_surface())
-        .stroke(egui::Stroke::new(1.0, c_border()))
-        .corner_radius(egui::CornerRadius::from(10))
-        .inner_margin(11.0)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add(ui);
-        });
+    ctx.set_zoom_factor(zoom);
 }
 
 /// Open a URL in the user's default browser.
@@ -633,46 +671,66 @@ fn open_url(url: &str) {
     }
 }
 
-/// The "Starting…" text, made specific when a local screen capture is about to be requested.
+/// What the media-control thread tells the window about the stream.
 ///
-/// On Linux that request opens the desktop portal's share dialog and blocks until somebody answers
-/// it. A bare "Starting…" during that wait is actively misleading -- reported from the field as
-/// "it flashes up the screen grabber then sticks at Starting forever", which was really a 45-second
-/// wait for a prompt the operator had already dismissed. Naming the thing being waited on turns a
-/// hang into an instruction.
-fn starting_text(video_kind: VideoSourceKind) -> String {
-    let _ = video_kind;
-    #[cfg(all(target_os = "linux", feature = "linux-capture"))]
-    if video_kind == VideoSourceKind::Screen {
-        return "Starting… approve the screen-share prompt if it appears".to_string();
+/// This replaces a single status STRING that carried the durable "Serving: …" line, transient
+/// hints and errors all at once. Everything that read it had to guess which of the three it was
+/// holding by how the sentence started, and one overwrote another: a validation hint erased the
+/// serving line, a long error was cut to one line with nowhere to read the rest. Each fact now
+/// has its own field.
+#[derive(Clone, Default)]
+struct StreamStatus {
+    /// The capture device of the stream being served. `None` until the first one is up.
+    serving: Option<String>,
+    /// That stream carries video.
+    video: bool,
+    /// The last failure to start or switch, in full. Cleared by the next start that succeeds.
+    error: Option<String>,
+    /// Counts failed switches, so the window can tell that one happened (and roll its "applied"
+    /// baseline back to what is really streaming).
+    failures: u64,
+    /// The start in progress is going to open the desktop portal's screen-share dialog.
+    ///
+    /// On Linux that request blocks until somebody answers the dialog. A bare "Starting…" during
+    /// that wait is actively misleading — reported from the field as "it flashes up the screen
+    /// grabber then sticks at Starting forever", which was really a 45-second wait for a prompt
+    /// the operator had already dismissed. Naming the thing being waited on turns a hang into an
+    /// instruction.
+    waiting_on_portal: bool,
+    /// The source asked for at launch could not start and the stream is the no-capture cast relay.
+    fell_back: bool,
+}
+
+impl StreamStatus {
+    fn now_serving(&mut self, m: &Media) {
+        self.serving = Some(m.capture_device.clone());
+        self.video = m.config.video;
+        self.error = None;
     }
-    "Starting…".to_string()
-}
 
-fn serving_text(m: &Media) -> String {
-    format!(
-        "{SERVING_PREFIX}{}{}",
-        m.capture_device,
-        if m.config.video { "  + screen" } else { "" }
-    )
-}
+    /// The capture device is a dummy/null sink, so the stream carries silence.
+    ///
+    /// Silence is the one failure the window cannot show by staying quiet: every control looks
+    /// correct while the stream carries nothing.
+    fn is_dummy(&self) -> bool {
+        self.serving.as_deref().is_some_and(|d| d.contains(crate::capture::DUMMY_TAG))
+    }
 
-/// Should the "streaming silence" banner be showing?
-///
-/// The one status string carries two kinds of message: the durable serving line, and transient
-/// chatter ("Starting…", "Pick an app first, then Apply."). Recomputing the verdict from whatever
-/// happens to be in `status` would blank a live silence warning the moment any of that chatter
-/// lands — the warning would flicker away exactly when the operator went looking for it. So only a
-/// real serving line is allowed to move the verdict; everything else leaves it latched.
-fn dummy_verdict(latched: bool, status: &str) -> bool {
-    if status.starts_with(SERVING_PREFIX) {
-        status.contains(crate::capture::DUMMY_TAG)
-    } else {
-        latched
+    /// The device name without the dummy marker (which the window shows as a banner instead).
+    fn device_label(&self) -> String {
+        self.serving
+            .as_deref()
+            .map(|d| d.replace(crate::capture::DUMMY_TAG, "").trim().to_string())
+            .unwrap_or_default()
     }
 }
 
-const SERVING_PREFIX: &str = "Serving: ";
+/// Would starting a stream with these options open the portal's screen-share dialog?
+fn opens_portal(video: bool, capture_source: CaptureSource) -> bool {
+    cfg!(all(target_os = "linux", feature = "linux-capture"))
+        && video
+        && !matches!(capture_source, CaptureSource::WebUplink)
+}
 
 fn res_to_idx(r: Resolution) -> usize {
     match r {
@@ -690,32 +748,29 @@ fn control_loop(
     mut current: Media,
     tx: watch::Sender<Arc<StreamState>>,
     cmd_rx: mpsc::Receiver<MediaOptions>,
-    status: Arc<Mutex<String>>,
+    status: Arc<Mutex<StreamStatus>>,
     starting: Arc<AtomicBool>,
 ) {
     while let Ok(opts) = cmd_rx.recv() {
         starting.store(true, Ordering::Relaxed);
-        // Same reasoning as starting_text(): if this start is going to open the portal dialog, say
-        // so, because the wait is long enough to look like a freeze.
-        let waiting_on_portal = cfg!(all(target_os = "linux", feature = "linux-capture"))
-            && opts.video.is_some()
-            && !matches!(opts.capture_source, CaptureSource::WebUplink);
-        *status.lock().unwrap() = if waiting_on_portal {
-            "Starting… approve the screen-share prompt if it appears".into()
-        } else {
-            String::from("Starting…")
-        };
+        status.lock().unwrap().waiting_on_portal = opens_portal(opts.video.is_some(), opts.capture_source);
         match media::start(opts) {
             Ok(m) => {
                 let _ = tx.send(Arc::new(StreamState::from_media(&m)));
-                *status.lock().unwrap() = serving_text(&m);
-                current = m; // drop the previous stream (threads joined) now that the new one is live
+                status.lock().unwrap().now_serving(&m);
+                // Drop the previous stream (threads joined) now that the new one is live — and with
+                // the status lock released: joining capture threads can take a moment, and the
+                // window reads that lock every frame.
+                current = m;
             }
             Err(e) => {
-                // Keep serving the previous source; just report the failure.
-                *status.lock().unwrap() = format!("Couldn't switch: {e:#}");
+                // Keep serving the previous source; report the failure in full.
+                let mut st = status.lock().unwrap();
+                st.error = Some(format!("Couldn't switch: {e:#}"));
+                st.failures += 1;
             }
         }
+        status.lock().unwrap().waiting_on_portal = false;
         starting.store(false, Ordering::Relaxed);
     }
     drop(current); // GUI closed → stop capture
@@ -741,9 +796,58 @@ struct AppliedConfig {
     bitrate: i32,
 }
 
+impl Drop for ServerApp {
+    /// The window is closing: write anything about a device that the debounce was still holding.
+    fn drop(&mut self) {
+        if self.devices_dirty {
+            let now = unix_now();
+            for id in &self.connected {
+                if let Some(k) = self.known.get_mut(id) {
+                    k.last_seen = now;
+                }
+            }
+            self.write_devices();
+        }
+    }
+}
+
+/// What the main area of the window is showing.
+#[derive(Clone, Copy, PartialEq)]
+enum MainView {
+    /// The mixer. With no device connected this shows the first-connection instructions instead.
+    Devices,
+    /// Address + QR code, for connecting another device.
+    AddDevice,
+    Settings,
+}
+
+/// A device the server has seen before, connected or not.
+struct KnownDevice {
+    /// What the device calls itself (its HELLO name), kept so it can be listed while offline.
+    name: String,
+    /// Unix seconds when it was last connected.
+    last_seen: u64,
+}
+
+/// One connected client, copied out of the registry for a frame (never hold that lock across UI).
+#[derive(Clone)]
+struct ClientRow {
+    conn_id: u64,
+    stable_id: String,
+    name: String,
+    identified: bool,
+    calib_status: String,
+    reported_trim: Option<i32>,
+    /// Frames the server could not deliver to it — see `webserver::ClientEntry::frames_dropped`.
+    dropped: u64,
+}
+
 struct ServerApp {
     server_name: String,
+    /// The address devices open. Re-derived periodically: a laptop that changes network, or a VPN
+    /// coming up, moves the LAN address, and a stale address in the QR code fails with no hint.
     url: String,
+    last_lan_check: Instant,
     clients: Arc<AtomicUsize>,
     /// Live per-client registry shared with the web server — render the list and
     /// push per-client volume through each entry's `ctrl_tx`.
@@ -751,6 +855,9 @@ struct ServerApp {
     /// The single active web-caster's conn_id (shared with the web server). The GUI reads it to
     /// surface that caster's "Stop cast" control and writes `None` to free the slot when stopped.
     cast: webserver::CastState,
+    /// The stream the web server is serving right now — for its health counters and level meter.
+    stream_rx: watch::Receiver<Arc<StreamState>>,
+    view: MainView,
     /// Server master volume (0..=1): scales every client's effective remote volume.
     master_vol: f32,
     /// Master mute. Kept SEPARATE from `master_vol` so muting preserves the level to come back to;
@@ -769,36 +876,61 @@ struct ServerApp {
     /// Server-assigned display name override, keyed by stable id. Wins over the
     /// client's self-reported HELLO name; survives that device reconnecting.
     client_names: HashMap<String, String>,
+    /// Server-side mute, keyed by stable id. Muted ⇒ effective remote volume 0 (the
+    /// device's own slider value is preserved and restored on un-mute). Survives reconnect.
+    client_muted: HashMap<String, bool>,
+    /// Every device seen, by stable id. Together with the four maps above this is what gets saved
+    /// (see `save_devices_if_due`), so names, levels and offsets survive a restart of the server.
+    known: HashMap<String, KnownDevice>,
+    /// Something about a device changed and has not been written to disk yet.
+    devices_dirty: bool,
+    devices_saved_at: Instant,
+    /// When the connected devices' `last_seen` was last refreshed.
+    seen_stamped_at: Instant,
+    /// Stable ids connected on the previous frame, to notice the moment one leaves.
+    connected: std::collections::HashSet<String>,
     /// Stable id of the client whose name is being edited inline (double-click), if any.
     editing_client: Option<String>,
     /// Scratch buffer backing the inline rename text field.
     edit_name_buf: String,
-    /// Server-side mute, keyed by stable id. Muted ⇒ effective remote volume 0 (the
-    /// device's own slider value is preserved and restored on un-mute). Survives reconnect.
-    client_muted: HashMap<String, bool>,
-    /// The stream config last handed to the control thread, so the Apply button can show a
-    /// "changes pending" state (source/video/buffer are NOT live; they take effect on Apply).
+    /// Stable id of the device whose sync controls are open, if any.
+    sync_open: Option<String>,
+    /// Per connection: the dropped-frame count last seen, and when it last went UP. "Falling
+    /// behind" is said only while it is still climbing; a count that stopped moving is history.
+    drops: HashMap<u64, (u64, Option<Instant>)>,
+    /// The stream config last handed to the control thread, so the window can show what is
+    /// pending (source/video/delay/quality are NOT live; they take effect on Apply).
     applied: Option<AppliedConfig>,
-    /// Cached QR texture of the connect URL (built once; the URL is fixed for the session).
-    qr_tex: Option<egui::TextureHandle>,
-    /// True once a stream has successfully come up. The live-status pill keys off this, not the
-    /// transient status string (which a failed switch / "pick first" validation overwrites while
-    /// the previous stream keeps serving).
-    stream_live: bool,
+    /// The baseline before the Apply in flight. If that switch fails the previous stream keeps
+    /// serving, so the baseline is rolled back to this and the change shows as pending again.
+    applied_before: Option<AppliedConfig>,
+    /// The picked app's name as of the last Apply, so Discard can put the label back with the pid.
+    applied_audio_name: String,
+    seen_failures: u64,
+    /// The error text the operator dismissed; the banner stays away until a different one arrives.
+    dismissed_error: Option<String>,
+    /// A short confirmation for the footer ("Sync reset…"), with when it was raised.
+    notice: Option<(String, Instant)>,
+    /// Cached QR texture of the connect URL, with the URL it encodes (rebuilt if the address moves).
+    qr_tex: Option<(String, egui::TextureHandle)>,
+    /// The level meter as drawn: the pipeline's peaks, with a fall rate so the bars drop smoothly.
+    meter: [f32; 2],
+    meter_at: Instant,
+    /// Since when a local source has carried nothing but digital silence.
+    silent_since: Option<Instant>,
     /// Last window size we logged, so the geometry diagnostic prints on change rather than per frame.
     last_logged_size: Option<(i32, i32)>,
     /// True while a server-orchestrated "Calibrate all" run is active (Phase B).
     calibrating: bool,
-    status: Arc<Mutex<String>>,
-    /// Latched from the serving line: the capture device is a dummy/null sink, so we are streaming
-    /// silence. Drives the AUDIO SOURCE warning banner. See [`dummy_verdict`] for why it's latched
-    /// rather than recomputed from `status` every frame.
-    capture_is_dummy: bool,
+    status: Arc<Mutex<StreamStatus>>,
     starting: Arc<AtomicBool>,
     cmd_tx: mpsc::Sender<MediaOptions>,
     codec: CodecKind,
     bitrate: i32,
     source: SourceKind,
+    /// The local source / screen choice to come back to when leaving "A device casts".
+    last_local_source: SourceKind,
+    last_local_video: VideoSourceKind,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     apps: Vec<AudioApp>,
     // Async source enumeration: refresh_apps() spawns a worker and stashes the receiver here;
@@ -809,12 +941,9 @@ struct ServerApp {
     refreshing: bool,
     #[cfg(target_os = "linux")]
     routing: AppRouting,
-    /// When the Linux app list was last re-enumerated. Windows windows persist, so a manual
-    /// refresh is fine there; a Linux list is a snapshot of what is *playing this instant*, so it
-    /// has to re-scan on a timer or it will show apps that already stopped and miss ones that
     selected_pid: Option<u32>,
     selected_name: String,
-    // VIDEO SOURCE: off / whole screen / a specific window — its own picker, like audio.
+    // Screen sharing: off / whole screen / a specific window / the caster's screen.
     video_kind: VideoSourceKind,
     #[cfg(target_os = "windows")]
     video_pid: Option<u32>,
@@ -837,7 +966,9 @@ struct ServerApp {
     port_edit: u16,
     /// Transient status under the port field ("Saved — restart to apply", or an error).
     port_msg: String,
-    did_initial_zoom: bool, // applied the high-DPI default UI scale once (first frame)
+    /// Text size as an egui zoom factor (see [`ZOOM_MIN`]). Saved whenever it changes.
+    zoom: f32,
+    did_initial_zoom: bool, // applied the saved text size once (first frame)
 }
 
 impl ServerApp {
@@ -922,28 +1053,334 @@ impl ServerApp {
         self.calibrating = false;
     }
 
-    /// Plain-words description of the audio quality currently being streamed — codec,
-    /// sample rate, channels, bitrate, and a one-word verdict — for the operator.
-    fn audio_quality_text(&self) -> String {
+    /// The sound quality currently selected, in the words of the picker. A bitrate that is not one
+    /// of the presets (set with `--bitrate`) is shown as what it is.
+    fn quality_label(&self) -> String {
         match self.codec {
-            CodecKind::Pcm => {
-                "Lossless PCM · 48 kHz · 16-bit stereo — bit-perfect, uncompressed".to_string()
+            CodecKind::Pcm => QUALITY_PRESETS[QUALITY_PRESETS.len() - 1].0.to_string(),
+            CodecKind::Opus => QUALITY_PRESETS
+                .iter()
+                .find(|(_, c, b)| *c == CodecKind::Opus && *b == self.bitrate)
+                .map(|(l, _, _)| (*l).to_string())
+                .unwrap_or_else(|| format!("Opus {} kbps", (self.bitrate / 1000).max(1))),
+        }
+    }
+
+    /// Raise a short confirmation in the footer.
+    fn say(&mut self, text: impl Into<String>) {
+        self.notice = Some((text.into(), Instant::now()));
+    }
+
+    /// The connected clients, in an order that does not move.
+    ///
+    /// Sorted by the name shown, then stable id — NOT by connection id, which is new on every
+    /// reconnect: an Apply reconnects every device at once and used to reshuffle the list each time.
+    fn client_rows(&self) -> Vec<ClientRow> {
+        let mut rows: Vec<ClientRow> = Vec::new();
+        if let Ok(reg) = self.clients_reg.lock() {
+            for e in reg.values() {
+                rows.push(ClientRow {
+                    conn_id: e.conn_id,
+                    stable_id: e.stable_id.clone(),
+                    name: e.name.clone(),
+                    identified: e.identified,
+                    calib_status: e.calib_status.clone(),
+                    reported_trim: e.reported_trim_ms,
+                    dropped: e.frames_dropped.load(Ordering::Relaxed),
+                });
             }
-            CodecKind::Opus => {
-                let kbps = (self.bitrate / 1000).max(1);
-                let verdict = if self.bitrate >= 256_000 {
-                    "transparent (indistinguishable from the original)"
-                } else if self.bitrate >= 160_000 {
-                    "excellent, near-CD"
-                } else if self.bitrate >= 96_000 {
-                    "very good"
-                } else if self.bitrate >= 64_000 {
-                    "good"
-                } else {
-                    "voice-grade"
-                };
-                format!("Opus · 48 kHz stereo · {kbps} kbps — {verdict}")
+        }
+        rows.sort_by_cached_key(|r| {
+            (!r.identified, self.display_name(r).to_lowercase(), r.stable_id.clone(), r.conn_id)
+        });
+        rows
+    }
+
+    /// The name to show for a client: the one typed here, else its own, else a placeholder.
+    fn display_name(&self, r: &ClientRow) -> String {
+        if let Some(n) = self.client_names.get(&r.stable_id) {
+            return n.clone();
+        }
+        if r.name.trim().is_empty() {
+            format!("Client {}", r.conn_id)
+        } else {
+            r.name.clone()
+        }
+    }
+
+    /// Note which devices are connected, and track each one's dropped frames.
+    fn remember_devices(&mut self, rows: &[ClientRow]) {
+        // `last_seen` is stamped when a device arrives, when it leaves, and every few minutes in
+        // between (so a server that is killed still knows roughly when it last saw each one).
+        let stamp = self.seen_stamped_at.elapsed() >= Duration::from_secs(300);
+        let now = unix_now();
+        let here: std::collections::HashSet<String> =
+            rows.iter().filter(|r| r.identified).map(|r| r.stable_id.clone()).collect();
+        for gone in self.connected.difference(&here) {
+            if let Some(k) = self.known.get_mut(gone) {
+                k.last_seen = now;
+                self.devices_dirty = true;
             }
+        }
+        self.connected = here;
+        for r in rows.iter().filter(|r| r.identified) {
+            match self.known.get_mut(&r.stable_id) {
+                Some(k) => {
+                    if k.name != r.name {
+                        k.name = r.name.clone();
+                        self.devices_dirty = true;
+                    }
+                    if stamp {
+                        k.last_seen = now;
+                        self.devices_dirty = true;
+                    }
+                }
+                None => {
+                    self.known.insert(r.stable_id.clone(), KnownDevice { name: r.name.clone(), last_seen: now });
+                    self.devices_dirty = true;
+                }
+            }
+            let d = self.drops.entry(r.conn_id).or_insert((r.dropped, None));
+            if r.dropped > d.0 {
+                *d = (r.dropped, Some(Instant::now()));
+            }
+        }
+        if stamp {
+            self.seen_stamped_at = Instant::now();
+        }
+        // Connection ids are never reused, so entries for gone connections only ever accumulate.
+        if self.drops.len() > rows.len() + 32 {
+            self.drops.retain(|id, _| rows.iter().any(|r| r.conn_id == *id));
+        }
+    }
+
+    /// Write the device memory to disk if it changed. Not while a slider is held — `changed()`
+    /// fires on every mouse-move of a drag, and each save rewrites the whole settings file.
+    fn save_devices_if_due(&mut self, ctx: &egui::Context) {
+        if !self.devices_dirty
+            || ctx.input(|i| i.pointer.any_down())
+            || self.devices_saved_at.elapsed() < Duration::from_millis(800)
+        {
+            return;
+        }
+        self.write_devices();
+    }
+
+    fn write_devices(&mut self) {
+        let mut out = HashMap::new();
+        for (id, k) in &self.known {
+            let custom = self.client_names.get(id);
+            out.insert(
+                id.clone(),
+                crate::settings::DeviceMemo {
+                    name: custom.cloned().unwrap_or_else(|| k.name.clone()),
+                    custom_name: custom.is_some(),
+                    vol: self.client_vols.get(id).copied().unwrap_or(1.0),
+                    trim_ms: self.client_trims.get(id).copied().unwrap_or(0),
+                    muted: self.client_muted.get(id).copied().unwrap_or(false),
+                    last_seen: k.last_seen,
+                },
+            );
+        }
+        if let Err(e) = crate::settings::save_devices(&out) {
+            tracing::debug!("could not save the device list: {e}");
+        }
+        self.devices_dirty = false;
+        self.devices_saved_at = Instant::now();
+    }
+
+    /// Forget a device that is not connected: its name, level and sync offset.
+    fn forget_device(&mut self, id: &str) {
+        self.known.remove(id);
+        self.client_vols.remove(id);
+        self.client_trims.remove(id);
+        self.client_names.remove(id);
+        self.client_muted.remove(id);
+        self.devices_dirty = true;
+    }
+
+    /// Kick the active caster off the cast slot.
+    ///
+    /// The server is the SOLE authority on the slot and the caster's own stopCast doesn't notify
+    /// it — so free the slot IMMEDIATELY (letting another client claim it) AND tell the caster's
+    /// browser to tear down its uplink. No ack wait.
+    fn stop_cast(&mut self, cid: u64) {
+        if let Ok(mut s) = self.cast.lock() {
+            if *s == Some(cid) {
+                *s = None;
+            }
+        }
+        if let Ok(reg) = self.clients_reg.lock() {
+            if let Some(e) = reg.get(&cid) {
+                let _ = e.ctrl_tx.send(webserver::cast_stop_msg());
+            }
+        }
+    }
+
+    /// Reset sync to 0 ms on one device (`Some(stable id)`) or on every connected one (`None`).
+    ///
+    /// A sync reset has TWO halves and needs both. Clearing our own offset only moves the value
+    /// the server commands; a calibrated device keeps its whole speaker-latency compensation in
+    /// its OWN trim, which lives in the browser and is reachable only by asking. Sending one
+    /// without the other leaves the device sitting at a number nobody chose.
+    fn reset_sync(&mut self, only: Option<&str>) {
+        if let Ok(mut reg) = self.clients_reg.lock() {
+            for e in reg.values_mut() {
+                if only.is_some_and(|id| id != e.stable_id) {
+                    continue;
+                }
+                self.client_trims.insert(e.stable_id.clone(), 0);
+                let _ = e.ctrl_tx.send(webserver::reset_sync_msg());
+                // DELIBERATELY does not touch `e.trim_ms`. That field records what was last
+                // DELIVERED and is the dedup guard in push_client_state
+                // (`if trim != e.trim_ms { send(set_trim_msg(trim)) }`), so zeroing it here made
+                // the guard see 0 == 0 on the next frame and skip the SET_TRIM 0 entirely.
+                //
+                // That silently halved the reset: MSG_RESET_SYNC clears the device's OWN trim,
+                // but the client deliberately leaves the server-pushed `remoteTrimMs` alone
+                // ("the server's own reset clears both ends" — app.js), so nothing cleared it.
+                // The operator saw "Sync reset to 0 ms", the slider read 0, and the device kept
+                // playing at the old offset until its next report repainted the row.
+                //
+                // Leaving the mirror alone means the guard now sees 0 != old and pushes
+                // SET_TRIM 0 on the very next frame, through the one code path that owns
+                // delivering trims.
+            }
+        }
+        self.devices_dirty = true;
+        self.say(if only.is_some() {
+            "Sync reset to 0 ms on that device."
+        } else {
+            "Sync reset to 0 ms on every connected device."
+        });
+    }
+
+    /// Finish a "Calibrate all" run once every follower has reported an outcome (or left).
+    fn tick_calibration(&mut self, rows: &[ClientRow]) {
+        if !self.calibrating {
+            return;
+        }
+        let ids: Vec<&ClientRow> = rows.iter().filter(|c| c.identified).collect();
+        let ref_id = ids.iter().map(|c| c.conn_id).min();
+        let mut followers = 0;
+        let mut done = 0;
+        for c in &ids {
+            if Some(c.conn_id) == ref_id {
+                continue;
+            }
+            followers += 1;
+            let s = c.calib_status.as_str();
+            if s.contains("aligned") || s.contains("failed") || s.contains("no lock") {
+                done += 1;
+            }
+        }
+        if ref_id.is_none() || followers == 0 || done == followers {
+            self.stop_calibrate_all(false);
+        }
+    }
+
+    /// Switch between "this computer" and "a device casts", remembering the local choice.
+    fn set_cast_mode(&mut self, cast: bool) {
+        if cast == (self.source == SourceKind::WebUplink) {
+            return;
+        }
+        if cast {
+            self.last_local_source = self.source;
+            self.last_local_video = self.video_kind;
+            self.source = SourceKind::WebUplink;
+            // A cast as the source is audio only until "relay its screen" is ticked.
+            self.video_kind = VideoSourceKind::Off;
+        } else {
+            self.source = self.last_local_source;
+            self.video_kind = self.last_local_video;
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            if self.source == SourceKind::App {
+                self.refresh_apps();
+            }
+        }
+    }
+
+    /// Choose a local audio source.
+    fn pick_local(&mut self, kind: SourceKind) {
+        self.source = kind;
+        self.last_local_source = kind;
+        // You can't relay the caster's screen while capturing local audio — the uplink is one source.
+        if self.video_kind == VideoSourceKind::WebCast {
+            self.video_kind = VideoSourceKind::Off;
+        }
+    }
+
+    /// How many settings differ from what is streaming. Counted in the groups the operator thinks
+    /// in (source, screen, video options, delay, sound quality), not in raw fields.
+    fn change_count(&self) -> usize {
+        let Some(a) = &self.applied else { return 0 };
+        let c = self.current_config();
+        let mut n = 0;
+        n += (a.source != c.source || a.selected_pid != c.selected_pid) as usize;
+        #[cfg(target_os = "windows")]
+        let window_changed = a.video_hwnd != c.video_hwnd;
+        #[cfg(not(target_os = "windows"))]
+        let window_changed = false;
+        n += (a.video_kind != c.video_kind || window_changed) as usize;
+        n += (a.res_idx != c.res_idx
+            || a.fps60 != c.fps60
+            || a.enc_idx != c.enc_idx
+            || a.encode_device != c.encode_device
+            || a.video_quality_pct != c.video_quality_pct) as usize;
+        n += (a.buffer_ms != c.buffer_ms) as usize;
+        n += (a.codec != c.codec || a.bitrate != c.bitrate) as usize;
+        n
+    }
+
+    /// Why Apply cannot run right now, if it cannot.
+    fn apply_blocker(&self) -> Option<&'static str> {
+        if self.source == SourceKind::App && self.selected_pid.is_none() {
+            return Some("Pick the app to share first.");
+        }
+        #[cfg(target_os = "windows")]
+        if self.video_kind == VideoSourceKind::Window && self.video_hwnd.is_none() {
+            return Some("Pick the window to share first.");
+        }
+        None
+    }
+
+    /// Put every Apply-gated control back to what is streaming.
+    fn discard_changes(&mut self) {
+        let Some(a) = self.applied.clone() else { return };
+        self.source = a.source;
+        self.selected_pid = a.selected_pid;
+        self.selected_name = if a.selected_pid.is_some() { self.applied_audio_name.clone() } else { String::new() };
+        self.video_kind = a.video_kind;
+        #[cfg(target_os = "windows")]
+        {
+            self.video_hwnd = a.video_hwnd;
+            let found = self.apps.iter().find(|w| w.hwnd.is_some() && w.hwnd == a.video_hwnd);
+            self.video_pid = found.map(|w| w.pid);
+            self.video_name = found.map(|w| w.name.clone()).unwrap_or_default();
+        }
+        self.res_idx = a.res_idx;
+        self.fps60 = a.fps60;
+        self.enc_idx = a.enc_idx;
+        self.encode_device = a.encode_device;
+        self.video_quality_pct = a.video_quality_pct;
+        self.buffer_ms = a.buffer_ms;
+        self.codec = a.codec;
+        self.bitrate = a.bitrate;
+        if a.source != SourceKind::WebUplink {
+            self.last_local_source = a.source;
+        }
+    }
+
+    /// Re-derive the connect address every few seconds, in case this machine changed network.
+    fn refresh_address(&mut self) {
+        if self.last_lan_check.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_lan_check = Instant::now();
+        let url = connect_url(self.port);
+        if url != self.url {
+            tracing::info!(old = %self.url, new = %url, "this machine's LAN address changed");
+            self.url = url;
         }
     }
 
@@ -970,37 +1407,41 @@ impl ServerApp {
     }
 
     /// Lazily build (and cache) a black-on-white QR texture of the connect URL so phones
-    /// can scan instead of hand-typing `https://<ip>:<port>`. The URL is fixed for the
-    /// session, so this runs once. Returns None if QR generation fails (URL too long, etc.).
+    /// can scan instead of hand-typing `https://<ip>:<port>`. Rebuilt only if the address moves.
+    /// Returns None if QR generation fails (URL too long, etc.).
     fn qr_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
-        if self.qr_tex.is_none() {
-            let code = qrcode::QrCode::new(self.url.as_bytes()).ok()?;
-            let w = code.width();
-            let quiet = 4usize; // mandatory light border so scanners lock on
-            let scale = 4usize; // px per module
-            let dim = (w + 2 * quiet) * scale;
-            let colors = code.to_colors();
-            let mut rgba = vec![255u8; dim * dim * 4]; // start all-white
-            for my in 0..w {
-                for mx in 0..w {
-                    if colors[my * w + mx] == qrcode::Color::Dark {
-                        for dy in 0..scale {
-                            for dx in 0..scale {
-                                let px = (mx + quiet) * scale + dx;
-                                let py = (my + quiet) * scale + dy;
-                                let i = (py * dim + px) * 4;
-                                rgba[i] = 0;
-                                rgba[i + 1] = 0;
-                                rgba[i + 2] = 0;
-                            }
+        if let Some((url, tex)) = &self.qr_tex {
+            if *url == self.url {
+                return Some(tex.clone());
+            }
+        }
+        let code = qrcode::QrCode::new(self.url.as_bytes()).ok()?;
+        let w = code.width();
+        let quiet = 4usize; // mandatory light border so scanners lock on
+        let scale = 6usize; // px per module
+        let dim = (w + 2 * quiet) * scale;
+        let colors = code.to_colors();
+        let mut rgba = vec![255u8; dim * dim * 4]; // start all-white
+        for my in 0..w {
+            for mx in 0..w {
+                if colors[my * w + mx] == qrcode::Color::Dark {
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            let px = (mx + quiet) * scale + dx;
+                            let py = (my + quiet) * scale + dy;
+                            let i = (py * dim + px) * 4;
+                            rgba[i] = 0;
+                            rgba[i + 1] = 0;
+                            rgba[i + 2] = 0;
                         }
                     }
                 }
             }
-            let img = egui::ColorImage::from_rgba_unmultiplied([dim, dim], &rgba);
-            self.qr_tex = Some(ctx.load_texture("connect-qr", img, egui::TextureOptions::NEAREST));
         }
-        self.qr_tex.clone()
+        let img = egui::ColorImage::from_rgba_unmultiplied([dim, dim], &rgba);
+        let tex = ctx.load_texture("connect-qr", img, egui::TextureOptions::NEAREST);
+        self.qr_tex = Some((self.url.clone(), tex.clone()));
+        Some(tex)
     }
 
     /// Kick off a source enumeration on a worker thread. Does NOT block the GUI thread —
@@ -1165,74 +1606,6 @@ impl ServerApp {
         }
     }
 
-    /// The checkboxes under the "Newfoundsync" output device source: which apps play into it.
-    #[cfg(target_os = "linux")]
-    fn ui_app_routing(&mut self, ui: &mut egui::Ui) {
-        let dim = |t: &str| egui::RichText::new(t).size(11.0).color(c_dim());
-        if !self.routing.error.is_empty() {
-            ui.label(
-                egui::RichText::new(format!("⚠  Could not reach the sound server: {}", self.routing.error))
-                    .size(11.0)
-                    .color(c_err()),
-            );
-        }
-        let Some(snap) = self.routing.snapshot.clone() else {
-            return; // the first look is still in flight
-        };
-        let remembered: Vec<String> = self
-            .routing
-            .wanted
-            .iter()
-            .filter(|k| !snap.apps.iter().any(|a| a.key == **k))
-            .cloned()
-            .collect();
-        if !snap.device_live {
-            ui.label(dim("Press Apply to create the device  —  then tick the apps to send to it, right here."));
-            if !self.routing.wanted.is_empty() {
-                let names: Vec<&str> = self.routing.wanted.iter().map(|s| s.as_str()).collect();
-                ui.label(dim(&format!("Remembered from last time: {}", names.join(", "))));
-            }
-            return;
-        }
-        let mut toggled: Option<(String, bool)> = None;
-        ui.indent("route_apps", |ui| {
-            ui.label(dim("Send to it  —  streamed, and silent on this PC:"));
-            for app in &snap.apps {
-                // An app someone sent here with the system mixer is shown ticked as well: the box
-                // says where the app plays, and unticking it has to work either way.
-                let mut on = app.on_device || self.routing.wanted.contains(&app.key);
-                if ui.checkbox(&mut on, app.label.as_str()).changed() {
-                    toggled = Some((app.key.clone(), on));
-                }
-            }
-            for key in &remembered {
-                // Ticked earlier, not playing now. Kept visible so it can be unticked — otherwise
-                // the only way to stop an app being sent here would be to catch it mid-song.
-                let mut on = true;
-                if ui
-                    .checkbox(&mut on, egui::RichText::new(format!("{key}  (not playing)")).color(c_dim()))
-                    .on_hover_text("Remembered: it is sent here as soon as it plays.")
-                    .changed()
-                {
-                    toggled = Some((key.clone(), false));
-                }
-            }
-            if snap.apps.is_empty() && remembered.is_empty() {
-                ui.label(dim("(nothing is playing audio right now — press play in your app and it appears here)"));
-            }
-            if let Some(problem) = &snap.problem {
-                ui.label(egui::RichText::new(format!("⚠  {problem}")).size(11.0).color(c_err()));
-            }
-        });
-        ui.label(dim(
-            "To hear it on this PC in sync, open the address above in a browser here.\n\
-             Don't tick that browser, and keep your real speakers as the default output  —  either one echoes.",
-        ));
-        if let Some((key, on)) = toggled {
-            self.set_app_routed(&key, on);
-        }
-    }
-
     /// Build options from the current UI and hand them to the control thread.
     fn apply(&mut self) {
         let capture_source = match self.source {
@@ -1242,16 +1615,10 @@ impl ServerApp {
             SourceKind::WebUplink => CaptureSource::WebUplink,
             SourceKind::App => match self.selected_pid {
                 Some(pid) => CaptureSource::App { pid },
-                None => {
-                    *self.status.lock().unwrap() = "Pick an app first, then Apply.".into();
-                    return;
-                }
+                None => return, // apply_blocker() already told the operator why
             },
         };
-        // Video: validate a window pick the same way audio validates an app pick.
-        #[cfg(target_os = "windows")]
-        if self.video_kind == VideoSourceKind::Window && self.video_hwnd.is_none() {
-            *self.status.lock().unwrap() = "Pick a window for video first, then Apply.".into();
+        if self.apply_blocker().is_some() {
             return;
         }
         let video = if self.video_kind != VideoSourceKind::Off {
@@ -1295,1013 +1662,40 @@ impl ServerApp {
             encode_device: self.encode_device,
         };
         self.starting.store(true, Ordering::Relaxed);
-        *self.status.lock().unwrap() = starting_text(self.video_kind);
+        self.status.lock().unwrap().waiting_on_portal = opens_portal(opts.video.is_some(), opts.capture_source);
         let _ = self.cmd_tx.send(opts);
-        self.applied = Some(self.current_config()); // baseline for the "changes pending" state
+        // The new baseline for "changes pending" — and the old one, in case this switch fails.
+        self.applied_before = self.applied.take();
+        self.applied = Some(self.current_config());
+        self.applied_audio_name = self.selected_name.clone();
+        self.dismissed_error = None;
+        self.save_stream_prefs();
     }
 
-    // ===== 16:9 layout sections (composed by `ui` below) ============================
-
-    /// Full-width "connect" strip under the header: the URL plate (left) + the QR code,
-    /// scan hint and one-time-cert disclosure (right). Read-only.
-    fn ui_connect_strip(&mut self, ui: &mut egui::Ui, qr: &Option<egui::TextureHandle>) {
-        let inline_master = ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new("Open this on any phone or PC on the same Wi-Fi:").color(c_dim()),
-                );
-                ui.add_space(4.0);
-                egui::Frame::group(ui.style())
-                    .fill(c_surface())
-                    .stroke(egui::Stroke::new(1.0, c_border()))
-                    .corner_radius(egui::CornerRadius::from(10))
-                    .inner_margin(egui::Margin::from(9.0))
-                    .show(ui, |ui| {
-                        ui.set_width(520.0); // fixed so the QR group fits to the right
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(&self.url)
-                                    .monospace()
-                                    .size(19.0)
-                                    .strong()
-                                    .color(c_accent_hi()),
-                            );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Copy").clicked() {
-                                    ui.ctx().copy_text(self.url.clone());
-                                }
-                                if ui
-                                    .button("Open ↗")
-                                    .on_hover_text("Open this address in your default browser")
-                                    .clicked()
-                                {
-                                    open_url(&self.url);
-                                }
-                            });
-                        });
-                    });
-                // Port: editable + persisted. The server binds the port once at startup, so a change
-                // applies on the next launch — we save it and show a "restart to apply" note here.
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Port").size(12.5).color(c_dim()));
-                    ui.add(egui::DragValue::new(&mut self.port_edit).range(1024.0..=65535.0).speed(1.0))
-                        .on_hover_text("HTTP port the web client is served on (1024–65535). Default 47000.");
-                    if ui.button("Save").clicked() {
-                        self.port_msg = if self.port_edit == self.port {
-                            format!("Already serving on port {}.", self.port)
-                        } else {
-                            match crate::settings::save_port(self.port_edit) {
-                                Ok(()) => format!("Saved — restart Newfoundsync to serve on port {}.", self.port_edit),
-                                Err(e) => format!("Couldn't save port: {e}"),
-                            }
-                        };
-                    }
-                    if !self.port_msg.is_empty() {
-                        ui.label(egui::RichText::new(&self.port_msg).size(11.5).color(c_accent_hi()));
-                    }
-                });
-            });
-            ui.add_space(16.0);
-            // The QR's drawn size varies with the window height, so the master can only line up with
-            // it by asking — hence the side length coming back out of this block.
-            let qr_side = ui.vertical(|ui| {
-                let mut side = 0.0;
-                if let Some(tex) = qr {
-                    // The QR is the largest fixed block in the window, and drawn at its natural
-                    // texture size it never yielded an inch — so in a short window it was pure
-                    // reserved space pushing everything else down. Cap it to a slice of the height
-                    // that's actually available, with a floor that keeps it scannable.
-                    const QR_MIN: f32 = 96.0;
-                    const QR_SHARE: f32 = 0.34; // of the panel height, so it yields first
-                    let natural = tex.size_vec2().x;
-                    side = natural.min((ui.available_height() * QR_SHARE).max(QR_MIN));
-                    ui.image(egui::load::SizedTexture::new(tex.id(), egui::vec2(side, side)));
-                }
-                // Cert help folded into a hover (was a standalone "First time on a device?" line) to
-                // reclaim vertical space — hover "Scan to connect" for the one-time-cert explanation.
-                ui.label(egui::RichText::new("📷  Scan to connect").strong().color(c_text()))
-                    .on_hover_text(
-                        "First time on a device? Accept the one-time security warning \
-                         (Advanced -> proceed) — it's a self-signed certificate, needed so the \
-                         browser allows playback.",
-                    );
-                side
-            })
-            .inner;
-            // MASTER VOLUME lives up here, right of the QR, rather than inside the clients card.
-            //
-            // It is a LIVE control — it takes effect instantly, no Apply — and this strip is the one
-            // region that is always on screen. Down in the clients card it scrolled out of reach as
-            // soon as a few devices connected, which is the wrong behaviour for the control that
-            // mutes the whole house. It also fills the widest dead space in the window.
-            //
-            // Inline ONLY when the room is genuinely there. egui does not wrap a horizontal layout —
-            // it overflows — so on a narrow window (or a small screen, where the URL box and QR have
-            // already eaten the row) this would render past the window edge and simply not exist as
-            // far as the operator is concerned. Below the threshold it drops to its own row instead,
-            // which keeps it visible and full-width rather than clipped.
-            let room = ui.available_width();
-            let inline = room >= MASTER_MIN_INLINE;
-            if inline {
-                ui.add_space(20.0);
-                // Centred on the QR SQUARE, not on the whole QR column (which includes the "Scan to
-                // connect" caption) — the square is what the eye lines the bar up against. Allocating
-                // a region of exactly the QR's height and laying out across it with Align::Center
-                // does the centring from the real measurement, so it stays true as the QR resizes
-                // with the window.
-                // Centre the BAR on the QR's midline — not the label+bar group. The bar is what the
-                // eye pairs with the QR square; centring the group instead leaves the bar sitting
-                // below the QR's middle by half a label.
-                //
-                // Done as an explicit offset rather than a centred Layout: egui's Align::Center
-                // vertically centres ITEMS in a row, but a nested `vertical()` block is sized after
-                // it is placed, so it just lands at the cursor and the centring silently no-ops —
-                // measured on a 1920x1080 desktop, bar at y=177 against a QR midline of y=199.
-                let label_h = ui.text_style_height(&egui::TextStyle::Body);
-                let pad = (qr_side * 0.5 - (label_h + 4.0 + MASTER_ROW_H * 0.5)).max(0.0);
-                ui.vertical(|ui| {
-                    ui.add_space(pad);
-                    self.master_control(ui);
-                });
-            }
-            inline
-        })
-        .inner;
-        // Didn't fit beside the QR — give it the full width of its own row. Still above the columns,
-        // so it is still the always-visible control it was moved up here to be.
-        if !inline_master {
-            ui.add_space(8.0);
-            self.master_control(ui);
+    /// Remember what was just applied, so the next launch starts the same way without flags.
+    ///
+    /// A single-app source is saved as "all apps": its PID means nothing after a restart, and the
+    /// server has to start on something. Screen sharing is never saved as ON (see `run`).
+    fn save_stream_prefs(&self) {
+        let source = match self.source {
+            SourceKind::AllApps | SourceKind::App => "allapps",
+            SourceKind::System => "system",
+            SourceKind::VirtualSink => "sink",
+            SourceKind::WebUplink => "web",
+        };
+        let saved = crate::settings::set_many(&[
+            ("source", source.to_string()),
+            ("buffer_ms", config::clamp_buffer_ms(self.buffer_ms as i64).to_string()),
+            ("codec", self.codec.as_str().to_string()),
+            ("bitrate", self.bitrate.to_string()),
+            ("video_res", RES_LABELS[self.res_idx].1.to_string()),
+            ("video_fps60", (self.fps60 as u8).to_string()),
+            ("video_quality", self.video_quality_pct.to_string()),
+            ("video_encoder", ENC_LABELS[self.enc_idx].1.to_string()),
+        ]);
+        if let Err(e) = saved {
+            tracing::debug!("could not save the stream settings: {e}");
         }
-    }
-
-    /// The master volume control: label above, mute + slider + readout beneath. One definition, used
-    /// both inline beside the QR and as its own row when the window is too narrow for that.
-    fn master_control(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("Master").strong().color(c_text()));
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui
-                .selectable_label(self.master_muted, if self.master_muted { "🔇" } else { "🔊" })
-                .on_hover_text(if self.master_muted {
-                    "Unmute everyone (restores the master level)"
-                } else {
-                    "Mute everyone instantly — the master level is kept"
-                })
-                .clicked()
-            {
-                self.master_muted = !self.master_muted;
-            }
-            // Fills whatever the window leaves, re-measured every frame, so the bar tracks a resize
-            // instead of sitting at a fixed length. Only the readout is reserved. The floor keeps it
-            // draggable once the URL box and QR have taken their share of a narrow window.
-            //
-            // The trade-off of a very long bar is that one pixel of drag becomes a very small step;
-            // if that proves fiddly the answer is keyboard nudging, not shortening the bar.
-            ui.spacing_mut().slider_rail_height = MASTER_RAIL_H;
-            ui.spacing_mut().interact_size.y = MASTER_ROW_H;
-            ui.spacing_mut().slider_width =
-                (ui.available_width() - MASTER_READOUT_W).max(CLIENT_SLIDER_W);
-            ui.add(egui::Slider::new(&mut self.master_vol, 0.0..=1.0).show_value(false))
-                .on_hover_text("Scales every client's volume — applies instantly");
-            ui.label(
-                egui::RichText::new(if self.master_muted {
-                    " off".to_string()
-                } else {
-                    format!("{:>3}%", (self.master_vol * 100.0).round() as i32)
-                })
-                .monospace()
-                .color(c_dim()),
-            );
-        });
-    }
-
-    /// CLIENTS column (the right-hand one): the connected-clients mixer. Builds the registry snapshot, renders
-    /// master + per-client rows (in their own scroll area), then pushes state + runs the
-    /// Calibrate-all flags — all the live, no-Apply controls.
-    fn ui_clients(&mut self, ui: &mut egui::Ui, clients_n: usize) {
-        // Snapshot the live registry (don't hold the lock across egui closures).
-        let mut snapshot: Vec<(u64, String, String, bool, String, Option<i32>)> = Vec::new();
-        if let Ok(reg) = self.clients_reg.lock() {
-            for e in reg.values() {
-                snapshot.push((e.conn_id, e.stable_id.clone(), e.name.clone(), e.identified, e.calib_status.clone(), e.reported_trim_ms));
-            }
-        }
-        snapshot.sort_by_key(|c| c.0); // stable order ≈ connect order
-        let n_identified = snapshot.iter().filter(|c| c.3).count();
-        let calibrating = self.calibrating;
-        let mut do_calibrate = false; // set inside the card closure, acted on after it
-        let mut do_stop_calib = false;
-        // Sync resets, deferred out of the card closure for the same reason: the client registry
-        // can't be locked while `self` is borrowed by the UI.
-        let mut reset_sync_for: Option<String> = None; // one device, by stable id
-        let mut do_reset_all = false;
-        let mut do_stop_cast: Option<u64> = None; // caster's conn_id when the operator kicks it
-        // The active web-caster (if any) — only its row shows the operator "Stop cast" control.
-        let active_caster: Option<u64> = self.cast.lock().ok().and_then(|s| *s);
-
-        // If the client being renamed vanished, don't strand the half-typed buffer: commit it
-        // (keyed by stable id) and clear the edit state.
-        if let Some(ed) = self.editing_client.clone() {
-            let present = snapshot.iter().any(|(_, sid, _, ident, _, _)| *ident && sid == &ed);
-            if !present {
-                let nm = self.edit_name_buf.trim().to_string();
-                if !nm.is_empty() {
-                    self.client_names.insert(ed, nm);
-                }
-                self.editing_client = None;
-                self.edit_name_buf.clear();
-            }
-        }
-
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("CONNECTED CLIENTS").strong().size(13.0).color(c_dim()))
-                    .on_hover_text("Volume & sync are live — they apply instantly, no Apply needed.");
-                ui.label(egui::RichText::new(format!("({clients_n})")).strong().color(c_accent()));
-            });
-            ui.add_space(6.0);
-            if snapshot.is_empty() {
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new(
-                        "No clients yet — open the URL above on a phone, tablet, or laptop.",
-                    )
-                    .size(11.5)
-                    .color(c_dim()),
-                );
-            }
-            // ---- Calibrate all (Phase B): align every device at once over the mic ----
-            // Always render the control so the feature is discoverable; it only ENABLES once there
-            // are 2+ identified devices to align. (With fewer, "align all" has nothing to do — a
-            // lone device self-calibrates from its own browser's Calibrate button instead.)
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if calibrating {
-                    if ui.button("⏹ Stop calibration").clicked() {
-                        do_stop_calib = true;
-                    }
-                    ui.label(
-                        egui::RichText::new("Aligning all devices…").size(11.5).color(c_accent()),
-                    );
-                } else {
-                    let ready = n_identified >= 2;
-                    let resp = ui
-                        .add_enabled(ready, egui::Button::new("Calibrate all"))
-                        .on_hover_text(
-                            "Earliest-connected device plays a sync code; the rest listen on \
-                             their mics and align at once. Devices must be in the same room \
-                             with working mics. (Uses the coded signal.)",
-                        )
-                        .on_disabled_hover_text(
-                            "Connect 2+ devices (same room, working mics) to align them. A single \
-                             device self-calibrates from its own browser.",
-                        );
-                    if resp.clicked() {
-                        do_calibrate = true;
-                    }
-                    // Sits to the RIGHT of "Calibrate all" and is the undo for it. Enabled whenever
-                    // anything is connected — unlike calibration it needs no mics, no second device,
-                    // and no room: it is the way back to a known state when an alignment went wrong.
-                    if ui
-                        .add_enabled(!snapshot.is_empty(), egui::Button::new("Reset all"))
-                        .on_hover_text(
-                            "Reset every connected device's sync to 0 ms — clears the server \
-                             offsets and tells each device to drop its own calibration trim.",
-                        )
-                        .on_disabled_hover_text("No devices connected.")
-                        .clicked()
-                    {
-                        do_reset_all = true;
-                    }
-                    if !ready {
-                        ui.label(
-                            egui::RichText::new("connect 2+ devices to align them")
-                                .size(11.5)
-                                .color(c_dim()),
-                        );
-                    }
-                }
-            });
-            ui.add_space(4.0);
-            // Per-client rows scroll independently — the one routinely-growing region. Distinct
-            // id_salt from the config rail's scroll area so their scroll states don't collide.
-            //
-            // auto_shrink is [false, TRUE]: fill the width, but take only the height the rows need.
-            // With `false` on the vertical axis this claimed the whole column, which dragged the
-            // surrounding card frame down with it and left a tall empty bordered box under a short
-            // client list. Shrinking vertically means the card ends just below the last client, and
-            // the scrollbar appears only once the rows genuinely overflow the column (the enclosing
-            // allocate_ui_with_layout caps the available height).
-            //
-            // NB this has nothing to do with how small the WINDOW can be dragged: egui layout never
-            // feeds back into the OS resize floor, which comes solely from `with_min_inner_size`.
-            // (Measured via WM_GETMINMAXINFO — don't go looking in the layout code for that.)
-            egui::ScrollArea::vertical()
-                .id_salt("clients")
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    for (conn_id, stable_id, name, identified, calib_status, reported_trim) in &snapshot {
-                        if !*identified {
-                            ui.label(egui::RichText::new("connecting…").italics().color(c_dim()));
-                            ui.add_space(4.0);
-                            continue;
-                        }
-                        // Salt each row by stable id so a mid-list disconnect can't hand an
-                        // in-flight slider drag / rename focus to a different client.
-                        ui.push_id(stable_id, |ui| {
-                            ui.separator();
-                            let default_name = if name.is_empty() {
-                                format!("Client {conn_id}")
-                            } else {
-                                name.clone()
-                            };
-                            let display =
-                                self.client_names.get(stable_id).cloned().unwrap_or(default_name);
-                            if self.editing_client.as_deref() == Some(stable_id.as_str()) {
-                                let resp = ui.add(
-                                    egui::TextEdit::singleline(&mut self.edit_name_buf)
-                                        .desired_width(240.0)
-                                        .hint_text("name this device"),
-                                );
-                                if !resp.has_focus() && !resp.lost_focus() {
-                                    resp.request_focus();
-                                }
-                                if resp.lost_focus() {
-                                    let nm = self.edit_name_buf.trim().to_string();
-                                    if nm.is_empty() {
-                                        self.client_names.remove(stable_id);
-                                    } else {
-                                        self.client_names.insert(stable_id.clone(), nm);
-                                    }
-                                    self.editing_client = None;
-                                }
-                            } else {
-                                let resp = ui
-                                    .add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&display).strong().color(c_text()),
-                                        )
-                                        .sense(egui::Sense::click()),
-                                    )
-                                    .on_hover_text("double-click to rename");
-                                if resp.double_clicked() {
-                                    self.edit_name_buf = display.clone();
-                                    self.editing_client = Some(stable_id.clone());
-                                }
-                            }
-                            let muted = self.client_muted.get(stable_id).copied().unwrap_or(false);
-                            ui.horizontal(|ui| {
-                                // Both bars grow with the window, like the master above them.
-                                //
-                                // Measured, not fixed: take the row's width, reserve what the
-                                // non-slider widgets need (mute, the two captions, both readouts,
-                                // the reset button and the gaps between them), and split the rest
-                                // between the two sliders — they share one `slider_width`, so it is
-                                // one number for both. CLIENT_SLIDER_W stays as the FLOOR, which is
-                                // what a narrow window falls back to rather than collapsing them to
-                                // an undraggable stub.
-                                let per_slider = ((ui.available_width() - CLIENT_ROW_FIXED_W) * 0.5)
-                                    .max(CLIENT_SLIDER_W);
-                                ui.spacing_mut().slider_width = per_slider;
-                                if ui
-                                    .selectable_label(muted, if muted { "🔇" } else { "🔊" })
-                                    .on_hover_text("Mute / unmute this device")
-                                    .clicked()
-                                {
-                                    self.client_muted.insert(stable_id.clone(), !muted);
-                                }
-                                ui.label(egui::RichText::new("Vol").size(12.0).color(c_dim()));
-                                let v = self.client_vols.entry(stable_id.clone()).or_insert(1.0);
-                                ui.add(egui::Slider::new(v, 0.0..=1.0).show_value(false));
-                                let pct = (*v * 100.0).round() as i32;
-                                ui.label(
-                                    egui::RichText::new(if muted {
-                                        " off".to_string()
-                                    } else {
-                                        format!("{pct:>3}%")
-                                    })
-                                    .monospace()
-                                    .color(c_dim()),
-                                );
-                                ui.add_space(8.0);
-                                ui.label(egui::RichText::new("Sync").size(12.0).color(c_dim()));
-                                let t = self.client_trims.entry(stable_id.clone()).or_insert(0);
-                                ui.add(egui::Slider::new(t, -500..=500).show_value(false));
-                                let ms = *t;
-                                // Show the device's ACTUAL effective sync (reported back = its own
-                                // calibration/slider + our pushed offset), so calibrated clients read
-                                // their real, differing offsets instead of the commanded 0. Falls back
-                                // to the commanded value (dim) until the first report arrives.
-                                let reported = *reported_trim;
-                                let shown = reported.unwrap_or(ms);
-                                ui.label(
-                                    egui::RichText::new(format!("{shown:>+5} ms"))
-                                        .monospace()
-                                        .color(if reported.is_some() { c_text2() } else { c_dim() }),
-                                )
-                                .on_hover_text(if reported.is_some() {
-                                    "the device's actual sync — its own calibration/slider plus the server offset"
-                                } else {
-                                    "server-commanded offset (the device hasn't reported its actual sync yet)"
-                                });
-                                if ui
-                                    .button("⟲")
-                                    .on_hover_text(
-                                        "Reset this device's sync to 0 ms — clears BOTH the server \
-                                         offset and the device's own calibration trim.",
-                                    )
-                                    .clicked()
-                                {
-                                    reset_sync_for = Some(stable_id.clone());
-                                }
-                            });
-                            if !calib_status.is_empty() {
-                                let ok = calib_status.contains("aligned") || calib_status == "reference";
-                                ui.label(
-                                    egui::RichText::new(format!("   {calib_status}"))
-                                        .size(11.0)
-                                        .color(if ok { c_ok() } else { c_dim() }),
-                                );
-                            }
-                            if active_caster == Some(*conn_id) {
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("📡 casting").size(11.0).color(c_accent()));
-                                    if ui
-                                        .button("⏹ Stop cast")
-                                        .on_hover_text("Kick this device off the cast slot so another client can claim it.")
-                                        .clicked()
-                                    {
-                                        do_stop_cast = Some(*conn_id);
-                                    }
-                                });
-                            }
-                            ui.add_space(6.0);
-                        });
-                    }
-                });
-        });
-        // Deliver any changed volume / sync, then act on the deferred cast/calibrate flags.
-        self.push_client_state();
-        if let Some(cid) = do_stop_cast {
-            // Operator kicked the caster. The server is the SOLE authority on the slot and the
-            // caster's own stopCast doesn't notify it — so free the slot IMMEDIATELY (letting another
-            // client claim it) AND tell the caster's browser to tear down its uplink. No ack wait.
-            if let Ok(mut s) = self.cast.lock() {
-                if *s == Some(cid) {
-                    *s = None;
-                }
-            }
-            if let Ok(reg) = self.clients_reg.lock() {
-                if let Some(e) = reg.get(&cid) {
-                    let _ = e.ctrl_tx.send(webserver::cast_stop_msg());
-                }
-            }
-        }
-        // A sync reset has TWO halves and needs both. Clearing our own offset only moves the value
-        // the server commands; a calibrated device keeps its whole speaker-latency compensation in
-        // its OWN trim, which lives in the browser and is reachable only by asking. Sending one
-        // without the other leaves the device sitting at a number nobody chose.
-        if do_reset_all || reset_sync_for.is_some() {
-            if let Ok(mut reg) = self.clients_reg.lock() {
-                for e in reg.values_mut() {
-                    if !do_reset_all && reset_sync_for.as_deref() != Some(e.stable_id.as_str()) {
-                        continue;
-                    }
-                    self.client_trims.insert(e.stable_id.clone(), 0);
-                    let _ = e.ctrl_tx.send(webserver::reset_sync_msg());
-                    // DELIBERATELY does not touch `e.trim_ms`. That field records what was last
-                    // DELIVERED and is the dedup guard in push_client_state
-                    // (`if trim != e.trim_ms { send(set_trim_msg(trim)) }`), so zeroing it here made
-                    // the guard see 0 == 0 on the next frame and skip the SET_TRIM 0 entirely.
-                    //
-                    // That silently halved the reset: MSG_RESET_SYNC clears the device's OWN trim,
-                    // but the client deliberately leaves the server-pushed `remoteTrimMs` alone
-                    // ("the server's own reset clears both ends" — app.js), so nothing cleared it.
-                    // The operator saw "Sync reset to 0 ms", the slider read 0, and the device kept
-                    // playing at the old offset until its next report repainted the row.
-                    //
-                    // Leaving the mirror alone means the guard now sees 0 != old and pushes
-                    // SET_TRIM 0 on the very next frame, through the one code path that owns
-                    // delivering trims.
-                }
-            }
-            *self.status.lock().unwrap() = if do_reset_all {
-                "Sync reset to 0 ms on every connected device.".into()
-            } else {
-                "Sync reset to 0 ms on that device.".into()
-            };
-        }
-        if do_calibrate {
-            if !self.start_calibrate_all() {
-                *self.status.lock().unwrap() = "Need at least two connected devices to calibrate.".into();
-            }
-        } else if do_stop_calib {
-            self.stop_calibrate_all(true);
-        } else if self.calibrating {
-            let ids: Vec<&(u64, String, String, bool, String, Option<i32>)> =
-                snapshot.iter().filter(|c| c.3).collect();
-            let ref_id = ids.iter().map(|c| c.0).min();
-            let mut followers = 0;
-            let mut done = 0;
-            for c in &ids {
-                if Some(c.0) == ref_id {
-                    continue;
-                }
-                followers += 1;
-                let s = c.4.as_str();
-                if s.contains("aligned") || s.contains("failed") || s.contains("no lock") {
-                    done += 1;
-                }
-            }
-            if ref_id.is_none() || followers == 0 || done == followers {
-                self.stop_calibrate_all(false);
-            }
-        }
-        if self.calibrating {
-            ui.ctx().request_repaint_after(Duration::from_millis(300));
-        }
-    }
-
-    /// CONFIG RAIL (the left-hand column), top: the (Apply-gated) audio source picker + quality readout.
-    fn ui_audio_source(&mut self, ui: &mut egui::Ui) {
-        let audio_quality = self.audio_quality_text();
-        card(ui, |ui| {
-            // OS-appropriate source labels — WASAPI "mute" semantics don't apply on Linux/macOS.
-            #[cfg(target_os = "windows")]
-            const ALL_APPS_LABEL: &str = "All apps  —  recommended (keeps playing when Windows is muted)";
-            #[cfg(target_os = "linux")]
-            const ALL_APPS_LABEL: &str = "All apps  —  recommended (captures the system output)";
-            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-            const ALL_APPS_LABEL: &str = "All apps  —  recommended";
-            #[cfg(target_os = "windows")]
-            const SYSTEM_LABEL: &str = "Full system output  —  goes silent when Windows is muted";
-            #[cfg(target_os = "linux")]
-            const SYSTEM_LABEL: &str = "Full system output  —  mirrors the speakers (follows system mute)";
-            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-            const SYSTEM_LABEL: &str = "Full system output";
-            eyebrow(ui, "AUDIO SOURCE");
-            // Silence is the one failure the UI cannot show by staying quiet: every control below
-            // looks correct while the stream carries nothing. The device name in the footer already
-            // says so, but that line is small, far from here, and easy to miss — so say it in the
-            // panel the operator is actually reading when they wonder why there's no sound.
-            {
-                let st = self.status.lock().unwrap().clone();
-                self.capture_is_dummy = dummy_verdict(self.capture_is_dummy, &st);
-            }
-            if self.capture_is_dummy {
-                ui.label(
-                    egui::RichText::new(
-                        "⚠  No real audio output device — using the Dummy Output.\n\
-                         Nothing is audible on this machine, and this stream carries only what\n\
-                         apps still play into the dummy — silence whenever nothing does.\n\
-                         Every card profile is off, or there's no sound hardware (usual in a VM).\n\
-                         If `pactl list cards` shows a card:\n\
-                         pactl set-card-profile <card> output:analog-stereo   — then press Apply.",
-                    )
-                    .size(11.5)
-                    .color(c_err()),
-                );
-                ui.add_space(6.0);
-            }
-            // Coupling: choosing a LOCAL audio source drops a cast-video selection (you can't relay
-            // the caster's screen while capturing local audio — the uplink is one source).
-            if ui
-                .radio_value(
-                    &mut self.source,
-                    SourceKind::AllApps,
-                    ALL_APPS_LABEL,
-                )
-                .clicked()
-                && self.video_kind == VideoSourceKind::WebCast
-            {
-                self.video_kind = VideoSourceKind::Off;
-            }
-            #[cfg(any(target_os = "windows", target_os = "linux"))]
-            {
-                // The radio's wording differs per platform because the underlying thing differs.
-                // Windows lists windows and audio sessions, so "one window / app" is honest. Linux
-                // can only see streams that are playing, so promising "window" there would be a
-                // lie the operator discovers only after picking something.
-                #[cfg(target_os = "windows")]
-                const PICK_LABEL: &str = "Just one window / app:";
-                #[cfg(target_os = "linux")]
-                const PICK_LABEL: &str = "Just one app (must be playing):";
-                let apps = self.apps.clone();
-                ui.horizontal(|ui| {
-                    if ui
-                        .radio_value(&mut self.source, SourceKind::App, PICK_LABEL)
-                        .clicked()
-                    {
-                        // Arriving at the per-app source: enumerate now, so the list is current the
-                        // first time it is opened rather than whatever was cached at startup.
-                        self.refresh_apps();
-                        if self.video_kind == VideoSourceKind::WebCast {
-                            self.video_kind = VideoSourceKind::Off;
-                        }
-                    }
-                    let label = if self.selected_pid.is_some() {
-                        self.selected_name.clone()
-                    } else {
-                        "(choose)".to_string()
-                    };
-                    let combo = egui::ComboBox::from_id_salt("app_pick")
-                        .selected_text(label)
-                        .show_ui(ui, |ui| {
-                            for a in &apps {
-                                if ui
-                                    .selectable_label(self.selected_pid == Some(a.pid), &a.name)
-                                    .clicked()
-                                {
-                                    self.selected_pid = Some(a.pid);
-                                    self.selected_name = a.name.clone();
-                                    self.source = SourceKind::App;
-                                    if self.video_kind == VideoSourceKind::WebCast {
-                                        self.video_kind = VideoSourceKind::Off;
-                                    }
-                                }
-                            }
-                            if apps.is_empty() {
-                                // The empty state has to explain itself on Linux: an empty list is
-                                // the NORMAL state when nothing happens to be playing, not a
-                                // failure to enumerate, and "click Refresh" would be useless advice.
-                                #[cfg(target_os = "windows")]
-                                ui.label("(no windows / apps found — click Refresh)");
-                                #[cfg(target_os = "linux")]
-                                ui.label("(nothing is playing audio right now — start playback and it appears here)");
-                            }
-                        });
-                    // Opening the picker enumerates. With no background scan, this is what keeps the
-                    // list honest: what you are about to choose from was just read, not cached from
-                    // whenever the GUI last happened to look.
-                    if combo.response.clicked() {
-                        self.refresh_apps();
-                    }
-                    let label = if self.refreshing { "⟳ Refreshing…" } else { "⟳ Refresh" };
-                    if ui.add_enabled(!self.refreshing, egui::Button::new(label)).clicked() {
-                        self.refresh_apps();
-                    }
-                });
-            }
-            // Linux gets the picker (audio only); per-WINDOW capture stays Windows-only because
-            // window-scoped audio has no meaning on PipeWire — audio belongs to a process's
-            // stream, and nothing maps a window to one.
-            #[cfg(target_os = "linux")]
-            ui.label(
-                egui::RichText::new(
-                    "Per-window capture is Windows-only; on Linux audio belongs to an app, not a window.",
-                )
-                .size(11.0)
-                .color(c_dim()),
-            );
-            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-            ui.label(
-                egui::RichText::new(
-                    "Per-app / single-window capture is Windows-only — on this OS use All apps or Full system output.",
-                )
-                .size(11.0)
-                .color(c_dim()),
-            );
-            if ui
-                .radio_value(
-                    &mut self.source,
-                    SourceKind::System,
-                    SYSTEM_LABEL,
-                )
-                .clicked()
-                && self.video_kind == VideoSourceKind::WebCast
-            {
-                self.video_kind = VideoSourceKind::Off;
-            }
-            // Linux only: the device is a PipeWire/PulseAudio sink, and no other platform's capture
-            // can host one. Not shown disabled elsewhere: on Windows the all-apps and per-app sources
-            // keep streaming with the output muted, which already answers the same need.
-            #[cfg(target_os = "linux")]
-            {
-                if ui
-                    .radio_value(
-                        &mut self.source,
-                        SourceKind::VirtualSink,
-                        "\"Newfoundsync\" output device  —  only apps you send to it, silent on this PC",
-                    )
-                    .on_hover_text(
-                        "Adds an output device called \"Newfoundsync\" while this source is live. \
-                         Tick an app below (or set its output to the device in your system volume \
-                         mixer): that app is streamed and no longer plays out of this PC's speakers, \
-                         so you don't hear it twice (once now, once a buffer later). The device is \
-                         removed when you switch source or quit.",
-                    )
-                    .clicked()
-                    && self.video_kind == VideoSourceKind::WebCast
-                {
-                    self.video_kind = VideoSourceKind::Off;
-                }
-                if self.source == SourceKind::VirtualSink {
-                    self.ui_app_routing(ui);
-                }
-            }
-            if ui
-                .radio_value(
-                    &mut self.source,
-                    SourceKind::WebUplink,
-                    "Web client cast  —  a client casts its audio up to here",
-                )
-                .on_hover_text(
-                    "Audio-only cast: a connected web client taps \"Cast\" and becomes the source. To \
-                     also relay the caster's SCREEN, pick \"Web client cast\" under Video Source instead.",
-                )
-                .clicked()
-            {
-                // The cast as an AUDIO source = audio only; drop any video selection so it's
-                // unambiguous. (Audio + video from the cast is the Video Source option, which also
-                // selects this radio.)
-                self.video_kind = VideoSourceKind::Off;
-            }
-            ui.add_space(7.0);
-            ui.label(
-                egui::RichText::new(format!("🎧 Streaming {audio_quality}"))
-                    .size(11.5)
-                    .color(c_dim()),
-            );
-        });
-    }
-
-    /// CONFIG RAIL, middle: the (Apply-gated) video source + its quality/encoder disclosure.
-    fn ui_video_source(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
-            eyebrow(ui, "VIDEO SOURCE");
-            // Two ways to cast from a web client: "Web client cast" under AUDIO SOURCE = audio only;
-            // "Web client cast" here (below) = audio + video. Local Screen/Window pairs with a local
-            // audio source — selecting one auto-reconciles the other so the pickers never disagree.
-            ui.radio_value(&mut self.video_kind, VideoSourceKind::Off, "Off  —  audio only");
-            // Local screen capture is Windows-only (WGC): `video::capture` is not even compiled
-            // elsewhere, and media.rs drops video with a log line nobody reads. Offering the radio
-            // anyway meant picking "Whole screen", pressing Apply, and silently getting audio —
-            // the stream looked healthy and clients simply never saw a picture. Show it, so the
-            // capability is discoverable, but disabled and saying why.
-            #[cfg(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture"), all(target_os = "macos", feature = "mac-capture")))]
-            if ui
-                .radio_value(&mut self.video_kind, VideoSourceKind::Screen, "Whole screen")
-                .clicked()
-                && self.source == SourceKind::WebUplink
-            {
-                self.source = SourceKind::AllApps; // a local screen can't pair with a cast audio source
-            }
-            #[cfg(not(any(target_os = "windows", all(target_os = "linux", feature = "linux-capture"), all(target_os = "macos", feature = "mac-capture"))))]
-            ui.add_enabled(
-                false,
-                egui::RadioButton::new(false, "Whole screen  —  not built into this server"),
-            )
-            .on_disabled_hover_text(
-                "Capturing this machine's screen is only implemented on Windows. To share a \
-                 screen from here, use \"Web client cast\" below and cast from a browser tab \
-                 instead — that path relays real video.",
-            );
-            #[cfg(target_os = "windows")]
-            {
-                let windows: Vec<AudioApp> =
-                    self.apps.iter().filter(|a| a.hwnd.is_some()).cloned().collect();
-                ui.horizontal(|ui| {
-                    if ui
-                        .radio_value(&mut self.video_kind, VideoSourceKind::Window, "Just one window / app:")
-                        .clicked()
-                        && self.source == SourceKind::WebUplink
-                    {
-                        self.source = SourceKind::AllApps;
-                    }
-                    let label = if self.video_hwnd.is_some() && !self.video_name.is_empty() {
-                        self.video_name.clone()
-                    } else {
-                        "(choose)".to_string()
-                    };
-                    egui::ComboBox::from_id_salt("vid_pick")
-                        .selected_text(label)
-                        .show_ui(ui, |ui| {
-                            for a in &windows {
-                                if ui
-                                    .selectable_label(self.video_hwnd == a.hwnd, &a.name)
-                                    .clicked()
-                                {
-                                    self.video_pid = Some(a.pid);
-                                    self.video_name = a.name.clone();
-                                    self.video_hwnd = a.hwnd;
-                                    self.video_kind = VideoSourceKind::Window;
-                                    self.source = SourceKind::App;
-                                    self.selected_pid = Some(a.pid);
-                                    self.selected_name = a.name.clone();
-                                }
-                            }
-                            if windows.is_empty() {
-                                ui.label("(no windows found — click Refresh)");
-                            }
-                        });
-                    let label = if self.refreshing { "⟳ Refreshing…" } else { "⟳ Refresh" };
-                    if ui.add_enabled(!self.refreshing, egui::Button::new(label)).clicked() {
-                        self.refresh_apps();
-                    }
-                });
-            }
-            // Cast as a VIDEO source = audio + video from the caster. Selecting it also selects the
-            // "Web client cast" AUDIO source (it's one uplink), so the two pickers never contradict.
-            if ui
-                .radio_value(
-                    &mut self.video_kind,
-                    VideoSourceKind::WebCast,
-                    "Web client cast  —  a client casts its screen + audio up to here",
-                )
-                .on_hover_text(
-                    "The web client casts its SCREEN + audio; the server re-broadcasts both to everyone \
-                     at the quality below. (Also selects Web client cast as the audio source.)",
-                )
-                .clicked()
-            {
-                self.source = SourceKind::WebUplink;
-            }
-            if self.video_kind != VideoSourceKind::Off {
-                ui.add_space(2.0);
-                egui::CollapsingHeader::new(
-                    egui::RichText::new("Quality, resolution & encoder").size(12.5).color(c_dim()),
-                )
-                .id_salt("vid_adv")
-                .default_open(false)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Resolution:");
-                        egui::ComboBox::from_id_salt("res")
-                            .selected_text(RES_LABELS[self.res_idx].0)
-                            .show_ui(ui, |ui| {
-                                for (i, (label, _)) in RES_LABELS.iter().enumerate() {
-                                    ui.selectable_value(&mut self.res_idx, i, *label);
-                                }
-                            });
-                        ui.checkbox(&mut self.fps60, "60 fps");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Codec:").on_hover_text(
-                            "Which video codec to send. Hover either option for what it's good for — \
-                             the short version is AV1 for quality, VP9 if a device won't play AV1.",
-                        );
-                        // VP9 links libvpx and lives behind the (non-default) `vp9` feature, so this
-                        // build may be unable to honor it. Don't offer a choice we'd silently
-                        // substitute AV1 for — the picker must not claim a codec we won't send.
-                        // (`enc_idx` is already normalized at the seed site, so no mutation here — this
-                        // closure only runs once the disclosure is expanded, and writing state during
-                        // rendering would fake a pending change.)
-                        let vp9_available = cfg!(feature = "vp9");
-                        let is_vp9 = self.enc_idx == 1 && vp9_available;
-                        egui::ComboBox::from_id_salt("codec")
-                            .selected_text(if is_vp9 { ENC_LABELS[1].0 } else { ENC_LABELS[0].0 })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.enc_idx, 0, ENC_LABELS[0].0)
-                                    .on_hover_text(AV1_HINT);
-                                if vp9_available {
-                                    ui.selectable_value(&mut self.enc_idx, 1, ENC_LABELS[1].0)
-                                        .on_hover_text(VP9_HINT);
-                                } else {
-                                    ui.add_enabled(false, egui::Button::new("VP9 · not in this build"))
-                                        .on_disabled_hover_text(
-                                            "This build was compiled without the `vp9` feature (it links \
-                                             libvpx via vcpkg). Rebuild with --features vp9 to enable it.",
-                                        );
-                                }
-                            });
-                    });
-                    // WHERE video encodes, as opposed to WHICH codec above. Worth exposing because
-                    // the right answer is machine-specific and neither choice is universally
-                    // better: the GPU encoder costs almost no CPU but some hardware encoders are
-                    // lower quality per bitrate (or, on this project's own bug reports, flaky),
-                    // while SVT-AV1 gives up CPU headroom that a busy server may not have.
-                    ui.horizontal(|ui| {
-                        ui.label("Encode on:").on_hover_text(
-                            "Auto tries the GPU and quietly falls back to CPU — what this has \
-                             always done. GPU only refuses to start video if the GPU has no usable \
-                             AV1 encoder, instead of spending the CPU you were trying to protect. \
-                             CPU only never touches the GPU, which is the way out of a flaky \
-                             hardware encoder.",
-                        );
-                        // The screencast Flatpak has VA-API/NVENC backends; the ordinary Linux
-                        // Flatpak intentionally does not, so only expose a choice where it works.
-                        #[cfg(any(target_os = "windows", all(target_os = "linux", feature = "linux-hw-encode")))]
-                        egui::ComboBox::from_id_salt("encode_device")
-                            .selected_text(match self.encode_device {
-                                EncodeDevice::Auto => "Auto · GPU, else CPU",
-                                EncodeDevice::Gpu => "GPU only",
-                                EncodeDevice::Cpu => "CPU only",
-                            })
-                            .show_ui(ui, |ui| {
-                                for (d, label) in [
-                                    (EncodeDevice::Auto, "Auto · GPU, else CPU"),
-                                    (EncodeDevice::Gpu, "GPU only · fail if unavailable"),
-                                    (EncodeDevice::Cpu, "CPU only · never use the GPU"),
-                                ] {
-                                    if ui
-                                        .selectable_value(&mut self.encode_device, d, label)
-                                        .clicked()
-                                    {
-                                        // Persist immediately rather than on Apply. Apply rebuilds
-                                        // the stream and reconnects every listener; the operator
-                                        // reaching for this is usually mid-diagnosis of a bad
-                                        // encoder and shouldn't lose the setting to a crash before
-                                        // they get around to applying it.
-                                        if let Err(e) = crate::settings::save_encode_device(d) {
-                                            tracing::warn!("couldn't save encode device: {e}");
-                                        }
-                                    }
-                                }
-                            });
-                        #[cfg(not(any(target_os = "windows", all(target_os = "linux", feature = "linux-hw-encode"))))]
-                        ui.label(
-                            egui::RichText::new("CPU (SVT-AV1) — no GPU AV1/VP9 encoder here")
-                                .size(11.0)
-                                .color(c_dim()),
-                        )
-                        .on_hover_text(
-                            "Not a missing feature — a hardware one. Most GPUs can DECODE AV1/VP9 \
-                             but only encode H.264/HEVC, which this app doesn't ship. Hardware AV1 \
-                             encoding needs Intel Arc / Meteor Lake or newer, AMD RX 7000 or newer, \
-                             or an RTX 40-series; no NVIDIA GPU has ever encoded VP9. On Windows \
-                             the GPU path exists because Media Foundation exposes an AV1 encoder \
-                             where the hardware has one.",
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Quality:");
-                        ui.add(egui::Slider::new(&mut self.video_quality_pct, 40..=250).suffix("%"));
-                    });
-                    {
-                        let res = Resolution::parse(RES_LABELS[self.res_idx].1)
-                            .unwrap_or(Resolution::P1080);
-                        let est = VideoConfig {
-                            resolution: res,
-                            fps: if self.fps60 { Fps::F60 } else { Fps::F30 },
-                            quality_pct: self.video_quality_pct,
-                        }
-                        .suggested_bitrate_kbps();
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "🎬  ≈ {:.1} Mbps target — lower for weaker hardware/Wi-Fi, higher for sharper video.",
-                                est as f32 / 1000.0
-                            ))
-                            .size(11.0)
-                            .color(c_dim()),
-                        );
-                    }
-                });
-            }
-            // A/V OFFSET — live, deliberately NOT Apply-gated.
-            //
-            // Judging lip-sync needs continuous playback, so a control you can only change by
-            // restarting the stream is a control you cannot actually tune. This writes straight to
-            // the atomic the audio producer reads per frame.
-            //
-            // Only meaningful with video on, so it is hidden when video is off rather than sitting
-            // there inviting a change that does nothing.
-            if self.video_kind != VideoSourceKind::Off {
-                ui.add_space(8.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("A/V offset").color(c_text2())).on_hover_text(
-                        "Shifts AUDIO against video, for everyone, instantly. Drag right if you \
-                         hear the sound BEFORE the lips move; left if the sound lags the picture. \
-                         It is needed because a player writes its audio to the speakers ahead of \
-                         time, so the sound we capture belongs with a picture slightly later than \
-                         the one we capture with it — and nothing on the system reports that gap.",
-                    );
-                    let mut ms = self.av_offset_ms;
-                    ui.spacing_mut().slider_width = CLIENT_SLIDER_W * 2.0;
-                    let resp = ui.add(egui::Slider::new(&mut ms, -500..=500).show_value(false));
-                    // The LIVE value has to move on every change — that is the whole point of the
-                    // control, you tune it by ear against a running stream.
-                    if resp.changed() {
-                        self.apply_av_offset(ms);
-                    }
-                    // Saving is a different question. save_key() reads the whole settings file,
-                    // writes a temp copy and renames it, and `changed()` fires on every mouse-move
-                    // of a drag — so persisting there did that dance ~60 times a second for the
-                    // length of a drag. Once the drag ends is exactly as durable and costs one write.
-                    if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
-                        self.save_av_offset();
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("{:>+5} ms", self.av_offset_ms))
-                            .monospace()
-                            .color(c_dim()),
-                    );
-                    if ui.button("⟲").on_hover_text("Back to 0 ms").clicked() {
-                        self.apply_av_offset(0);
-                        self.save_av_offset();
-                    }
-                });
-                ui.label(
-                    egui::RichText::new(
-                        "+ = delay the audio (fixes sound arriving before the picture)",
-                    )
-                    .size(11.0)
-                    .color(c_dim()),
-                );
-            }
-        });
     }
 
     /// Apply the A/V offset LIVE: the slider's ms and the nanoseconds the audio producer reads, kept
@@ -2323,340 +1717,39 @@ impl ServerApp {
         }
     }
 
-    /// CONFIG RAIL: the buffer card (the former "Advanced" section, now a plain Apply-gated card).
-    fn ui_buffer(&mut self, ui: &mut egui::Ui) {
-        card(ui, |ui| {
-            eyebrow(ui, "BUFFER");
-            // Presets matched to this app's whole-home philosophy (multi-second buffers for
-            // dropout immunity), with the raw ms slider beneath for fine control.
-            ui.horizontal(|ui| {
-                for (label, ms) in [("Snappy · 1s", 1000), ("Balanced · 3s", 3000), ("Rock-solid · 6s", 6000)] {
-                    if ui.selectable_label(self.buffer_ms == ms, label).clicked() {
-                        self.buffer_ms = ms;
-                    }
-                }
-            });
-            ui.add_space(4.0);
-            // Buffer rationale folded into a hover on the slider (was a standalone 2-line paragraph)
-            // to reclaim vertical space for the ad strip below.
-            ui.add(
-                egui::Slider::new(&mut self.buffer_ms, (config::MIN_BUFFER_MS as i32)..=(config::MAX_BUFFER_MS as i32))
-                    .suffix(" ms"),
-            )
-            .on_hover_text(
-                "Reliable TCP stream (WebSocket/TLS): lost Wi-Fi packets are re-sent and this \
-                 jitter buffer hides the stall. Bigger = more dropout-proof but more delay; \
-                 identical on every client -> lock-step.",
-            );
-        });
-    }
-
-    /// CONFIG RAIL, bottom: the single accent surface — the dirty-state Apply button.
-    fn ui_apply(&mut self, ui: &mut egui::Ui, busy: bool, dirty: bool, clients_n: usize) {
-        ui.label(
-            egui::RichText::new("Source, video & buffer changes take effect when you Apply.")
-                .size(11.0)
-                .color(c_dim()),
-        );
-        ui.add_space(4.0);
-        let label = if busy {
-            "Starting…".to_string()
-        } else if dirty {
-            if clients_n > 0 {
-                format!(
-                    "Apply changes — reconnects {clients_n} device{}",
-                    if clients_n == 1 { "" } else { "s" }
-                )
-            } else {
-                "Apply changes".to_string()
-            }
-        } else {
-            "Stream is up to date".to_string()
-        };
-        let (fill, txt_col) = if dirty && !busy {
-            (c_accent(), egui::Color32::WHITE)
-        } else {
-            (c_surface(), c_dim())
-        };
-        let btn = egui::Button::new(egui::RichText::new(label).strong().size(15.0).color(txt_col))
-            .fill(fill)
-            .corner_radius(egui::CornerRadius::from(10));
-        let resp = ui.add_enabled(dirty && !busy, btn.min_size(egui::vec2(ui.available_width(), 40.0)));
-        let resp = if dirty && !busy {
-            resp.on_hover_text(format!(
-                "Rebuilds the stream with your new settings. {} (~1s of silence).",
-                if clients_n == 0 {
-                    "No devices are connected".to_string()
-                } else if clients_n == 1 {
-                    "1 connected device will reconnect".to_string()
-                } else {
-                    format!("All {clients_n} connected devices will reconnect")
-                }
-            ))
-        } else {
-            resp
-        };
-        if resp.clicked() {
-            self.apply();
-        }
-    }
-}
-
-impl eframe::App for ServerApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Fill the whole window with the theme background. eframe's framebuffer clear colour
-        // doesn't track our runtime theme, so without this the backdrop stays dark behind the
-        // light theme (white cards floating on a black window). Paint c_bg() at the very back.
-        ui.ctx()
-            .layer_painter(egui::LayerId::background())
-            .rect_filled(ui.ctx().screen_rect(), 0.0, c_bg());
-
-        // Breathing room at the window edges.
-        //
-        // eframe's `App::ui` hands us the ROOT ui straight from `run_ui` — unlike a CentralPanel there
-        // is no frame and therefore no margin at all, so every card sat flush against the window edge
-        // and the leftmost glyphs were actually being clipped ("AUDIO SOURCE" rendering as "UDIO
-        // SOURCE"). Inset a padded child and shadow the binding, so everything below lays out inside
-        // the inset with no other changes. Horizontal only: the header already has its own top spacing
-        // and the footer is meant to sit on the bottom edge.
-        let padded = ui.max_rect().shrink2(egui::vec2(EDGE_PAD, 0.0));
-        let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(padded));
-        let ui = &mut ui;
-        // Default the UI scale to the design baseline (shown as 100%) on the first frame
-        // (deterministic on every display). Users still adjust live with the ± buttons.
-        if !self.did_initial_zoom {
-            self.did_initial_zoom = true;
-            ui.ctx().set_zoom_factor(UI_ZOOM_BASE);
-        }
-        ui.ctx().request_repaint_after(Duration::from_secs(1)); // keep counts/status live
-        // Seed the "applied" baseline BEFORE poll_refresh() can self-heal a vanished source: it
-        // must reflect what the stream was actually started with (the CLI/init config), so a heal
-        // that rewrites the UI shows up as a pending change instead of being absorbed silently.
-        if self.applied.is_none() {
-            self.applied = Some(self.current_config());
-        }
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            #[cfg(target_os = "linux")]
-            self.poll_routes(ui.ctx());
-            self.poll_refresh();
-            if self.refreshing {
-                ui.ctx().request_repaint_after(Duration::from_millis(50)); // pick up the result promptly
-            }
-            // NO periodic rescan. Linux entries exist only while their app is playing, so the list
-            // does go stale — but a scan every 2 s made the Refresh button flicker to "⟳ Refreshing…"
-            // and disable itself every couple of seconds, which reads as the UI fighting you, and it
-            // kept the GUI repainting forever on an idle machine.
-            //
-            // The list is refreshed where it actually matters instead: when you select the per-app
-            // source, when you open the picker (so what you are looking at was just enumerated), and
-            // whenever you press Refresh. That is what the button is for.
-        }
-        let busy = self.starting.load(Ordering::Relaxed);
-        let st = self.status.lock().unwrap().clone();
-        let clients_n = self.clients.load(Ordering::Relaxed);
-        // Once a stream has come up, remember it. The live pill must NOT be inferred from the
-        // transient status string — a failed switch or a "pick first" validation overwrites the
-        // message while the previous stream keeps serving every client.
-        if st.starts_with("Serving") {
-            self.stream_live = true;
-        }
-        let stream_live = self.stream_live;
-        let dirty = self.applied.as_ref() != Some(&self.current_config());
-        let qr = self.qr_texture(ui.ctx()); // built once, then cached
-
-        // Window-geometry diagnostic. "It won't resize any smaller" is otherwise unanswerable without
-        // guessing at DPI: the min size is in LOGICAL pixels while everything egui lays out is in
-        // POINTS (scaled by zoom_factor), so the two are easy to confuse. Logged at debug, once per
-        // distinct size, so `RUST_LOG=newfoundsync=debug` shows exactly where the floor is.
-        {
-            let vp = ui.ctx().input(|i| i.viewport().inner_rect);
-            if let Some(r) = vp {
-                let size = (r.width().round() as i32, r.height().round() as i32);
-                if self.last_logged_size != Some(size) {
-                    self.last_logged_size = Some(size);
-                    tracing::debug!(
-                        win_pts_w = size.0,
-                        win_pts_h = size.1,
-                        zoom = ui.ctx().zoom_factor(),
-                        ppp = ui.ctx().pixels_per_point(),
-                        avail_h_pts = ui.available_height(),
-                        "window geometry (points; multiply by ppp for physical pixels)"
-                    );
-                }
-            }
-        }
-
-        ui.add_space(2.0);
-        // ---- Header band (full width): title + live status pill + zoom ----
-        ui.horizontal(|ui| {
-            ui.heading("Newfoundsync");
-            let (pill, pcol) = if busy {
-                ("Starting…".to_string(), c_accent_hi())
-            } else if stream_live {
-                (format!("Live · {clients_n} listening"), c_ok())
-            } else {
-                ("Stopped".to_string(), c_err())
-            };
-            // Status LED — drawn, not a glyph: egui's bundled font has no "●", so a literal renders
-            // as a tofu box. A painted dot always renders and matches the status colour.
-            let (dot, _) = ui.allocate_exact_size(egui::vec2(13.0, 16.0), egui::Sense::hover());
-            ui.painter().circle_filled(egui::pos2(dot.left() + 6.0, dot.center().y), 4.5, pcol);
-            ui.label(egui::RichText::new(pill).color(pcol).size(12.5).strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Match the web client's header: theme toggle on the LEFT, then just − / + (no
-                // percentage readout/reset). In a right-to-left layout the FIRST widget sits
-                // rightmost, so add +, − (renders left→right as − +), then the toggle LAST (leftmost).
-                // Step ±10% of the baseline; the window opens at UI_ZOOM_BASE and can shrink well
-                // below it (down to 40% of baseline) so users can make it as tiny as they like.
-                let step = UI_ZOOM_BASE * 0.1;
-                if ui.small_button("+").on_hover_text("Bigger UI").clicked() {
-                    let z = ui.ctx().zoom_factor();
-                    ui.ctx().set_zoom_factor((z + step).min(UI_ZOOM_BASE * 2.5));
-                }
-                if ui.small_button("−").on_hover_text("Smaller UI").clicked() {
-                    let z = ui.ctx().zoom_factor();
-                    ui.ctx().set_zoom_factor((z - step).max(UI_ZOOM_BASE * 0.4));
-                }
-                ui.add_space(6.0);
-                theme_toggle(ui); // leftmost — matches the client (toggle, then − +)
-            });
-        });
-        ui.separator();
-        ui.add_space(6.0);
-        // ---- Connect strip (full width): URL plate + QR ----
-        self.ui_connect_strip(ui, &qr);
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
-        // ---- Body: two columns — config rail | clients (shares set just below) ----
-        // Reserve enough for the footer (separator + spacing + one status line) so the columns
-        // don't overdraw it — there's no outer ScrollArea to absorb overflow.
-        let footer_h = 44.0;
-        let body_h = (ui.available_height() - footer_h).max(0.0);
-        let full = ui.available_width();
-        let gap = 12.0;
-        // Column split. The clients card used to get 58% and the config rail 42%, which was backwards
-        // for the actual content: the rail has long wrapping labels ("All apps — recommended (keeps
-        // playing when Windows is muted)") that want the room, while the client rows are fixed-width
-        // widgets (icon + Vol slider + % + Sync slider + ms) whose sliders do NOT stretch — so the
-        // extra width just became empty card. Giving the rail the larger share narrows the clients
-        // block to roughly what it uses and lets the whole window be narrower.
-        let left_w = ((full - gap) * 0.54).max(0.0);
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(left_w, body_h),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    // Config rail in its own scroll area — a safety valve at the min window height.
-                    egui::ScrollArea::vertical()
-                        .id_salt("cfg")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            self.ui_audio_source(ui);
-                            ui.add_space(9.0);
-                            self.ui_video_source(ui);
-                            ui.add_space(9.0);
-                            self.ui_buffer(ui);
-                            ui.add_space(10.0);
-                            self.ui_apply(ui, busy, dirty, clients_n);
-                        });
-                },
-            );
-            ui.add_space(gap);
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), body_h),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    // Clients mixer — the right-hand column (see the split rationale above).
-                    self.ui_clients(ui, clients_n);
-                },
-            );
-        });
-        // ---- Footer band (full width): the tinted status line ----
-        ui.separator();
-        let st = self.status.lock().unwrap().clone();
-        let col = if st.starts_with("Couldn't") || st.starts_with("Pick") {
-            c_err()
-        } else if st.starts_with("Serving") {
-            c_ok()
-        } else if busy || st.starts_with("Starting") {
-            c_accent_hi()
-        } else {
-            c_dim()
-        };
-        // Status on the left, build version pinned to the lower-right corner.
-        //
-        // Right-to-left OUTER with a left-to-right INNER is the egui idiom for "pin one thing to the
-        // right, give the rest to the left": the outer layout places the version first (so it lands on
-        // the right edge), then the inner child receives whatever width is left and fills it normally.
-        // Doing it the other way round — status first, then a right-aligned version — does not work,
-        // because the truncating label below claims the full remaining width and leaves the version
-        // nothing to sit in.
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // The crate version, i.e. what a release tag corresponds to, so a user reporting a bug
-                // can read their build straight off the window. Matches the web client's footer stamp.
-                ui.label(
-                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .monospace()
-                        .size(12.0)
-                        .color(c_dim()),
-                );
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    // Truncate (ellipsize) — a long `Couldn't …` anyhow chain must stay one line, not
-                    // wrap off the bottom of the (non-scrolling) window.
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(st).monospace().size(13.0).color(col),
-                        )
-                        .truncate(),
-                    );
-                });
-            });
-        });
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{dummy_verdict, SERVING_PREFIX};
+    use super::StreamStatus;
     use crate::capture::DUMMY_TAG;
 
-    #[test]
-    fn raises_the_banner_on_a_dummy_serving_line() {
-        let st = format!("{SERVING_PREFIX}auto_null.monitor  {DUMMY_TAG}");
-        assert!(dummy_verdict(false, &st));
+    fn serving(device: &str) -> StreamStatus {
+        StreamStatus { serving: Some(device.to_string()), ..Default::default() }
     }
 
     #[test]
-    fn stays_quiet_for_a_real_device() {
-        let st = format!("{SERVING_PREFIX}alsa_output.pci-0000_00_1f.3.analog-stereo.monitor");
-        assert!(!dummy_verdict(false, &st));
-        // …and a real device CLEARS a previously latched warning (the self-heal / an Apply worked).
-        assert!(!dummy_verdict(true, &st));
+    fn a_dummy_device_is_recognised_and_a_real_one_is_not() {
+        assert!(serving(&format!("auto_null.monitor  {DUMMY_TAG}")).is_dummy());
+        assert!(!serving("alsa_output.pci-0000_00_1f.3.analog-stereo.monitor").is_dummy());
+        assert!(!StreamStatus::default().is_dummy(), "nothing serving yet is not a dummy");
     }
 
     #[test]
-    fn transient_chatter_does_not_blank_a_live_warning() {
-        // The bug this latch exists to prevent: the operator hits Apply, a validation message
-        // overwrites the serving line, and the silence warning vanishes while still true.
-        for chatter in [
-            "Starting…",
-            "Pick an app first, then Apply.",
-            "Couldn't switch: no such device",
-            "⚠ Audio source unavailable (x). Relaying web casts — pick a source and Apply.",
-        ] {
-            assert!(dummy_verdict(true, chatter), "{chatter} wrongly cleared the warning");
-            assert!(!dummy_verdict(false, chatter), "{chatter} wrongly raised the warning");
-        }
+    fn an_error_does_not_hide_what_is_being_served() {
+        // The bug the old single status string had: a failed switch or a validation hint overwrote
+        // the serving line, and the silence warning vanished while it was still true.
+        let mut st = serving(&format!("auto_null.monitor  {DUMMY_TAG}"));
+        st.error = Some("Couldn't switch: no such device".into());
+        st.failures += 1;
+        assert!(st.is_dummy());
+        assert_eq!(st.device_label(), "auto_null.monitor");
     }
 
     #[test]
     fn the_tag_the_banner_matches_is_the_tag_the_capture_layer_emits() {
-        // Guards the cross-platform seam: pulse.rs builds the device string, gui.rs greps it. If
-        // someone edits one literal, `DUMMY_TAG` is the single definition that keeps them agreeing.
+        // Guards the cross-platform seam: pulse.rs builds the device string, the window greps it.
+        // If someone edits one literal, `DUMMY_TAG` is the single definition that keeps them agreeing.
         assert!(DUMMY_TAG.contains("DUMMY OUTPUT"));
-        assert!(format!("{SERVING_PREFIX}auto_null.monitor  {DUMMY_TAG}").contains(DUMMY_TAG));
     }
 }

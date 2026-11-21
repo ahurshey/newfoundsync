@@ -15,3 +15,6 @@ vcpkg_installed/
 /e2e/test-results/
 /e2e/playwright-report/
 /e2e/.playwright/
+
+# Commit stamp for builds that cannot run git (written by flatpak/stamp-git-sha.sh, read by build.rs)
+/.nfs-git-sha

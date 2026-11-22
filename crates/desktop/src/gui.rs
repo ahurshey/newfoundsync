@@ -224,16 +224,24 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
     let stream_rx = state_rx.clone();
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    // Google Cast: the devices found on the network, shared with the web server so a TV's page can be
+    // told which TV it is, and the manager that searches and launches.
+    let cast_devices: crate::cast::CastDirectory = Default::default();
+    let google_cast = crate::cast::CastManager::start(cast_devices.clone());
     {
         let clients = clients.clone();
         let clients_reg = clients_reg.clone();
         let cast = cast.clone();
+        let receiver = webserver::ReceiverListener {
+            addr: SocketAddr::from(([0, 0, 0, 0], crate::cast::receiver_port(port))),
+            cast_devices,
+        };
         std::thread::Builder::new()
             .name("web-server".into())
             .spawn(move || match tokio::runtime::Runtime::new() {
                 Ok(rt) => {
                     if let Err(e) =
-                        rt.block_on(webserver::run(state_rx, clients, clients_reg, cast, addr, true))
+                        rt.block_on(webserver::run(state_rx, clients, clients_reg, cast, addr, true, Some(receiver)))
                     {
                         tracing::error!("web server exited: {e:#}");
                     }
@@ -411,6 +419,11 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         port_msg: String::new(),
         zoom,
         did_initial_zoom: false,
+        google_cast,
+        cast_app_id: crate::settings::get("cast_app_id").and_then(|s| crate::cast::parse_app_id(&s)),
+        cast_app_id_edit: crate::settings::get("cast_app_id").unwrap_or_default(),
+        cast_registered_url: crate::settings::get("cast_receiver_url"),
+        cast_setup_open: crate::settings::get("cast_app_id").is_none(),
     };
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     app.refresh_apps();
@@ -969,6 +982,16 @@ struct ServerApp {
     /// Text size as an egui zoom factor (see [`ZOOM_MIN`]). Saved whenever it changes.
     zoom: f32,
     did_initial_zoom: bool, // applied the saved text size once (first frame)
+    /// Google Cast: searches for TVs and speakers and opens the page on them.
+    google_cast: crate::cast::CastManager,
+    /// The Cast app id from Google's Cast console (saved as `cast_app_id`), and its edit buffer.
+    cast_app_id: Option<String>,
+    cast_app_id_edit: String,
+    /// The receiver address the operator last said is registered in the Cast console (saved as
+    /// `cast_receiver_url`). Compared with the current one so a changed LAN address is pointed out.
+    cast_registered_url: Option<String>,
+    /// Whether the one-time Cast setup is folded open.
+    cast_setup_open: bool,
 }
 
 impl ServerApp {

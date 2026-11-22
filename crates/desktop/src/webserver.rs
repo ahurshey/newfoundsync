@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, RawQuery, State};
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -263,6 +263,11 @@ const MSG_CLIENT_SYNC: u8 = 0x24;
 /// it says — and the client can show "nothing is playing" or "waiting for a cast" instead of
 /// "playing" over silence or "no audio" over a perfectly healthy idle relay.
 const MSG_STREAM_INFO: u8 = 0x26;
+/// Client→server: a Cast page's report on the device it runs on, `[0x27][utf8 JSON]`. Logged and kept
+/// on the client's [`ClientEntry::cast_probe`] for the server window.
+const MSG_CAST_PROBE: u8 = 0x27;
+/// The largest Cast probe report kept. It is a handful of short fields.
+const MAX_CAST_PROBE_BYTES: usize = 2048;
 /// The source is being captured and is carrying only digital silence.
 const INFO_SILENT: u8 = 1;
 /// The source is a web cast and no client holds the cast slot.
@@ -346,6 +351,9 @@ pub type CastState = Arc<Mutex<Option<u64>>>;
 #[derive(Clone)]
 pub struct StreamState {
     pub config_json: String,
+    /// The codec of the frames on `audio_tx` (`"opus"` or `"pcm"`). A TV page that cannot decode Opus
+    /// itself asks for PCM, and this says whether its frames need decoding first.
+    pub audio_codec: &'static str,
     pub audio_tx: broadcast::Sender<Frame>,
     pub video_tx: broadcast::Sender<Frame>,
     /// Present iff the active source is a web-client cast: the relay the serve() task pushes a
@@ -363,6 +371,7 @@ impl StreamState {
     pub fn from_media(media: &Media) -> StreamState {
         StreamState {
             config_json: media.config.to_json(),
+            audio_codec: media.config.audio_codec,
             audio_tx: media.audio_tx.clone(),
             video_tx: media.video_tx.clone(),
             cast_relay: media.cast_relay.clone(),
@@ -407,6 +416,12 @@ pub struct ClientEntry {
     /// it used to be discarded). Non-zero is the objective signal that stuttering is THIS client
     /// falling behind — not the network, and not the browser's decoder.
     pub frames_dropped: Arc<AtomicU64>,
+    /// True for the page a Google Cast device runs (`/cast`): it gets PCM, starts by itself and has no
+    /// controls of its own, so the server window is the only place to set it up.
+    pub is_cast: bool,
+    /// What a Cast page reported about the device it runs on ([`MSG_CAST_PROBE`]): browser version,
+    /// whether sound could start without a tap, output latency. Empty until it reports.
+    pub cast_probe: String,
 }
 
 /// All currently-connected clients, keyed by ephemeral connection id. Shared
@@ -506,6 +521,17 @@ struct AppState {
     next_id: AtomicU64,
     /// The single active caster's conn_id (web-uplink source), or None. Shared with the GUI.
     cast: CastState,
+    /// The Google Cast devices found on the network, by address, so a TV page that connects can be
+    /// told which TV it is running on (`/cast/whoami`).
+    cast_devices: crate::cast::CastDirectory,
+}
+
+/// The second, plain-HTTP listener the Google Cast page is served from. A Cast device cannot accept
+/// the self-signed certificate the main HTTPS port uses, and the page registered in Google's Cast
+/// console is loaded from here.
+pub struct ReceiverListener {
+    pub addr: SocketAddr,
+    pub cast_devices: crate::cast::CastDirectory,
 }
 
 /// Run the web server until shutdown. `stream` carries the active capture/stream
@@ -519,14 +545,17 @@ pub async fn run(
     cast: CastState,
     addr: SocketAddr,
     use_tls: bool,
+    receiver: Option<ReceiverListener>,
 ) -> Result<()> {
     let _ = STARTED_AT.set(std::time::Instant::now()); // for /health uptime
+    let cast_devices = receiver.as_ref().map(|r| r.cast_devices.clone()).unwrap_or_default();
     let state = Arc::new(AppState {
         stream,
         clients,
         clients_reg,
         next_id: AtomicU64::new(1),
         cast,
+        cast_devices,
     });
 
     spawn_stall_watchdog(state.clone());
@@ -546,14 +575,42 @@ pub async fn run(
         .route("/icon-512.png", get(icon_512_png))
         .route("/icon-512-maskable.png", get(icon_512_maskable_png))
         .route("/ws", get(ws_upgrade))
+        .route("/cast", get(cast_page)) // the page a Google Cast device (TV, speaker) runs
+        .route("/cast/whoami", get(cast_whoami))
         .with_state(state);
+
+    // The Cast page's own plain-HTTP port. Its failure to bind is logged, not fatal: everything else
+    // still works, only casting to a TV does not.
+    if let Some(r) = receiver.filter(|r| r.addr.port() != addr.port()) {
+        let app = app.clone();
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(r.addr).await {
+                Ok(listener) => {
+                    tracing::info!(addr = %r.addr, "Google Cast page listening (plain HTTP) at /cast");
+                    if let Err(e) = axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .await
+                    {
+                        tracing::error!("Google Cast page server stopped: {e:#}");
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    addr = %r.addr,
+                    "could not open the port the Google Cast page is served from ({e}); casting to a TV \
+                     will not work until it is free"
+                ),
+            }
+        });
+    }
 
     if !use_tls {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("bind HTTP server on {addr}"))?;
         tracing::warn!(%addr, build = crate::BUILD_ID, "serving plain HTTP — WebCodecs only works via localhost or a TLS proxy");
-        axum::serve(listener, app.into_make_service())
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .context("web server error")?;
         return Ok(());
@@ -574,7 +631,7 @@ pub async fn run(
         addr.port()
     );
     axum_server::bind_rustls(addr, config)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .context("web server error")?;
     Ok(())
@@ -590,6 +647,70 @@ async fn index() -> impl IntoResponse {
         ],
         index_body(),
     )
+}
+
+/// Google's Cast receiver library. Google asks that it is loaded from their CDN, never copied.
+const CAST_RECEIVER_SDK: &str =
+    "https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js";
+
+/// The client page as a Google Cast device runs it: the same page and the same `app.js`, flagged so it
+/// starts by itself, takes PCM (a plain-HTTP page has no WebCodecs) and shows no controls.
+fn cast_page_body(index: &str) -> String {
+    index
+        .replacen("<html lang=\"en\">", "<html lang=\"en\" class=\"cast\">", 1)
+        .replacen(
+            "<head>",
+            &format!("<head>\n<script>window.NFS_CAST = true;</script>\n<script src=\"{CAST_RECEIVER_SDK}\"></script>"),
+            1,
+        )
+}
+
+async fn cast_page() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        cast_page_body(&index_body()),
+    )
+}
+
+/// Which Cast device the asking page runs on, matched by its address against the devices found on the
+/// network: `{"id":"cast-…","name":"Living Room TV"}`. A device that was not found (opened from Google's
+/// test tool before a search, say) still gets a stable id from its address.
+async fn cast_whoami(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let ip = peer.ip().to_canonical();
+    let found = state.cast_devices.lock().ok().and_then(|d| d.get(&ip).cloned());
+    let (id, name) = match found {
+        Some(d) => (crate::cast::client_id(&d.id), d.name),
+        None => (crate::cast::client_id(&ip.to_string()), format!("TV at {ip}")),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        format!("{{\"id\":{},\"name\":{}}}", json_str(&id), json_str(&name)),
+    )
+}
+
+/// `s` as a JSON string literal.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 async fn app_js() -> impl IntoResponse {
@@ -1001,13 +1122,19 @@ async fn icon_512_maskable_png() -> impl IntoResponse {
     png(ICON_512_MASKABLE_PNG)
 }
 
-async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    RawQuery(query): RawQuery,
+) -> impl IntoResponse {
+    // `?cast=1`: the Google Cast page. It has no WebCodecs (plain HTTP), so it is sent PCM.
+    let is_cast = query.as_deref().is_some_and(|q| q.split('&').any(|kv| kv == "cast=1"));
     // Cap WS message/frame size well below tungstenite's 64 MiB default so a malicious/buggy caster
     // can't force huge per-message allocations (each fanned out to every receiver). Above any legit
     // payload (see MAX_UP_* — largest is a 4 MiB video AU).
     ws.max_message_size(8 * 1024 * 1024)
         .max_frame_size(8 * 1024 * 1024)
-        .on_upgrade(move |socket| ws_client(socket, state))
+        .on_upgrade(move |socket| ws_client(socket, state, is_cast))
 }
 
 /// Removes this client from the registry and decrements the connected-client
@@ -1033,7 +1160,7 @@ impl Drop for ClientGuard {
     }
 }
 
-async fn ws_client(socket: WebSocket, state: Arc<AppState>) {
+async fn ws_client(socket: WebSocket, state: Arc<AppState>, is_cast: bool) {
     let n = state.clients.fetch_add(1, Ordering::Relaxed) + 1;
     let conn_id = state.next_id.fetch_add(1, Ordering::Relaxed);
     tracing::info!(conn_id, clients = n, "client connected");
@@ -1055,6 +1182,8 @@ async fn ws_client(socket: WebSocket, state: Arc<AppState>) {
                 identified: false,
                 stream_info: None,
                 frames_dropped: Arc::new(AtomicU64::new(0)),
+                is_cast,
+                cast_probe: String::new(),
             },
         );
     }
@@ -1064,7 +1193,7 @@ async fn ws_client(socket: WebSocket, state: Arc<AppState>) {
         cast: state.cast.clone(),
         conn_id,
     };
-    serve(socket, &state, conn_id, ctrl_rx).await;
+    serve(socket, &state, conn_id, ctrl_rx, is_cast).await;
 }
 
 /// Per-connection sliding ~1 s byte-rate limiter for caster uplinks. Returns true once the caster has
@@ -1146,6 +1275,22 @@ impl Exit {
 
 /// True when `b` is an audio/video frame whose PTS is more than `deadline_ns` in the past at `now_ns`:
 /// every client schedules a frame to play at PTS + its buffer, so by then it is useless to send.
+/// An audio frame `[MSG_AUDIO][pts: 8][opus]` re-encoded as `[MSG_AUDIO][pts: 8][s16le PCM]`, for a
+/// Cast page. A packet that fails to decode becomes a frame of silence at the same timestamp, so the
+/// page's schedule keeps its cadence instead of closing the gap.
+fn opus_frame_to_pcm(dec: &mut newfoundsync_core::codec::Decoder, frame: &[u8]) -> Vec<u8> {
+    if frame.len() < 9 || frame[0] != crate::media::MSG_AUDIO {
+        return frame.to_vec();
+    }
+    let pcm = dec.decode(&frame[9..]).unwrap_or_else(|_| dec.silence());
+    let mut out = Vec::with_capacity(9 + pcm.len() * 2);
+    out.extend_from_slice(&frame[..9]);
+    for s in pcm {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
 fn media_frame_expired(b: &[u8], now_ns: i64, deadline_ns: i64) -> bool {
     use crate::media::{MSG_AUDIO, MSG_VIDEO};
     if b.len() < 9 || (b[0] != MSG_AUDIO && b[0] != MSG_VIDEO) {
@@ -1171,6 +1316,7 @@ async fn serve(
     state: &AppState,
     conn_id: u64,
     mut ctrl_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    is_cast: bool,
 ) {
     let (sender, mut receiver) = socket.split();
 
@@ -1229,9 +1375,28 @@ async fn serve(
         }
     });
 
+    // A Cast page gets PCM (it has no WebCodecs), decoded here from the stream's Opus, and no video
+    // (it could not decode that either, and a TV is here for the sound).
+    let mut pcm_decoder = if is_cast && active.audio_codec == "opus" {
+        match newfoundsync_core::codec::Decoder::new(newfoundsync_core::codec::CodecKind::Opus) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::warn!(conn_id, "Cast page: no Opus decoder ({e:#}); it will hear nothing");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let config_json = if is_cast {
+        active.config_json.replace("\"video\":true", "\"video\":false")
+    } else {
+        active.config_json.clone()
+    };
+
     // Config must be the client's first frame; the queue is empty so it lands immediately.
     if out_tx
-        .send(Message::Text(active.config_json.clone()))
+        .send(Message::Text(config_json))
         .await
         .is_err()
     {
@@ -1332,6 +1497,19 @@ async fn serve(
                         if let Ok(mut reg) = state.clients_reg.lock() {
                             if let Some(e) = reg.get_mut(&conn_id) {
                                 e.reported_trim_ms = Some(ms);
+                            }
+                        }
+                    }
+                    // A Cast page's report on the device it runs on → log it and keep it for the GUI.
+                    Some(Ok(Message::Binary(b))) if b.first() == Some(&MSG_CAST_PROBE) && is_cast => {
+                        let text: String = String::from_utf8_lossy(&b[1..b.len().min(1 + MAX_CAST_PROBE_BYTES)])
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .collect();
+                        tracing::info!(conn_id, report = %text, "Google Cast device report");
+                        if let Ok(mut reg) = state.clients_reg.lock() {
+                            if let Some(e) = reg.get_mut(&conn_id) {
+                                e.cast_probe = text;
                             }
                         }
                     }
@@ -1448,7 +1626,10 @@ async fn serve(
             }
             audio = arx.recv() => {
                 match audio {
-                    Ok(frame) => match out_tx.try_send(Message::Binary((*frame).clone())) {
+                    Ok(frame) => match out_tx.try_send(Message::Binary(match pcm_decoder.as_mut() {
+                        Some(dec) => opus_frame_to_pcm(dec, &frame),
+                        None => (*frame).clone(),
+                    })) {
                         Ok(()) => {}
                         // client behind; drop this frame (like Lagged) — counted, not silent
                         Err(mpsc::error::TrySendError::Full(_)) => { dropped.fetch_add(1, Ordering::Relaxed); }
@@ -1461,7 +1642,7 @@ async fn serve(
                     Err(broadcast::error::RecvError::Closed) => { exit = Exit::SourceSwapped; break }
                 }
             }
-            video = vrx.recv() => {
+            video = vrx.recv(), if !is_cast => {
                 match video {
                     Ok(frame) => match video_tx.try_send(Message::Binary((*frame).clone())) {
                         Ok(()) => {}

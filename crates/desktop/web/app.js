@@ -29,6 +29,68 @@ window.__NFS_APP_BOOT = "__NFS_BUILD__";
 //  - Screen Wake Lock keeps the phone awake; it's auto-released on background and
 //    must be re-acquired on visibilitychange.
 
+// ---- Google Cast mode -------------------------------------------------------------------------
+// The server serves this same page at /cast, on a plain-HTTP port, for a TV or speaker with Google
+// Cast built in, and sets window.NFS_CAST. Nobody is there to tap Start, so it starts by itself, and
+// a plain-HTTP page has no WebCodecs, so the server sends it PCM (`/ws?cast=1`) and these stand-ins
+// for AudioDecoder / EncodedAudioChunk turn that straight into what onAudioData consumes. Everything
+// after decode (clock sync, jitter buffer, scheduling, the rate servo) is the code every other device
+// runs.
+const CAST = window.NFS_CAST === true;
+const NATIVE_AUDIO_DECODER = typeof window.AudioDecoder === "function";
+if (CAST) {
+  class PcmChunk {
+    constructor(init) {
+      this.type = init.type;
+      this.timestamp = init.timestamp;
+      this.data = init.data;
+      this.byteLength = init.data.byteLength;
+    }
+  }
+  class PcmAudioData {
+    constructor(samples, channels, sampleRate, timestamp) {
+      this.samples = samples; // interleaved s16
+      this.numberOfChannels = channels;
+      this.sampleRate = sampleRate;
+      this.numberOfFrames = Math.floor(samples.length / channels);
+      this.timestamp = timestamp;
+      this.format = "s16";
+    }
+    copyTo(dest, opts) {
+      const c = (opts && opts.planeIndex) || 0;
+      const ch = this.numberOfChannels;
+      const s = this.samples;
+      const n = Math.min(this.numberOfFrames, dest.length);
+      for (let i = 0; i < n; i++) dest[i] = s[i * ch + c] / 32768;
+    }
+    close() {}
+  }
+  class PcmDecoder {
+    constructor(init) {
+      this.output = init.output;
+      this.state = "unconfigured";
+      this.decodeQueueSize = 0;
+    }
+    configure(cfg) {
+      this.channels = cfg.numberOfChannels || 2;
+      this.rate = cfg.sampleRate || 48000;
+      this.state = "configured";
+    }
+    decode(chunk) {
+      const d = chunk.data; // s16le at an odd offset in the message, so copy into an aligned buffer
+      const s = new Int16Array(d.byteLength >> 1);
+      new Uint8Array(s.buffer).set(d.subarray(0, s.length * 2));
+      this.output(new PcmAudioData(s, this.channels, this.rate, chunk.timestamp));
+    }
+    flush() { return Promise.resolve(); }
+    reset() {}
+    close() { this.state = "closed"; }
+    static isConfigSupported(config) { return Promise.resolve({ supported: true, config }); }
+  }
+  window.AudioDecoder = PcmDecoder;
+  window.EncodedAudioChunk = PcmChunk;
+}
+
 const MSG_AUDIO = 0x01;
 const MSG_VIDEO = 0x02;
 const MSG_CLOCK_REQ = 0x10;
@@ -181,6 +243,7 @@ let remoteTrimMs = 0; // server-controlled sync offset (SET_TRIM, ms); ADDS to t
 // clearing site data (which also wipes nfs_trim) "fixes". Keep it with the other persisted-state vars.
 let aligned = false; // true once an alignment is established (calibration / manual trim / server push)
 let chosenName = null; // in-memory device name; survives a failed localStorage write this session
+let castIdentity = null; // Cast mode: {id, name} from /cast/whoami — the TV's own id and Google Home name
 // What the server last said about its SOURCE (MSG_STREAM_INFO), which this client cannot work out
 // for itself: frames keep arriving through digital silence, and "no frames" looks the same whether
 // the source died or nobody has pressed Cast yet. bit 0 = the source is silent; bit 1 = the server
@@ -752,7 +815,9 @@ let keepaliveTimer = null;
 let statsTimer = null;
 
 // ---- capability gate (existence only; precise check happens after config) ---
-if (!window.isSecureContext) {
+if (CAST) {
+  // Plain HTTP on purpose, and decoding is done by the server (see the Cast mode notes at the top).
+} else if (!window.isSecureContext) {
   // Plain http:// to a LAN IP is an insecure context, so the browser hides the
   // WebCodecs decoder. The server serves https for exactly this reason.
   showWarn(
@@ -1059,6 +1124,7 @@ function clientIdentity() {
     name = localStorage.getItem("nfs_cname");
   } catch (e) {}
   if (chosenName) name = chosenName; // in-session pick wins (covers a failed storage write)
+  if (CAST && castIdentity) return castIdentity; // the server says which TV this is
   if (!id) {
     id = "c" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
     try { localStorage.setItem("nfs_cid", id); } catch (e) {}
@@ -1095,6 +1161,7 @@ function needsNamePrompt() {
 // chosen name and re-announces it to the server; skipping keeps the random default.
 // Either way we won't ask again on this device.
 function maybePromptName() {
+  if (CAST) return; // a TV is named in the server window; nobody is there to type
   if (!needsNamePrompt() || !els.namemodal) return;
   if (els.namemodal.style.display === "flex") return; // already open — a reconnect mustn't reset typing
   els.nameinput.value = clientIdentity().name;
@@ -1136,7 +1203,7 @@ function connect() {
   teardownConnection(); // ensure a clean slate (no leaked timers/decoders)
   const proto = location.protocol === "https:" ? "wss" : "ws";
   try {
-    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws = new WebSocket(`${proto}://${location.host}/ws${CAST ? "?cast=1" : ""}`);
   } catch (e) {
     scheduleReconnect();
     return;
@@ -3699,6 +3766,77 @@ try { if (localStorage.getItem("nfs_details") === "1") showDetails(true); } catc
 paintVolume();
 paintIdentity();
 paintPanels();
+
+// ---- Google Cast mode: start by itself, and report what this device can do -------------------------
+const MSG_CAST_PROBE = 0x27; // client→server: [0x27][utf8 JSON] — this device's report (Cast mode only)
+function castReceiverStart() {
+  // Google's receiver library. Without start() the device treats the page as a failed launch and
+  // closes it; disableIdleTimeout keeps it open with no media element playing. Absent when the page is
+  // opened in an ordinary browser to try it out — then this is a no-op.
+  try {
+    const fw = window.cast && window.cast.framework;
+    if (!fw) return "absent";
+    const opts = new fw.CastReceiverOptions();
+    opts.disableIdleTimeout = true;
+    opts.skipPlayersLoad = true;
+    fw.CastReceiverContext.getInstance().start(opts);
+    return "started";
+  } catch (e) {
+    return "failed: " + (e && e.message ? e.message : e);
+  }
+}
+function castProbe(receiver, storageBefore) {
+  const lat = (v) => (typeof v === "number" ? Math.round(v * 1000) : null);
+  const m = navigator.userAgent.match(/Chrome\/(\d+)/);
+  return {
+    chrome: m ? Number(m[1]) : null,
+    userAgent: navigator.userAgent,
+    receiver,
+    secureContext: window.isSecureContext,
+    nativeAudioDecoder: NATIVE_AUDIO_DECODER,
+    audioContext: ac ? ac.state : "none",
+    sampleRate: ac ? ac.sampleRate : null,
+    outputLatencyMs: ac ? lat(ac.outputLatency) : null,
+    baseLatencyMs: ac ? lat(ac.baseLatency) : null,
+    storageKept: storageBefore,
+    playing: !!(ac && ac.state === "running" && aPlayable > 0),
+    screen: window.innerWidth + "x" + window.innerHeight,
+  };
+}
+function castSendProbe(p) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const body = new TextEncoder().encode(JSON.stringify(p));
+  const buf = new Uint8Array(1 + body.length);
+  buf[0] = MSG_CAST_PROBE;
+  buf.set(body, 1);
+  try { ws.send(buf); } catch (e) {}
+}
+async function castBoot() {
+  const receiver = castReceiverStart();
+  // Whether this device kept anything from an earlier launch (decides whether the TV may rely on its
+  // own storage at all; the server-side id is what it uses either way).
+  let storageBefore = null;
+  try {
+    storageBefore = localStorage.getItem("nfs_cast_seen") === "1";
+    localStorage.setItem("nfs_cast_seen", "1");
+  } catch (e) {}
+  try {
+    const r = await fetch("/cast/whoami", { cache: "no-store" });
+    if (r.ok) {
+      const who = await r.json();
+      if (who && typeof who.id === "string" && typeof who.name === "string") castIdentity = { id: who.id, name: who.name };
+    }
+  } catch (e) {}
+  paintIdentity();
+  onStart();
+  // Some devices start the context suspended without a gesture; ask once more, then report what
+  // happened either way — the report is how the server window learns whether this TV can play.
+  setTimeout(() => { if (ac && ac.state !== "running") ac.resume().catch(() => {}); }, 1000);
+  const report = () => castSendProbe(castProbe(receiver, storageBefore));
+  setTimeout(report, 6000);
+  setInterval(report, 60000);
+}
+if (CAST) castBoot();
 
 // =============================================================================
 // Readiness stamp — MUST be the last statement in this file.

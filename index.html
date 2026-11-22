@@ -156,7 +156,7 @@
 <section id="app" class="tint">
   <div class="wrap">
     <header class="head">
-      <p class="eyebrow">The server window <span class="tag" data-unreleased>New since 0.1.3</span></p>
+      <p class="eyebrow">The server window <span class="tag">New in 0.1.4</span></p>
       <h2>Laid out around who is listening.</h2>
       <p>The window used to be a setup screen. It is now the thing you leave open: the devices in
       the house take up most of it, and what you are sharing sits in a column on the left.</p>
@@ -199,7 +199,7 @@
 <section id="client">
   <div class="wrap">
     <header class="head">
-      <p class="eyebrow">The page each device opens <span class="tag" data-unreleased>New since 0.1.3</span></p>
+      <p class="eyebrow">The page each device opens <span class="tag">New in 0.1.4</span></p>
       <h2>It says what it is doing, in words.</h2>
       <p>The listening side is a web page served by your own computer. It works in current
       Chrome, Edge and Safari (iOS 17 or later), and can be added to a phone's home screen.</p>
@@ -256,7 +256,7 @@
         <p class="os">Windows · Linux · macOS</p>
       </article>
       <article>
-        <h3>A "Newfoundsync" output device <span class="tag" data-unreleased>New since 0.1.3</span></h3>
+        <h3>A "Newfoundsync" output device <span class="tag">New in 0.1.4</span></h3>
         <p>Tick an app and it is streamed and goes quiet on the computer, so you do not hear it
         once from the desk and again, a moment later, from the room. The ticks are remembered.</p>
         <p class="os">Linux</p>
@@ -294,11 +294,11 @@
         <tbody>
           <tr><th scope="row">Whole-system audio</th><td class="y">Yes</td><td class="y">Yes</td><td class="y">Yes <small>macOS 14.2 or later, no extra driver</small></td></tr>
           <tr><th scope="row">One app's audio</th><td class="y">Yes <small>by app or window</small></td><td class="y">Yes</td><td class="n">No</td></tr>
-          <tr><th scope="row">Output device that silences the app locally</th><td class="n">No</td><td class="y">Yes <small data-unreleased>after 0.1.3</small></td><td class="n">No</td></tr>
+          <tr><th scope="row">Output device that silences the app locally</th><td class="n">No</td><td class="y">Yes <small>new in 0.1.4</small></td><td class="n">No</td></tr>
           <tr><th scope="row">Screen sharing</th><td class="y">Yes <small>whole screen or one window</small></td><td class="y">Yes <small>through the desktop's screen-share prompt</small></td><td class="y">Yes <small>needs the Screen Recording permission</small></td></tr>
           <tr><th scope="row">AV1 encoding on the GPU</th><td class="y">Yes <small>where the GPU has an AV1 encoder</small></td><td class="y">Yes <small>Intel Arc and newer, AMD RX 7000 and newer, NVIDIA RTX 40 and newer</small></td><td class="n">No <small>encodes on the CPU</small></td></tr>
           <tr><th scope="row">Video on the CPU</th><td class="y">AV1, VP9</td><td class="y">AV1, VP9</td><td class="y">AV1, VP9</td></tr>
-          <tr><th scope="row">Newest build</th><td data-ver="windows">0.1.3</td><td data-ver="linux">0.1.3</td><td data-ver="mac">0.0.10</td></tr>
+          <tr><th scope="row">Newest build</th><td data-ver="windows">0.1.3</td><td data-ver="linux">0.1.4</td><td data-ver="mac">0.0.10</td></tr>
         </tbody>
       </table>
     </div>
@@ -350,11 +350,6 @@
       <h2>Install it on the computer that plays the music.</h2>
       <p>Only that one. Everything else just needs a browser.</p>
     </header>
-    <p class="notice" data-unreleased>
-      <b>The screenshots are one step ahead of the downloads.</b> The rebuilt server window,
-      the new device page and the Linux output device were finished after version 0.1.3. They
-      are in the source today and will be in the next release.
-    </p>
     <div class="downloads" id="dl-cards">
       <article data-os="windows">
         <h3>Windows</h3>
@@ -362,21 +357,24 @@
         <a class="btn btn-primary" data-dl="windows" href="https://github.com/ahurshey/newfoundsync/releases/download/0.1.3/Newfoundsync-0.1.3-windows-x64.exe">Download .exe</a>
         <p class="how">A single program, with no installer. Windows may warn about an
         unrecognised app the first time you run it.</p>
+        <p class="how old" data-older="windows">Older than 0.1.4, so it does not have the server
+        window and device page pictured above yet.</p>
       </article>
       <article data-os="linux">
         <h3>Linux</h3>
-        <p class="ver"><span data-ver="linux">0.1.3</span> · x86-64 Flatpak · <span data-size="linux">19 MB</span></p>
-        <a class="btn btn-primary" data-dl="linux" href="https://github.com/ahurshey/newfoundsync/releases/download/0.1.3/Newfoundsync-0.1.3.flatpak">Download .flatpak</a>
+        <p class="ver"><span data-ver="linux">0.1.4</span> · x86-64 Flatpak · <span data-size="linux">20 MB</span></p>
+        <a class="btn btn-primary" data-dl="linux" href="https://github.com/ahurshey/newfoundsync/releases/download/0.1.4/Newfoundsync-0.1.4.flatpak">Download .flatpak</a>
         <p class="how">Open the file with your software centre, or install it from a terminal:</p>
-        <pre><code>flatpak install --user <span data-file="linux">Newfoundsync-0.1.3.flatpak</span></code></pre>
+        <pre><code>flatpak install --user <span data-file="linux">Newfoundsync-0.1.4.flatpak</span></code></pre>
       </article>
       <article data-os="mac">
         <h3>macOS</h3>
         <p class="ver"><span data-ver="mac">0.0.10</span> · Apple Silicon · <span data-size="mac">12 MB</span></p>
         <a class="btn btn-primary" data-dl="mac" href="https://github.com/ahurshey/newfoundsync/releases/download/0.0.10/Newfoundsync-0.0.10-arm64.pkg">Download .pkg</a>
-        <p class="how" data-mac-lag>The Mac build is older than the other two. It is not
-        signed, so right-click the file and choose Open. Screen sharing and sound capture need
-        the Screen &amp; System Audio Recording permission.</p>
+        <p class="how">It is not signed, so right-click the file and choose Open. Screen
+        sharing and sound capture need the Screen &amp; System Audio Recording permission.</p>
+        <p class="how old" data-older="mac">Older than 0.1.4, so it does not have the server
+        window and device page pictured above yet.</p>
       </article>
     </div>
     <p class="more-dl">

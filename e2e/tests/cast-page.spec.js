@@ -66,3 +66,18 @@ test('the ordinary page is untouched by the Cast mode', async ({ page }) => {
   const native = await page.evaluate(() => typeof AudioDecoder !== 'function' || String(AudioDecoder).includes('[native code]'));
   expect(native, 'the real WebCodecs AudioDecoder, not the PCM stand-in').toBeTruthy();
 });
+
+test('the Android TV app finds the server and opens the page as itself', async ({ page, baseURL }) => {
+  const hello = await page.request.get(`${castBase(baseURL)}/hello`);
+  expect(hello.ok()).toBeTruthy();
+  const h = await hello.json();
+  expect(h.app).toBe('newfoundsync');
+  expect(typeof h.name).toBe('string');
+
+  let castLibrary = false;
+  page.on('request', (r) => { if (r.url().includes('cast_receiver_framework')) castLibrary = true; });
+  await page.goto(`${castBase(baseURL)}/cast?app=1&id=tv-e2e0001&name=Den%20TV`);
+  await expect(page.locator('#devline')).toContainText('Den TV');
+  await expect(page.locator('#state')).not.toHaveText('idle', { timeout: 10_000 });
+  expect(castLibrary, 'the app page must not load Google\'s Cast library').toBe(false);
+});

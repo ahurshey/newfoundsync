@@ -3812,7 +3812,11 @@ function castSendProbe(p) {
   try { ws.send(buf); } catch (e) {}
 }
 async function castBoot() {
-  const receiver = castReceiverStart();
+  // Opened by the Newfoundsync Android TV app: it says who it is, and there is no Cast receiver.
+  const tvApp = window.NFS_APP && typeof window.NFS_APP.id === "string" && typeof window.NFS_APP.name === "string"
+    ? { id: window.NFS_APP.id, name: window.NFS_APP.name }
+    : null;
+  const receiver = tvApp ? "android-tv-app" : castReceiverStart();
   // Whether this device kept anything from an earlier launch (decides whether the TV may rely on its
   // own storage at all; the server-side id is what it uses either way).
   let storageBefore = null;
@@ -3820,7 +3824,8 @@ async function castBoot() {
     storageBefore = localStorage.getItem("nfs_cast_seen") === "1";
     localStorage.setItem("nfs_cast_seen", "1");
   } catch (e) {}
-  try {
+  if (tvApp) castIdentity = tvApp;
+  else try {
     const r = await fetch("/cast/whoami", { cache: "no-store" });
     if (r.ok) {
       const who = await r.json();

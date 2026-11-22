@@ -577,6 +577,7 @@ pub async fn run(
         .route("/ws", get(ws_upgrade))
         .route("/cast", get(cast_page)) // the page a Google Cast device (TV, speaker) runs
         .route("/cast/whoami", get(cast_whoami))
+        .route("/hello", get(hello)) // "is this a Newfoundsync server?" — for the Android TV app's search
         .with_state(state);
 
     // The Cast page's own plain-HTTP port. Its failure to bind is logged, not fatal: everything else
@@ -653,25 +654,106 @@ async fn index() -> impl IntoResponse {
 const CAST_RECEIVER_SDK: &str =
     "https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js";
 
-/// The client page as a Google Cast device runs it: the same page and the same `app.js`, flagged so it
-/// starts by itself, takes PCM (a plain-HTTP page has no WebCodecs) and shows no controls.
-fn cast_page_body(index: &str) -> String {
+/// The client page as a TV runs it: the same page and the same `app.js`, flagged so it starts by
+/// itself, takes PCM (a plain-HTTP page has no WebCodecs) and shows no controls.
+///
+/// `app` is set when the Newfoundsync Android TV app opened it (`/cast?app=1&id=…&name=…`): the app
+/// says who it is, so the page skips Google's Cast library (useless outside a Cast device) and the
+/// `/cast/whoami` lookup. Otherwise it is a Google Cast device and loads Google's receiver library.
+fn cast_page_body(index: &str, app: Option<(&str, &str)>) -> String {
+    let head = match app {
+        Some((id, name)) => format!(
+            "<head>\n<script>window.NFS_CAST = true; window.NFS_APP = {{\"id\":{},\"name\":{}}};</script>",
+            script_safe(&json_str(id)),
+            script_safe(&json_str(name))
+        ),
+        None => format!("<head>\n<script>window.NFS_CAST = true;</script>\n<script src=\"{CAST_RECEIVER_SDK}\"></script>"),
+    };
     index
         .replacen("<html lang=\"en\">", "<html lang=\"en\" class=\"cast\">", 1)
-        .replacen(
-            "<head>",
-            &format!("<head>\n<script>window.NFS_CAST = true;</script>\n<script src=\"{CAST_RECEIVER_SDK}\"></script>"),
-            1,
-        )
+        .replacen("<head>", &head, 1)
 }
 
-async fn cast_page() -> impl IntoResponse {
+/// A JSON literal made safe to sit inside an inline `<script>`: a `<` can never start `</script>`.
+fn script_safe(json: &str) -> String {
+    json.replace('<', "\\u003c")
+}
+
+/// The `app`, `id` and `name` query parameters of an Android TV app's request, if it is one. The id
+/// must be a plain token a settings key accepts, and the name is cut to 64 characters.
+fn tv_app_params(query: Option<&str>) -> Option<(String, String)> {
+    let q = query?;
+    let mut app = false;
+    let (mut id, mut name) = (None, None);
+    for kv in q.split('&') {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        match k {
+            "app" => app = v == "1",
+            "id" => id = Some(percent_decode(v)),
+            "name" => name = Some(percent_decode(v)),
+            _ => {}
+        }
+    }
+    let id = id.filter(|i| app && crate::settings::device_id_ok(i))?;
+    let name: String = name.unwrap_or_default().chars().filter(|c| !c.is_control()).take(64).collect();
+    let name = if name.trim().is_empty() { "Android TV".to_string() } else { name };
+    Some((id, name))
+}
+
+/// `application/x-www-form-urlencoded` decoding (`+` is a space, `%XX` a byte), lossy on bad UTF-8.
+fn percent_decode(s: &str) -> String {
+    fn hex(c: u8) -> Option<u8> {
+        (c as char).to_digit(16).map(|d| d as u8)
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => match (hex(b[i + 1]), hex(b[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push(h << 4 | l);
+                    i += 2;
+                }
+                _ => out.push(b'%'),
+            },
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+async fn cast_page(RawQuery(query): RawQuery) -> impl IntoResponse {
+    let app = tv_app_params(query.as_deref());
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        cast_page_body(&index_body()),
+        cast_page_body(&index_body(), app.as_ref().map(|(i, n)| (i.as_str(), n.as_str()))),
+    )
+}
+
+/// `{"app":"newfoundsync","name":"Office PC","version":"0.1.4"}` — how the Android TV app recognises
+/// a Newfoundsync server among whatever else answers on the port while it searches the network.
+async fn hello(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let config = state.stream.borrow().config_json.clone();
+    let name = serde_json::from_str::<serde_json::Value>(&config)
+        .ok()
+        .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    (
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        format!(
+            "{{\"app\":\"newfoundsync\",\"name\":{},\"version\":{}}}",
+            json_str(&name),
+            json_str(APP_VERSION)
+        ),
     )
 }
 
@@ -1682,6 +1764,34 @@ async fn serve(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tv_app_params_are_read_and_checked() {
+        let p = super::tv_app_params(Some("app=1&id=tv-0a1b2c&name=Living+Room%20TV")).unwrap();
+        assert_eq!(p, ("tv-0a1b2c".to_string(), "Living Room TV".to_string()));
+        assert!(super::tv_app_params(Some("id=tv-0a1b2c&name=x")).is_none(), "not the app");
+        assert!(super::tv_app_params(Some("app=1&id=../../etc&name=x")).is_none(), "id is not a plain token");
+        assert_eq!(super::tv_app_params(Some("app=1&id=tv-1")).unwrap().1, "Android TV");
+        assert!(super::tv_app_params(None).is_none());
+    }
+
+    #[test]
+    fn percent_decoding() {
+        assert_eq!(super::percent_decode("a%20b+c"), "a b c");
+        assert_eq!(super::percent_decode("caf%C3%A9"), "café");
+        assert_eq!(super::percent_decode("100%"), "100%");
+        assert_eq!(super::percent_decode("%zz"), "%zz");
+    }
+
+    #[test]
+    fn app_page_cannot_break_out_of_its_script() {
+        let page = super::cast_page_body("<html lang=\"en\"><head></head>", Some(("tv-1", "</script><b>")));
+        assert!(!page.contains("</script><b>"));
+        assert!(page.contains("window.NFS_APP"));
+        assert!(!page.contains("cast_receiver_framework"), "the app does not load Google's Cast library");
+        let cast = super::cast_page_body("<html lang=\"en\"><head></head>", None);
+        assert!(cast.contains("cast_receiver_framework"));
+    }
+
     use super::*;
     use crate::media::{MSG_AUDIO, MSG_VIDEO};
 

@@ -18,3 +18,6 @@ vcpkg_installed/
 
 # Commit stamp for builds that cannot run git (written by flatpak/stamp-git-sha.sh, read by build.rs)
 /.nfs-git-sha
+
+# Android TV app build output (android/build.sh)
+/android/build/

@@ -37,11 +37,11 @@
   // ---- download links follow the newest release -----------------------------------------------
   // The links in the HTML point at the release that was current when the page was written, so they
   // work with no script and when GitHub's API is unreachable. This replaces them with the newest
-  // release that has a build for each system, and takes down the "new since 0.1.3" notes once a
-  // later release exists.
+  // release that has a build for each system. A build older than FEATURES_SINCE keeps a note saying
+  // it does not have what the screenshots show; the note goes once that system catches up.
   var REPO = "ahurshey/newfoundsync";
   var ASSET_PREFIX = "https://github.com/" + REPO + "/releases/download/";
-  var UNRELEASED_AFTER = "0.1.3";
+  var FEATURES_SINCE = "0.1.4";
   var match = { windows: /\.exe$/i, linux: /\.flatpak$/i, mac: /\.pkg$/i };
 
   function cmpVersion(a, b) {
@@ -58,7 +58,6 @@
     var rels = list.filter(function (r) { return r && !r.draft && !r.prerelease && r.tag_name; })
                    .sort(function (a, b) { return cmpVersion(b.tag_name, a.tag_name); });
     if (!rels.length) return;
-    var newest = rels[0].tag_name.replace(/^v/, "");
     Object.keys(match).forEach(function (key) {
       for (var i = 0; i < rels.length; i++) {
         var asset = (rels[i].assets || []).filter(function (a) {
@@ -70,15 +69,10 @@
         setText('[data-ver="' + key + '"]', ver);
         setText('[data-size="' + key + '"]', Math.round(asset.size / 1e6) + " MB");
         setText('[data-file="' + key + '"]', asset.name);
-        if (key === "mac" && ver === newest) {
-          $$("[data-mac-lag]").forEach(function (el) {
-            el.textContent = el.textContent.replace("The Mac build is older than the other two. ", "");
-          });
-        }
+        $$('[data-older="' + key + '"]').forEach(function (el) { el.hidden = cmpVersion(ver, FEATURES_SINCE) >= 0; });
         break;
       }
     });
-    if (cmpVersion(newest, UNRELEASED_AFTER) > 0) $$("[data-unreleased]").forEach(function (el) { el.hidden = true; });
   }
   if (window.fetch) {
     fetch("https://api.github.com/repos/" + REPO + "/releases?per_page=20", { headers: { Accept: "application/vnd.github+json" } })

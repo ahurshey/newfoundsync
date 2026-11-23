@@ -142,6 +142,9 @@ impl FfmpegAv1Encoder {
             return Ok(());
         }
         let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if let Some(why) = explain_probe_failure(backend, &diagnostic) {
+            bail!("{why}");
+        }
         bail!(
             "FFmpeg {} AV1 probe exited ({}){}",
             backend.describe(),
@@ -440,9 +443,31 @@ fn render_nodes() -> Vec<PathBuf> {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("renderD"))
         })
+        // NVIDIA's driver offers no VA-API encode, so probing its node only ever logs an opaque
+        // "unknown libva error" ahead of the NVENC result that actually matters.
+        .filter(|path| render_node_driver(path).as_deref() != Some("nvidia"))
         .collect::<Vec<_>>();
     nodes.sort();
     nodes
+}
+
+/// The kernel driver behind a DRM node (`amdgpu`, `i915`, `xe`, `nvidia`), from sysfs.
+fn render_node_driver(node: &std::path::Path) -> Option<String> {
+    let name = node.file_name()?.to_str()?;
+    let link = fs::read_link(format!("/sys/class/drm/{name}/device/driver")).ok()?;
+    Some(link.file_name()?.to_str()?.to_string())
+}
+
+/// FFmpeg's diagnostic in plain words where it is a known, final answer rather than a fault.
+fn explain_probe_failure(backend: &HardwareBackend, diagnostic: &str) -> Option<&'static str> {
+    match backend {
+        // NVENC reports this when the GPU has no AV1 encoder: every NVIDIA card before the RTX 40
+        // series (Ada). They encode H.264/HEVC only, which Newfoundsync does not ship.
+        HardwareBackend::Nvenc if diagnostic.contains("Codec not supported") || diagnostic.contains("No capable devices") => {
+            Some("this NVIDIA GPU has no AV1 encoder (NVIDIA added AV1 encoding with the RTX 40 series)")
+        }
+        _ => None,
+    }
 }
 
 /// Blocking pipe writes, on their own thread.

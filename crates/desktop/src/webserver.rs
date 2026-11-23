@@ -1631,8 +1631,9 @@ async fn serve(
                             }
                         }
                     }
-                    // A Cast page's report on the device it runs on → log it and keep it for the GUI.
-                    Some(Ok(Message::Binary(b))) if b.first() == Some(&MSG_CAST_PROBE) && is_cast => {
+                    // A TV page's report on the device it runs on (a Cast device, or the Android TV app
+                    // on either page) → log it and keep it for the GUI. Size-capped and sanitized.
+                    Some(Ok(Message::Binary(b))) if b.first() == Some(&MSG_CAST_PROBE) => {
                         let text: String = String::from_utf8_lossy(&b[1..b.len().min(1 + MAX_CAST_PROBE_BYTES)])
                             .chars()
                             .filter(|c| !c.is_control())

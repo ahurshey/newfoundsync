@@ -1306,6 +1306,7 @@ function flushVideo() {
   vq = [];
   evq = [];
   needDecodeKey = false;
+  resetVideoCadence();
 }
 
 // =============================================================================
@@ -1849,6 +1850,39 @@ function pumpVideo() {
   }
 }
 
+// ---- Video cadence ----------------------------------------------------------------------------------
+// A frame's ideal on-screen time wobbles by a few ms: the source stamps capture times with jitter, and
+// every clock-sync sample nudges the server→local mapping. On a 60 Hz panel a 30 fps picture must
+// change on every 2nd refresh, and a target sitting near the boundary between two refreshes flips
+// between them with that wobble: measured on a Google TV, ~30% of frames came one refresh early or late
+// (17/50 ms instead of 33) — visible judder, worse the bigger the picture. So frame targets ride a
+// steady cadence (the learned frame spacing), following the real timeline only slowly (5% per frame)
+// and resyncing on a genuine jump (more than a frame). On that TV this took off-beat frames from ~31%
+// to ~2%; what is left is the source genuinely skipping a frame, where holding one is right.
+let vSmoothT = null; // last smoothed target (performance.now ms)
+let vSmoothPts = null; // its presentation timestamp (ms)
+let vPtsPeriod = 1000 / 30; // learned spacing between frames (ms)
+function smoothVideoTarget(rawT, ptsMs) {
+  if (vSmoothT === null || vSmoothPts === null) {
+    vSmoothT = rawT;
+    vSmoothPts = ptsMs;
+    return rawT;
+  }
+  const d = ptsMs - vSmoothPts;
+  vSmoothPts = ptsMs;
+  // How many frame slots this step spans (2 when the source skipped one), so a skip neither squeezes
+  // the gap nor inflates the learned spacing.
+  const steps = Math.max(1, Math.round(d / vPtsPeriod));
+  if (d > 8 && d / steps < 100) vPtsPeriod += 0.05 * (d / steps - vPtsPeriod);
+  const expected = vSmoothT + steps * vPtsPeriod;
+  const err = rawT - expected;
+  vSmoothT = d <= 0 || Math.abs(err) > vPtsPeriod ? rawT : expected + 0.05 * err;
+  return vSmoothT;
+}
+function resetVideoCadence() {
+  vSmoothT = vSmoothPts = null;
+}
+
 function onVideoFrame(frame) {
   vFrames++;
   // Only a SUSTAINED run of good frames clears the failure streak. A single good frame
@@ -1862,7 +1896,7 @@ function onVideoFrame(frame) {
     frame.close();
     return;
   }
-  vq.push({ frame, targetPerf: videoPresentMs(frame.timestamp * 1000) });
+  vq.push({ frame, targetPerf: smoothVideoTarget(videoPresentMs(frame.timestamp * 1000), frame.timestamp / 1000) });
   // Overflow guard (rare — pumpVideo already gates on MAX_DECODED). Drop a doomed past-due frame
   // first, else the farthest-FUTURE one — never the imminent frame, which would be a guaranteed skip.
   while (vq.length > MAX_DECODED) {
@@ -1892,15 +1926,23 @@ function videoStep(nowTs) {
   if (vq[0].targetPerf > nextVsync + half) return; // head not due at the next refresh → HOLD (no redraw)
   // Head is due: drain every frame due by the next refresh (catch-up after a stall) and keep only the
   // newest — it best matches this vsync. The +half hysteresis keeps the choice stable frame-to-frame.
-  let due = null;
+  let due = vq.shift().frame;
   while (vq.length && vq[0].targetPerf <= nextVsync + half) {
-    if (due) due.close();
+    due.close();
     due = vq.shift().frame;
   }
-  if (!due) return;
-  if (els.canvas.width !== due.displayWidth || els.canvas.height !== due.displayHeight) {
-    els.canvas.width = due.displayWidth;
-    els.canvas.height = due.displayHeight;
+  // The canvas is the picture's size, except in the TV app, where it is capped at the screen's own
+  // pixels: a 2966-wide desktop on a 1920-wide TV would otherwise be drawn at full size and then
+  // scaled down again by the compositor every frame, ~2.4x the pixels for nothing.
+  let cw = due.displayWidth, ch = due.displayHeight;
+  if (TV_APP) {
+    const fit = Math.min(1, (screen.width * devicePixelRatio) / cw, (screen.height * devicePixelRatio) / ch);
+    cw = Math.max(1, Math.round(cw * fit));
+    ch = Math.max(1, Math.round(ch * fit));
+  }
+  if (els.canvas.width !== cw || els.canvas.height !== ch) {
+    els.canvas.width = cw;
+    els.canvas.height = ch;
     // Give the STAGE the picture's own shape. The box was hard-coded to 16/9, so an ultrawide
     // desktop sat letterboxed inside it with black bars top and bottom even though the frame itself
     // was correct — and on a 21:9 source that wastes a third of the width you are watching on.
@@ -1912,7 +1954,7 @@ function videoStep(nowTs) {
   }
   if (els.vlogo.style.display !== "none") { els.vlogo.style.display = "none"; vizStop(); } // real video → swap logo for the stage
   els.stage.style.display = "block";
-  ctx2d.drawImage(due, 0, 0);
+  ctx2d.drawImage(due, 0, 0, cw, ch);
   due.close();
 }
 

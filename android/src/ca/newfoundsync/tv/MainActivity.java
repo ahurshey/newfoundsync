@@ -123,6 +123,9 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        // Lets the page be inspected from a PC over adb (chrome://inspect). Only reachable through
+        // adb, which already has full control of the TV, so it opens nothing new.
+        WebView.setWebContentsDebuggingEnabled(true);
         prefs = getSharedPreferences("newfoundsync", MODE_PRIVATE);
         buildSearchScreen();
         setContentView(root);

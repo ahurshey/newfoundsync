@@ -4,15 +4,22 @@ A small app for the TV: open it with the remote and it finds the Newfoundsync se
 and plays in sync, full screen, with the logo and visualizer. The TV then shows up in the server
 window's Devices list like any other device (volume, mute, sync, remembered by name).
 
-It is a thin shell: a full-screen WebView on the server's TV page (`http://<server>:47001/cast`, the
-same page a Google Cast device runs), so all the sync logic is the code every other device runs. No
-Google Cast registration is involved.
+It is a thin shell: a full-screen WebView on the server's own page, so all the sync logic is the code
+every other device runs. No Google Cast registration is involved.
+
+- **Sound and video:** it opens the HTTPS page (`https://<server>:47000/?app=1…`), where the WebView
+  has WebCodecs. Video, when the server shares a screen or a phone casts a tab, fills the screen;
+  otherwise the logo and visualizer show. The server's certificate is self-signed, and the app
+  accepts it only when its SHA-256 matches the `certSha256` the server reports in `/hello`.
+- **Fallback, sound only:** if that page cannot load, the plain-HTTP TV page
+  (`http://<server>:47001/cast?app=1…`, the one a Google Cast device runs), which the server feeds
+  PCM. The HTTPS page also sends itself there if the WebView turns out to have no WebCodecs.
 
 ## Finding the server
 
 1. The server it played from last time, if it still answers.
 2. Otherwise every address in the TV's /24 on port 47001, asking `GET /hello` for
-   `{"app":"newfoundsync", …}`. One found: it connects. Several: a list to choose from. None: a box
+   `{"app":"newfoundsync","name":…,"httpsPort":47000,"certSha256":…}`. One found: it connects. Several: a list to choose from. None: a box
    for the PC's address.
 
 It does not use mDNS, because many home networks drop multicast between wired and wireless devices.

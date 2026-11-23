@@ -37,6 +37,10 @@ window.__NFS_APP_BOOT = "__NFS_BUILD__";
 // after decode (clock sync, jitter buffer, scheduling, the rate servo) is the code every other device
 // runs.
 const CAST = window.NFS_CAST === true;
+// The Newfoundsync Android TV app opening the main HTTPS page (`/?app=1&id=…&name=…`): hands-free like
+// the Cast page, but a secure context, so it decodes with WebCodecs and plays video too, full screen.
+const TV_APP = !CAST && !!window.NFS_TV && typeof window.NFS_TV.id === "string" && typeof window.NFS_TV.name === "string";
+const HANDS_FREE = CAST || TV_APP; // starts by itself, no controls, named by the server or the app
 const NATIVE_AUDIO_DECODER = typeof window.AudioDecoder === "function";
 if (CAST) {
   class PcmChunk {
@@ -1124,7 +1128,7 @@ function clientIdentity() {
     name = localStorage.getItem("nfs_cname");
   } catch (e) {}
   if (chosenName) name = chosenName; // in-session pick wins (covers a failed storage write)
-  if (CAST && castIdentity) return castIdentity; // the server says which TV this is
+  if (HANDS_FREE && castIdentity) return castIdentity; // the server (or the TV app) says which TV this is
   if (!id) {
     id = "c" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
     try { localStorage.setItem("nfs_cid", id); } catch (e) {}
@@ -1161,7 +1165,7 @@ function needsNamePrompt() {
 // chosen name and re-announces it to the server; skipping keeps the random default.
 // Either way we won't ask again on this device.
 function maybePromptName() {
-  if (CAST) return; // a TV is named in the server window; nobody is there to type
+  if (HANDS_FREE) return; // a TV is named in the server window; nobody is there to type
   if (!needsNamePrompt() || !els.namemodal) return;
   if (els.namemodal.style.display === "flex") return; // already open — a reconnect mustn't reset typing
   els.nameinput.value = clientIdentity().name;
@@ -3813,10 +3817,19 @@ function castSendProbe(p) {
 }
 async function castBoot() {
   // Opened by the Newfoundsync Android TV app: it says who it is, and there is no Cast receiver.
-  const tvApp = window.NFS_APP && typeof window.NFS_APP.id === "string" && typeof window.NFS_APP.name === "string"
-    ? { id: window.NFS_APP.id, name: window.NFS_APP.name }
+  // NFS_TV is the HTTPS page (WebCodecs, video); NFS_APP the plain-HTTP fallback (PCM, audio only).
+  const fromApp = TV_APP ? window.NFS_TV : window.NFS_APP;
+  const tvApp = fromApp && typeof fromApp.id === "string" && typeof fromApp.name === "string"
+    ? { id: fromApp.id, name: fromApp.name }
     : null;
-  const receiver = tvApp ? "android-tv-app" : castReceiverStart();
+  if (TV_APP && (!window.isSecureContext || !NATIVE_AUDIO_DECODER || !window.AudioContext)) {
+    // No WebCodecs after all (an old WebView): go to the audio-only TV page on the plain-HTTP port
+    // (this port + 1), which the server feeds PCM.
+    const port = Number(location.port || 443) + 1;
+    location.replace(`http://${location.hostname}:${port}/cast?app=1&id=${encodeURIComponent(tvApp.id)}&name=${encodeURIComponent(tvApp.name)}`);
+    return;
+  }
+  const receiver = TV_APP ? "android-tv-app (video)" : tvApp ? "android-tv-app (audio only)" : castReceiverStart();
   // Whether this device kept anything from an earlier launch (decides whether the TV may rely on its
   // own storage at all; the server-side id is what it uses either way).
   let storageBefore = null;
@@ -3841,7 +3854,7 @@ async function castBoot() {
   setTimeout(report, 6000);
   setInterval(report, 60000);
 }
-if (CAST) castBoot();
+if (HANDS_FREE) castBoot();
 
 // =============================================================================
 // Readiness stamp — MUST be the last statement in this file.

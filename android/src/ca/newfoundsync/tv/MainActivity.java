@@ -8,6 +8,8 @@ import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.net.http.SslCertificate;
+import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -21,6 +23,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
+import android.webkit.SslErrorHandler;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
@@ -43,6 +46,7 @@ import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.net.URL;
 import java.net.URLEncoder;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -57,10 +61,15 @@ import java.util.concurrent.TimeUnit;
 /**
  * Newfoundsync for Android TV / Google TV.
  *
- * <p>Finds the Newfoundsync server on the network and plays its TV page full screen: the same page a
- * Google Cast device runs ({@code http://<server>:47001/cast}), which starts by itself, takes PCM
- * from the server and joins the sync like every other device. All the sync logic lives in that page,
+ * <p>Finds the Newfoundsync server on the network and plays its page full screen, hands-free: it
+ * starts by itself and joins the sync like every other device. All the sync logic lives in that page,
  * so this app is only the search and a WebView.
+ *
+ * <p>It opens the server's HTTPS page ({@code https://<server>:47000/?app=1…}), where the WebView
+ * has WebCodecs and so plays video as well as sound. The server's certificate is self-signed; it is
+ * accepted only when its SHA-256 matches the fingerprint the server reported in {@code /hello}. If
+ * that page cannot load, the app falls back to the plain-HTTP TV page ({@code :47001/cast}), which
+ * the server feeds PCM: sound only, but nothing to go wrong.
  *
  * <p>The search tries the last server first, then every address in this TV's /24 on the TV page's
  * port, asking {@code /hello} whether it is a Newfoundsync server. It does not rely on mDNS: many home
@@ -93,10 +102,20 @@ public class MainActivity extends Activity {
     static final class Server {
         final String host;
         final String name;
+        /** The HTTPS port and the SHA-256 (hex) of its certificate; 0 / null when it has none. */
+        final int httpsPort;
+        final String certSha256;
 
-        Server(String host, String name) {
+        Server(String host, String name, int httpsPort, String certSha256) {
             this.host = host;
             this.name = name;
+            this.httpsPort = httpsPort;
+            this.certSha256 = certSha256;
+        }
+
+        String address() {
+            int colon = host.indexOf(':');
+            return colon < 0 ? host : host.substring(0, colon);
         }
     }
 
@@ -244,29 +263,70 @@ public class MainActivity extends Activity {
         ++generation;
         prefs.edit().putString("server", s.host).apply();
         panel.setVisibility(View.GONE);
+        boolean video = s.certSha256 != null && s.httpsPort > 0;
+        load(s, video);
+    }
 
+    /** Show the server's page: the HTTPS one with video, or the plain-HTTP sound-only one. */
+    private void load(Server s, boolean video) {
+        if (web != null) {
+            root.removeView(web);
+            web.destroy();
+        }
         web = new WebView(this);
         web.setBackgroundColor(BG);
         WebSettings ws = web.getSettings();
         ws.setJavaScriptEnabled(true);
         ws.setDomStorageEnabled(true);
         ws.setMediaPlaybackRequiresUserGesture(false); // nobody is there to tap Start
-        final String serverName = s.name;
         web.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError err) {
+                // The server's own self-signed certificate, and only that one.
+                if (video && s.certSha256.equals(sha256(err.getCertificate()))) {
+                    handler.proceed();
+                } else {
+                    handler.cancel();
+                    if (video) ui.post(() -> load(s, false));
+                }
+            }
+
             @Override
             public void onReceivedError(WebView view, WebResourceRequest req, WebResourceError err) {
                 if (!req.isForMainFrame()) return;
-                // The page itself rides out a server restart once loaded; this is the page not loading.
                 ui.post(() -> {
-                    showSearchScreen("Lost " + serverName + ". Looking again…");
-                    ui.postDelayed(MainActivity.this::search, 3000);
+                    if (video) {
+                        load(s, false); // the video page would not load: sound only is better than nothing
+                    } else {
+                        // The page itself rides out a server restart once loaded; this is it not loading.
+                        showSearchScreen("Lost " + s.name + ". Looking again…");
+                        ui.postDelayed(MainActivity.this::search, 3000);
+                    }
                 });
             }
         });
         root.addView(web, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        web.loadUrl("http://" + withPort(s.host) + "/cast?app=1&id=" + enc(deviceId()) + "&name=" + enc(deviceName()));
+        String who = "app=1&id=" + enc(deviceId()) + "&name=" + enc(deviceName());
+        web.loadUrl(video
+                ? "https://" + s.address() + ":" + s.httpsPort + "/?" + who
+                : "http://" + withPort(s.host) + "/cast?" + who);
         web.requestFocus();
+    }
+
+    /** SHA-256 (lower-case hex) of a certificate's DER encoding, or "" if it cannot be read. */
+    private static String sha256(SslCertificate cert) {
+        try {
+            byte[] der = SslCertificate.saveState(cert).getByteArray("x509-certificate");
+            if (der == null) return "";
+            StringBuilder hex = new StringBuilder();
+            for (byte b : MessageDigest.getInstance("SHA-256").digest(der)) {
+                hex.append(String.format(Locale.ROOT, "%02x", b));
+            }
+            return hex.toString();
+        } catch (Exception e) {
+            return "";
+        }
     }
 
     @Override
@@ -365,7 +425,9 @@ public class MainActivity extends Activity {
             JSONObject j = new JSONObject(body.toString("UTF-8"));
             if (!"newfoundsync".equals(j.optString("app"))) return null;
             String name = j.optString("name", "").trim();
-            return new Server(host, name.isEmpty() ? "Newfoundsync" : name);
+            String cert = j.isNull("certSha256") ? null : j.optString("certSha256", "").toLowerCase(Locale.ROOT);
+            if (cert != null && !cert.matches("[0-9a-f]{64}")) cert = null;
+            return new Server(host, name.isEmpty() ? "Newfoundsync" : name, j.optInt("httpsPort", 0), cert);
         } catch (Exception e) {
             return null;
         } finally {

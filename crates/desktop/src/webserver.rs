@@ -524,6 +524,12 @@ struct AppState {
     /// The Google Cast devices found on the network, by address, so a TV page that connects can be
     /// told which TV it is running on (`/cast/whoami`).
     cast_devices: crate::cast::CastDirectory,
+    /// The HTTPS port and the SHA-256 of its certificate (lower-case hex, of the DER), both `None`
+    /// when serving plain HTTP. `/hello` reports them so the Android TV app can load the HTTPS page
+    /// (the one with WebCodecs, so video) and accept this server's self-signed certificate, and only
+    /// this one.
+    https_port: Option<u16>,
+    cert_sha256: Option<String>,
 }
 
 /// The second, plain-HTTP listener the Google Cast page is served from. A Cast device cannot accept
@@ -549,6 +555,15 @@ pub async fn run(
 ) -> Result<()> {
     let _ = STARTED_AT.set(std::time::Instant::now()); // for /health uptime
     let cast_devices = receiver.as_ref().map(|r| r.cast_devices.clone()).unwrap_or_default();
+    let tls_pem = if use_tls {
+        // Two crypto providers are compiled in (ring + aws-lc); pick one as the process
+        // default before axum-server builds its ServerConfig.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Some(crate::tls::load_or_create_cert().context("TLS certificate")?)
+    } else {
+        None
+    };
+    let cert_sha256 = tls_pem.as_ref().and_then(|(cert, _)| cert_fingerprint(cert));
     let state = Arc::new(AppState {
         stream,
         clients,
@@ -556,6 +571,8 @@ pub async fn run(
         next_id: AtomicU64::new(1),
         cast,
         cast_devices,
+        https_port: use_tls.then_some(addr.port()),
+        cert_sha256,
     });
 
     spawn_stall_watchdog(state.clone());
@@ -606,7 +623,7 @@ pub async fn run(
         });
     }
 
-    if !use_tls {
+    let Some((cert_pem, key_pem)) = tls_pem else {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("bind HTTP server on {addr}"))?;
@@ -615,12 +632,8 @@ pub async fn run(
             .await
             .context("web server error")?;
         return Ok(());
-    }
+    };
 
-    // Two crypto providers are compiled in (ring + aws-lc); pick one as the process
-    // default before axum-server builds its ServerConfig.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let (cert_pem, key_pem) = crate::tls::load_or_create_cert().context("TLS certificate")?;
     let config = RustlsConfig::from_pem(cert_pem, key_pem)
         .await
         .context("load TLS config")?;
@@ -638,7 +651,17 @@ pub async fn run(
     Ok(())
 }
 
-async fn index() -> impl IntoResponse {
+async fn index(RawQuery(query): RawQuery) -> axum::response::Response {
+    if let Some((id, name)) = tv_app_params(query.as_deref()) {
+        return (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            tv_app_page_body(&index_body(), &id, &name),
+        )
+            .into_response();
+    }
     // no-cache so a rebuilt shell is never masked by browser/proxy heuristic caching
     // (the service worker is network-first, but the very first load predates it).
     (
@@ -648,6 +671,7 @@ async fn index() -> impl IntoResponse {
         ],
         index_body(),
     )
+        .into_response()
 }
 
 /// Google's Cast receiver library. Google asks that it is loaded from their CDN, never copied.
@@ -671,6 +695,20 @@ fn cast_page_body(index: &str, app: Option<(&str, &str)>) -> String {
     };
     index
         .replacen("<html lang=\"en\">", "<html lang=\"en\" class=\"cast\">", 1)
+        .replacen("<head>", &head, 1)
+}
+
+/// The main page as the Android TV app opens it over HTTPS (`/?app=1&id=…&name=…`): hands-free like
+/// the Cast page (starts by itself, no controls, named by the app), but decoding with WebCodecs, so
+/// video plays too, full screen.
+fn tv_app_page_body(index: &str, id: &str, name: &str) -> String {
+    let head = format!(
+        "<head>\n<script>window.NFS_TV = {{\"id\":{},\"name\":{}}};</script>",
+        script_safe(&json_str(id)),
+        script_safe(&json_str(name))
+    );
+    index
+        .replacen("<html lang=\"en\">", "<html lang=\"en\" class=\"cast tv\">", 1)
         .replacen("<head>", &head, 1)
 }
 
@@ -750,9 +788,11 @@ async fn hello(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             (header::CACHE_CONTROL, "no-store"),
         ],
         format!(
-            "{{\"app\":\"newfoundsync\",\"name\":{},\"version\":{}}}",
+            "{{\"app\":\"newfoundsync\",\"name\":{},\"version\":{},\"httpsPort\":{},\"certSha256\":{}}}",
             json_str(&name),
-            json_str(APP_VERSION)
+            json_str(APP_VERSION),
+            state.https_port.map(|p| p.to_string()).unwrap_or_else(|| "null".into()),
+            state.cert_sha256.as_deref().map(json_str).unwrap_or_else(|| "null".into()),
         ),
     )
 }
@@ -777,6 +817,15 @@ async fn cast_whoami(
         ],
         format!("{{\"id\":{},\"name\":{}}}", json_str(&id), json_str(&name)),
     )
+}
+
+/// SHA-256 of the first certificate in `pem`, as lower-case hex: what Android's `SslCertificate`
+/// hashes to when the TV app checks it is talking to this server.
+fn cert_fingerprint(pem: &[u8]) -> Option<String> {
+    use rustls::pki_types::pem::PemObject;
+    let der = rustls::pki_types::CertificateDer::from_pem_slice(pem).ok()?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, der.as_ref());
+    Some(digest.as_ref().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// `s` as a JSON string literal.
@@ -1780,6 +1829,29 @@ mod tests {
         assert_eq!(super::percent_decode("caf%C3%A9"), "café");
         assert_eq!(super::percent_decode("100%"), "100%");
         assert_eq!(super::percent_decode("%zz"), "%zz");
+    }
+
+    #[test]
+    fn cert_fingerprint_is_sha256_hex_of_the_der() {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let fp = super::cert_fingerprint(certified.cert.pem().as_bytes()).unwrap();
+        let want: String = ring::digest::digest(&ring::digest::SHA256, certified.cert.der().as_ref())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(fp, want);
+        assert_eq!(fp.len(), 64);
+        assert!(super::cert_fingerprint(b"not a certificate").is_none());
+    }
+
+    #[test]
+    fn tv_app_page_is_hands_free_with_video() {
+        let page = super::tv_app_page_body("<html lang=\"en\"><head></head>", "tv-1", "Den TV</script>");
+        assert!(page.contains("class=\"cast tv\""));
+        assert!(page.contains("window.NFS_TV"));
+        assert!(!page.contains("NFS_CAST"), "not the PCM page: it decodes with WebCodecs");
+        assert!(!page.contains("Den TV</script>"));
     }
 
     #[test]

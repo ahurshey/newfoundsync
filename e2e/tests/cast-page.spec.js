@@ -81,3 +81,19 @@ test('the Android TV app finds the server and opens the page as itself', async (
   await expect(page.locator('#state')).not.toHaveText('idle', { timeout: 10_000 });
   expect(castLibrary, 'the app page must not load Google\'s Cast library').toBe(false);
 });
+
+test('the Android TV app page on the main port is hands-free but decodes itself (video too)', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'the WebCodecs path is verified on Chromium');
+  const sockets = [];
+  page.on('websocket', (ws) => sockets.push(ws.url()));
+  await page.goto('/?app=1&id=tv-e2e0002&name=Den%20TV');
+  await expect(page.locator('html')).toHaveClass(/\btv\b/);
+  await expect(page.locator('#start')).toBeHidden();
+  await expect(page.locator('#controls')).toBeHidden();
+  await expect(page.locator('#devline')).toContainText('Den TV');
+  await expect(page.locator('#state')).not.toHaveText('idle', { timeout: 10_000 });
+  expect(sockets.length, 'connected').toBeGreaterThan(0);
+  expect(sockets.every((u) => !u.includes('cast=1')), 'not the PCM connection').toBeTruthy();
+  const native = await page.evaluate(() => String(AudioDecoder).includes('[native code]'));
+  expect(native, 'the real WebCodecs decoder, not the PCM stand-in').toBeTruthy();
+});

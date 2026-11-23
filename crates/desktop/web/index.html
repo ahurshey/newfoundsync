@@ -451,6 +451,12 @@ window.__NFS_BUILD = "__NFS_BUILD__";
   html.cast .vstage { width: min(54vh, 60vw); height: min(54vh, 60vw); }
   html.cast .vstage img { width: 66%; height: 66%; }
   html.cast #status { font-size: 1.5em; }
+  /* The Android TV app on the HTTPS page: video, when there is any, fills the screen. app.js shows
+     #stage only while frames arrive, so the logo and visualizer come back by themselves without. */
+  html.tv #stage {
+    position: fixed; inset: 0; width: 100%; height: 100%; max-width: none; aspect-ratio: auto;
+    border: 0; border-radius: 0; box-shadow: none; z-index: 50; background: #000;
+  }
 </style>
 </head>
 <body>

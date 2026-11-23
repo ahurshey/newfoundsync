@@ -2780,6 +2780,7 @@ dependencies = [
  "qrcode",
  "rayon",
  "rcgen",
+ "ring",
  "rustls",
  "screencapturekit",
  "serde_json",

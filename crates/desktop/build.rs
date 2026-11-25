@@ -17,6 +17,7 @@ const BINARY_INPUTS: &[&str] = &[
     "Cargo.toml",       // features / deps
     "../core",          // the workspace's other crate
     "../../Cargo.lock", // dependency versions
+    "../../third_party", // vendored dependencies, compiled from here rather than from crates.io
 ];
 
 /// Where `flatpak/stamp-git-sha.sh` leaves the commit for builds that cannot run git themselves.

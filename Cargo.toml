@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/desktop"]
+# Vendored third-party crates are dependencies, not members: `--workspace` must not build or test them.
+exclude = ["third_party"]
+
+# env-libvpx-sys (the libvpx bindings behind the `vp9` / `vp9-bindgen` features) is archived upstream
+# and pins a bindgen that silently generates broken bindings under libclang 21+. This swaps in a
+# copy whose only change is a newer bindgen. Full story: third_party/env-libvpx-sys/VENDORED.md.
+[patch.crates-io]
+env-libvpx-sys = { path = "third_party/env-libvpx-sys" }
 
 [profile.release]
 opt-level = 3

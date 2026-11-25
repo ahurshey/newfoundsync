@@ -12,9 +12,6 @@
 //! it). `--headless` runs server-only from those flags.
 
 mod capture;
-// Headless has no window to search for or launch on a Cast device from, only the page a TV loads.
-#[cfg_attr(not(feature = "gui"), allow(dead_code, unused_imports))]
-mod cast;
 #[cfg(feature = "gui")]
 mod gui;
 mod media;
@@ -369,13 +366,9 @@ fn run_headless(
     let cast = Arc::new(std::sync::Mutex::new(None));
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let runtime = tokio::runtime::Runtime::new()?;
-    // The Google Cast page's plain-HTTP port. Headless has no window to search for or launch on a TV
-    // from, but a TV opened some other way (Google's test tool) can still play.
-    let receiver = webserver::ReceiverListener {
-        addr: SocketAddr::from(([0, 0, 0, 0], crate::cast::receiver_port(port))),
-        cast_devices: Default::default(),
-    };
-    runtime.block_on(webserver::run(state_rx, clients, clients_reg, cast, addr, use_tls, Some(receiver)))?;
+    // The Android TV app's plain-HTTP port (search + sound-only fallback), next to the main one.
+    let tv_addr = SocketAddr::from(([0, 0, 0, 0], webserver::tv_port(port)));
+    runtime.block_on(webserver::run(state_rx, clients, clients_reg, cast, addr, use_tls, Some(tv_addr)))?;
     Ok(())
 }
 

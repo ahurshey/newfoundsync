@@ -68,7 +68,7 @@ import java.util.concurrent.TimeUnit;
  * <p>It opens the server's HTTPS page ({@code https://<server>:47000/?app=1…}), where the WebView
  * has WebCodecs and so plays video as well as sound. The server's certificate is self-signed; it is
  * accepted only when its SHA-256 matches the fingerprint the server reported in {@code /hello}. If
- * that page cannot load, the app falls back to the plain-HTTP TV page ({@code :47001/cast}), which
+ * that page cannot load, the app falls back to the plain-HTTP sound-only page ({@code :47001/tv}), which
  * the server feeds PCM: sound only, but nothing to go wrong.
  *
  * <p>The search tries the last server first, then every address in this TV's /24 on the TV page's
@@ -313,7 +313,7 @@ public class MainActivity extends Activity {
         String who = "app=1&id=" + enc(deviceId()) + "&name=" + enc(deviceName());
         web.loadUrl(video
                 ? "https://" + s.address() + ":" + s.httpsPort + "/?" + who
-                : "http://" + withPort(s.host) + "/cast?" + who);
+                : "http://" + withPort(s.host) + "/tv?" + who);
         web.requestFocus();
     }
 

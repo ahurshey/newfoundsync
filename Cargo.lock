@@ -2786,7 +2786,6 @@ dependencies = [
  "serde_json",
  "shiguredo_svt_av1",
  "tokio",
- "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "windows",

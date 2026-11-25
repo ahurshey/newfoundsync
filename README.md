@@ -367,38 +367,27 @@ visualizer ring, one line says what the device is doing in plain words: *Playing
 - **More** (in the header) — the device's name, light / dark theme, text size.
 - **Details for a bug report** (in the footer) — the state, clock, buffer and frame counters.
 
-### A TV or speaker with Google Cast
+### Google TV / Android TV app
 
-A TV with Google Cast built in (or a Chromecast) can join without anyone touching it: under **Add a
-device** the server window lists the Cast devices on the network, and **Play here** opens
-Newfoundsync on one. It starts by itself, shows the logo and its visualizer, and plays in sync; its
-volume and sync are set under **Devices** like any other device.
+The TV gets an app of its own (`android/`): open **Newfoundsync** from the TV's apps and it finds the
+server on the network and plays, full screen and in sync, with nothing to tap. Video, when the server
+shares a screen or a phone casts a tab, fills the screen; otherwise the logo and its visualizer show.
+The TV then appears under **Devices** like any other device. It is sideloaded (free); see
+[`android/README.md`](android/README.md) to build and install it.
 
-Google only lets a device open a page like this through a registered Cast app, so there is a one-time
-setup (the window's **Set up** walks through it):
+How it fits together:
 
-1. In the [Google Cast SDK Developer Console](https://cast.google.com/publish) (a one-time US$5
-   developer registration), add a **Custom Receiver** app. Its receiver URL is the address the window
-   shows: `http://<this-pc>:47001/cast` (the HTTPS port plus one, plain HTTP because a Cast device
-   cannot accept the self-signed certificate).
-2. Under **Cast Receiver Devices**, add the TV's serial number. Wait about 15 minutes and restart the
-   TV. (Until the app is published, only registered devices can open it.)
-3. Paste the app's **application ID** into the window and press Save.
-
-Things to know:
-
-- **The receiver URL contains this PC's address.** If the router gives the PC a new one, TVs can no
-  longer open the page; the window says so and shows the new address. A DHCP reservation for the
-  server PC in your router stops it changing.
-- **Play here closes whatever the TV is showing.**
-- **No WebCodecs on the TV page.** It is plain HTTP, so the server decodes Opus to PCM for that one
-  connection (about 1.5 Mbit/s) and sends no video.
-- **Finding devices works even where multicast doesn't.** Besides mDNS, the search tries the Cast
-  port on every address in the PC's /24 and asks what answers for its name, because many home
-  networks drop multicast between wired and wireless devices.
-- The TV page reports what the device can do (browser version, whether sound started without a tap,
-  the output delay it reports), shown under the TV in the window. A TV's own picture processing adds
-  delay the page cannot see, so set its sync by ear once; it is remembered.
+- **A second, plain-HTTP port** next to the HTTPS one (HTTPS port + 1, so `47001` by default). The app
+  finds servers there by asking every address on its /24 for `GET /hello` (no mDNS: many home networks
+  drop multicast between wired and wireless devices). `/hello` also reports the HTTPS port and the
+  SHA-256 of the server's certificate.
+- **The app plays the HTTPS page** (`/?app=1&id=…&name=…`), accepting the self-signed certificate only
+  when it matches that fingerprint, so the TV's WebView has WebCodecs and hardware video decode.
+- **A sound-only fallback** at `/tv?app=1…` on the plain-HTTP port, if the HTTPS page will not load. A
+  plain-HTTP page has no WebCodecs, so the server decodes Opus to PCM for that one connection (about
+  1.5 Mbit/s) and sends no video.
+- A TV's own picture and sound processing adds delay the app cannot see: set its sync by ear once in
+  the server window; it is remembered.
 
 > Clients must be on the same LAN/subnet as the server. Some corporate/guest Wi-Fi isolates
 > wireless devices from each other — if a phone can't reach the server but a wired PC can,

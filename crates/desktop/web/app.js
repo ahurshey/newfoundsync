@@ -29,20 +29,21 @@ window.__NFS_APP_BOOT = "__NFS_BUILD__";
 //  - Screen Wake Lock keeps the phone awake; it's auto-released on background and
 //    must be re-acquired on visibilitychange.
 
-// ---- Google Cast mode -------------------------------------------------------------------------
-// The server serves this same page at /cast, on a plain-HTTP port, for a TV or speaker with Google
-// Cast built in, and sets window.NFS_CAST. Nobody is there to tap Start, so it starts by itself, and
-// a plain-HTTP page has no WebCodecs, so the server sends it PCM (`/ws?cast=1`) and these stand-ins
-// for AudioDecoder / EncodedAudioChunk turn that straight into what onAudioData consumes. Everything
-// after decode (clock sync, jitter buffer, scheduling, the rate servo) is the code every other device
-// runs.
-const CAST = window.NFS_CAST === true;
-// The Newfoundsync Android TV app opening the main HTTPS page (`/?app=1&id=…&name=…`): hands-free like
-// the Cast page, but a secure context, so it decodes with WebCodecs and plays video too, full screen.
-const TV_APP = !CAST && !!window.NFS_TV && typeof window.NFS_TV.id === "string" && typeof window.NFS_TV.name === "string";
-const HANDS_FREE = CAST || TV_APP; // starts by itself, no controls, named by the server or the app
+// ---- Android TV app modes ---------------------------------------------------------------------------
+// The Newfoundsync Android TV app opens this page hands-free: nobody is there to tap Start, so it starts
+// by itself, shows no controls, and takes its name from the app.
+//  - TV_APP: the main HTTPS page (`/?app=1&id=…&name=…`, window.NFS_TV). A secure context, so it decodes
+//    with WebCodecs and plays video too, full screen.
+//  - PCM_PAGE: the sound-only fallback on the plain-HTTP port (`/tv?app=1…`, window.NFS_PCM). A
+//    plain-HTTP page has no WebCodecs, so the server sends it PCM (`/ws?pcm=1`) and these stand-ins for
+//    AudioDecoder / EncodedAudioChunk turn that straight into what onAudioData consumes.
+// Everything after decode (clock sync, jitter buffer, scheduling, the rate servo) is the code every
+// other device runs.
+const PCM_PAGE = window.NFS_PCM === true;
+const TV_APP = !PCM_PAGE && !!window.NFS_TV && typeof window.NFS_TV.id === "string" && typeof window.NFS_TV.name === "string";
+const HANDS_FREE = PCM_PAGE || TV_APP; // starts by itself, no controls, named by the app
 const NATIVE_AUDIO_DECODER = typeof window.AudioDecoder === "function";
-if (CAST) {
+if (PCM_PAGE) {
   class PcmChunk {
     constructor(init) {
       this.type = init.type;
@@ -247,7 +248,7 @@ let remoteTrimMs = 0; // server-controlled sync offset (SET_TRIM, ms); ADDS to t
 // clearing site data (which also wipes nfs_trim) "fixes". Keep it with the other persisted-state vars.
 let aligned = false; // true once an alignment is established (calibration / manual trim / server push)
 let chosenName = null; // in-memory device name; survives a failed localStorage write this session
-let castIdentity = null; // Cast mode: {id, name} from /cast/whoami — the TV's own id and Google Home name
+let appIdentity = null; // Android TV app: {id, name} the app passed — a stable id kept on the TV and its name
 // What the server last said about its SOURCE (MSG_STREAM_INFO), which this client cannot work out
 // for itself: frames keep arriving through digital silence, and "no frames" looks the same whether
 // the source died or nobody has pressed Cast yet. bit 0 = the source is silent; bit 1 = the server
@@ -819,8 +820,8 @@ let keepaliveTimer = null;
 let statsTimer = null;
 
 // ---- capability gate (existence only; precise check happens after config) ---
-if (CAST) {
-  // Plain HTTP on purpose, and decoding is done by the server (see the Cast mode notes at the top).
+if (PCM_PAGE) {
+  // Plain HTTP on purpose, and decoding is done by the server (see the Android TV app notes at the top).
 } else if (!window.isSecureContext) {
   // Plain http:// to a LAN IP is an insecure context, so the browser hides the
   // WebCodecs decoder. The server serves https for exactly this reason.
@@ -1128,7 +1129,7 @@ function clientIdentity() {
     name = localStorage.getItem("nfs_cname");
   } catch (e) {}
   if (chosenName) name = chosenName; // in-session pick wins (covers a failed storage write)
-  if (HANDS_FREE && castIdentity) return castIdentity; // the server (or the TV app) says which TV this is
+  if (HANDS_FREE && appIdentity) return appIdentity; // the TV app says which TV this is
   if (!id) {
     id = "c" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
     try { localStorage.setItem("nfs_cid", id); } catch (e) {}
@@ -1207,7 +1208,7 @@ function connect() {
   teardownConnection(); // ensure a clean slate (no leaked timers/decoders)
   const proto = location.protocol === "https:" ? "wss" : "ws";
   try {
-    ws = new WebSocket(`${proto}://${location.host}/ws${CAST ? "?cast=1" : ""}`);
+    ws = new WebSocket(`${proto}://${location.host}/ws${PCM_PAGE ? "?pcm=1" : ""}`);
   } catch (e) {
     scheduleReconnect();
     return;
@@ -3813,90 +3814,58 @@ paintVolume();
 paintIdentity();
 paintPanels();
 
-// ---- Google Cast mode: start by itself, and report what this device can do -------------------------
-const MSG_CAST_PROBE = 0x27; // client→server: [0x27][utf8 JSON] — this device's report (Cast mode only)
-function castReceiverStart() {
-  // Google's receiver library. Without start() the device treats the page as a failed launch and
-  // closes it; disableIdleTimeout keeps it open with no media element playing. Absent when the page is
-  // opened in an ordinary browser to try it out — then this is a no-op.
-  try {
-    const fw = window.cast && window.cast.framework;
-    if (!fw) return "absent";
-    const opts = new fw.CastReceiverOptions();
-    opts.disableIdleTimeout = true;
-    opts.skipPlayersLoad = true;
-    fw.CastReceiverContext.getInstance().start(opts);
-    return "started";
-  } catch (e) {
-    return "failed: " + (e && e.message ? e.message : e);
-  }
-}
-function castProbe(receiver, storageBefore) {
+// ---- Android TV app: start by itself, and report what the TV can do -----------------------------------
+const MSG_TV_REPORT = 0x27; // client→server: [0x27][utf8 JSON] — the TV's report (Android TV app only)
+function tvReport(page) {
   const lat = (v) => (typeof v === "number" ? Math.round(v * 1000) : null);
   const m = navigator.userAgent.match(/Chrome\/(\d+)/);
   return {
     chrome: m ? Number(m[1]) : null,
     userAgent: navigator.userAgent,
-    receiver,
+    page,
     secureContext: window.isSecureContext,
     nativeAudioDecoder: NATIVE_AUDIO_DECODER,
     audioContext: ac ? ac.state : "none",
     sampleRate: ac ? ac.sampleRate : null,
     outputLatencyMs: ac ? lat(ac.outputLatency) : null,
     baseLatencyMs: ac ? lat(ac.baseLatency) : null,
-    storageKept: storageBefore,
     playing: !!(ac && ac.state === "running" && aPlayable > 0),
     screen: window.innerWidth + "x" + window.innerHeight,
   };
 }
-function castSendProbe(p) {
+function sendTvReport(r) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const body = new TextEncoder().encode(JSON.stringify(p));
+  const body = new TextEncoder().encode(JSON.stringify(r));
   const buf = new Uint8Array(1 + body.length);
-  buf[0] = MSG_CAST_PROBE;
+  buf[0] = MSG_TV_REPORT;
   buf.set(body, 1);
   try { ws.send(buf); } catch (e) {}
 }
-async function castBoot() {
-  // Opened by the Newfoundsync Android TV app: it says who it is, and there is no Cast receiver.
-  // NFS_TV is the HTTPS page (WebCodecs, video); NFS_APP the plain-HTTP fallback (PCM, audio only).
+function handsFreeBoot() {
+  // Who the app says this TV is: NFS_TV on the HTTPS page (WebCodecs, video), NFS_APP on the plain-HTTP
+  // sound-only page. Without one (the page opened by hand) the usual browser identity is used.
   const fromApp = TV_APP ? window.NFS_TV : window.NFS_APP;
   const tvApp = fromApp && typeof fromApp.id === "string" && typeof fromApp.name === "string"
     ? { id: fromApp.id, name: fromApp.name }
     : null;
   if (TV_APP && (!window.isSecureContext || !NATIVE_AUDIO_DECODER || !window.AudioContext)) {
-    // No WebCodecs after all (an old WebView): go to the audio-only TV page on the plain-HTTP port
+    // No WebCodecs after all (an old WebView): go to the sound-only page on the plain-HTTP port
     // (this port + 1), which the server feeds PCM.
     const port = Number(location.port || 443) + 1;
-    location.replace(`http://${location.hostname}:${port}/cast?app=1&id=${encodeURIComponent(tvApp.id)}&name=${encodeURIComponent(tvApp.name)}`);
+    location.replace(`http://${location.hostname}:${port}/tv?app=1&id=${encodeURIComponent(tvApp.id)}&name=${encodeURIComponent(tvApp.name)}`);
     return;
   }
-  const receiver = TV_APP ? "android-tv-app (video)" : tvApp ? "android-tv-app (audio only)" : castReceiverStart();
-  // Whether this device kept anything from an earlier launch (decides whether the TV may rely on its
-  // own storage at all; the server-side id is what it uses either way).
-  let storageBefore = null;
-  try {
-    storageBefore = localStorage.getItem("nfs_cast_seen") === "1";
-    localStorage.setItem("nfs_cast_seen", "1");
-  } catch (e) {}
-  if (tvApp) castIdentity = tvApp;
-  else try {
-    const r = await fetch("/cast/whoami", { cache: "no-store" });
-    if (r.ok) {
-      const who = await r.json();
-      if (who && typeof who.id === "string" && typeof who.name === "string") castIdentity = { id: who.id, name: who.name };
-    }
-  } catch (e) {}
+  if (tvApp) appIdentity = tvApp;
   paintIdentity();
   onStart();
   // Some devices start the context suspended without a gesture; ask once more, then report what
-  // happened either way — the report is how the server window learns whether this TV can play.
+  // happened either way — the report (in the server log) says whether this TV can play.
   setTimeout(() => { if (ac && ac.state !== "running") ac.resume().catch(() => {}); }, 1000);
-  const report = () => castSendProbe(castProbe(receiver, storageBefore));
+  const report = () => sendTvReport(tvReport(TV_APP ? "video" : "sound only"));
   setTimeout(report, 6000);
   setInterval(report, 60000);
 }
-if (HANDS_FREE) castBoot();
+if (HANDS_FREE) handsFreeBoot();
 
 // =============================================================================
 // Readiness stamp — MUST be the last statement in this file.

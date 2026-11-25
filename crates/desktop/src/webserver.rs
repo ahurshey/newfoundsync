@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, RawQuery, State};
+use axum::extract::{RawQuery, State};
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -263,11 +263,12 @@ const MSG_CLIENT_SYNC: u8 = 0x24;
 /// it says — and the client can show "nothing is playing" or "waiting for a cast" instead of
 /// "playing" over silence or "no audio" over a perfectly healthy idle relay.
 const MSG_STREAM_INFO: u8 = 0x26;
-/// Client→server: a Cast page's report on the device it runs on, `[0x27][utf8 JSON]`. Logged and kept
-/// on the client's [`ClientEntry::cast_probe`] for the server window.
-const MSG_CAST_PROBE: u8 = 0x27;
-/// The largest Cast probe report kept. It is a handful of short fields.
-const MAX_CAST_PROBE_BYTES: usize = 2048;
+/// Client→server: the Android TV app page's report on the TV it runs on, `[0x27][utf8 JSON]` (browser
+/// version, whether sound started without a tap, output latency). Logged and kept on the client's
+/// [`ClientEntry::tv_report`].
+const MSG_TV_REPORT: u8 = 0x27;
+/// The largest TV report kept. It is a handful of short fields.
+const MAX_TV_REPORT_BYTES: usize = 2048;
 /// The source is being captured and is carrying only digital silence.
 const INFO_SILENT: u8 = 1;
 /// The source is a web cast and no client holds the cast slot.
@@ -416,12 +417,11 @@ pub struct ClientEntry {
     /// it used to be discarded). Non-zero is the objective signal that stuttering is THIS client
     /// falling behind — not the network, and not the browser's decoder.
     pub frames_dropped: Arc<AtomicU64>,
-    /// True for the page a Google Cast device runs (`/cast`): it gets PCM, starts by itself and has no
-    /// controls of its own, so the server window is the only place to set it up.
-    pub is_cast: bool,
-    /// What a Cast page reported about the device it runs on ([`MSG_CAST_PROBE`]): browser version,
-    /// whether sound could start without a tap, output latency. Empty until it reports.
-    pub cast_probe: String,
+    /// True for the Android TV app's sound-only page (`/tv`, plain HTTP): it has no WebCodecs, so the
+    /// server sends it PCM and no video.
+    pub pcm: bool,
+    /// What a TV app page reported about the TV it runs on ([`MSG_TV_REPORT`]). Empty until it reports.
+    pub tv_report: String,
 }
 
 /// All currently-connected clients, keyed by ephemeral connection id. Shared
@@ -521,9 +521,6 @@ struct AppState {
     next_id: AtomicU64,
     /// The single active caster's conn_id (web-uplink source), or None. Shared with the GUI.
     cast: CastState,
-    /// The Google Cast devices found on the network, by address, so a TV page that connects can be
-    /// told which TV it is running on (`/cast/whoami`).
-    cast_devices: crate::cast::CastDirectory,
     /// The HTTPS port and the SHA-256 of its certificate (lower-case hex, of the DER), both `None`
     /// when serving plain HTTP. `/hello` reports them so the Android TV app can load the HTTPS page
     /// (the one with WebCodecs, so video) and accept this server's self-signed certificate, and only
@@ -532,12 +529,11 @@ struct AppState {
     cert_sha256: Option<String>,
 }
 
-/// The second, plain-HTTP listener the Google Cast page is served from. A Cast device cannot accept
-/// the self-signed certificate the main HTTPS port uses, and the page registered in Google's Cast
-/// console is loaded from here.
-pub struct ReceiverListener {
-    pub addr: SocketAddr,
-    pub cast_devices: crate::cast::CastDirectory,
+/// The plain-HTTP port next to the HTTPS one (HTTPS port + 1, 47001 by default). The Android TV app
+/// finds servers on it (`/hello`, no certificate to deal with while searching) and falls back to its
+/// sound-only page there (`/tv`) if the HTTPS page will not load.
+pub fn tv_port(https_port: u16) -> u16 {
+    https_port.checked_add(1).unwrap_or(https_port - 1)
 }
 
 /// Run the web server until shutdown. `stream` carries the active capture/stream
@@ -551,10 +547,9 @@ pub async fn run(
     cast: CastState,
     addr: SocketAddr,
     use_tls: bool,
-    receiver: Option<ReceiverListener>,
+    tv_addr: Option<SocketAddr>,
 ) -> Result<()> {
     let _ = STARTED_AT.set(std::time::Instant::now()); // for /health uptime
-    let cast_devices = receiver.as_ref().map(|r| r.cast_devices.clone()).unwrap_or_default();
     let tls_pem = if use_tls {
         // Two crypto providers are compiled in (ring + aws-lc); pick one as the process
         // default before axum-server builds its ServerConfig.
@@ -570,7 +565,6 @@ pub async fn run(
         clients_reg,
         next_id: AtomicU64::new(1),
         cast,
-        cast_devices,
         https_port: use_tls.then_some(addr.port()),
         cert_sha256,
     });
@@ -592,32 +586,31 @@ pub async fn run(
         .route("/icon-512.png", get(icon_512_png))
         .route("/icon-512-maskable.png", get(icon_512_maskable_png))
         .route("/ws", get(ws_upgrade))
-        .route("/cast", get(cast_page)) // the page a Google Cast device (TV, speaker) runs
-        .route("/cast/whoami", get(cast_whoami))
+        .route("/tv", get(tv_sound_page)) // the Android TV app's sound-only fallback (plain HTTP)
         .route("/hello", get(hello)) // "is this a Newfoundsync server?" — for the Android TV app's search
         .with_state(state);
 
-    // The Cast page's own plain-HTTP port. Its failure to bind is logged, not fatal: everything else
-    // still works, only casting to a TV does not.
-    if let Some(r) = receiver.filter(|r| r.addr.port() != addr.port()) {
+    // The TV app's plain-HTTP port. Its failure to bind is logged, not fatal: everything else still
+    // works, only the Android TV app cannot find this server.
+    if let Some(tv_addr) = tv_addr.filter(|a| a.port() != addr.port()) {
         let app = app.clone();
         tokio::spawn(async move {
-            match tokio::net::TcpListener::bind(r.addr).await {
+            match tokio::net::TcpListener::bind(tv_addr).await {
                 Ok(listener) => {
-                    tracing::info!(addr = %r.addr, "Google Cast page listening (plain HTTP) at /cast");
+                    tracing::info!(addr = %tv_addr, "Android TV app port listening (plain HTTP)");
                     if let Err(e) = axum::serve(
                         listener,
-                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                        app.into_make_service(),
                     )
                     .await
                     {
-                        tracing::error!("Google Cast page server stopped: {e:#}");
+                        tracing::error!("Android TV app port stopped: {e:#}");
                     }
                 }
                 Err(e) => tracing::warn!(
-                    addr = %r.addr,
-                    "could not open the port the Google Cast page is served from ({e}); casting to a TV \
-                     will not work until it is free"
+                    addr = %tv_addr,
+                    "could not open the Android TV app's port ({e}); the TV app will not find this \
+                     server until it is free"
                 ),
             }
         });
@@ -628,7 +621,7 @@ pub async fn run(
             .await
             .with_context(|| format!("bind HTTP server on {addr}"))?;
         tracing::warn!(%addr, build = crate::BUILD_ID, "serving plain HTTP — WebCodecs only works via localhost or a TLS proxy");
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        axum::serve(listener, app.into_make_service())
             .await
             .context("web server error")?;
         return Ok(());
@@ -645,7 +638,7 @@ pub async fn run(
         addr.port()
     );
     axum_server::bind_rustls(addr, config)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .serve(app.into_make_service())
         .await
         .context("web server error")?;
     Ok(())
@@ -674,33 +667,26 @@ async fn index(RawQuery(query): RawQuery) -> axum::response::Response {
         .into_response()
 }
 
-/// Google's Cast receiver library. Google asks that it is loaded from their CDN, never copied.
-const CAST_RECEIVER_SDK: &str =
-    "https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js";
-
-/// The client page as a TV runs it: the same page and the same `app.js`, flagged so it starts by
-/// itself, takes PCM (a plain-HTTP page has no WebCodecs) and shows no controls.
-///
-/// `app` is set when the Newfoundsync Android TV app opened it (`/cast?app=1&id=…&name=…`): the app
-/// says who it is, so the page skips Google's Cast library (useless outside a Cast device) and the
-/// `/cast/whoami` lookup. Otherwise it is a Google Cast device and loads Google's receiver library.
-fn cast_page_body(index: &str, app: Option<(&str, &str)>) -> String {
-    let head = match app {
+/// The Android TV app's sound-only page (`/tv?app=1&id=…&name=…`, plain HTTP): the same page and the
+/// same `app.js`, hands-free (starts by itself, no controls, named by the app), taking PCM because a
+/// plain-HTTP page has no WebCodecs. The app uses it only when the HTTPS page will not load.
+fn tv_sound_page_body(index: &str, app: Option<(&str, &str)>) -> String {
+    let app_js = match app {
         Some((id, name)) => format!(
-            "<head>\n<script>window.NFS_CAST = true; window.NFS_APP = {{\"id\":{},\"name\":{}}};</script>",
+            " window.NFS_APP = {{\"id\":{},\"name\":{}}};",
             script_safe(&json_str(id)),
             script_safe(&json_str(name))
         ),
-        None => format!("<head>\n<script>window.NFS_CAST = true;</script>\n<script src=\"{CAST_RECEIVER_SDK}\"></script>"),
+        None => String::new(),
     };
     index
-        .replacen("<html lang=\"en\">", "<html lang=\"en\" class=\"cast\">", 1)
-        .replacen("<head>", &head, 1)
+        .replacen("<html lang=\"en\">", "<html lang=\"en\" class=\"handsfree\">", 1)
+        .replacen("<head>", &format!("<head>\n<script>window.NFS_PCM = true;{app_js}</script>"), 1)
 }
 
-/// The main page as the Android TV app opens it over HTTPS (`/?app=1&id=…&name=…`): hands-free like
-/// the Cast page (starts by itself, no controls, named by the app), but decoding with WebCodecs, so
-/// video plays too, full screen.
+/// The main page as the Android TV app opens it over HTTPS (`/?app=1&id=…&name=…`): hands-free (starts
+/// by itself, no controls, named by the app) and decoding with WebCodecs, so video plays too, full
+/// screen.
 fn tv_app_page_body(index: &str, id: &str, name: &str) -> String {
     let head = format!(
         "<head>\n<script>window.NFS_TV = {{\"id\":{},\"name\":{}}};</script>",
@@ -708,7 +694,7 @@ fn tv_app_page_body(index: &str, id: &str, name: &str) -> String {
         script_safe(&json_str(name))
     );
     index
-        .replacen("<html lang=\"en\">", "<html lang=\"en\" class=\"cast tv\">", 1)
+        .replacen("<html lang=\"en\">", "<html lang=\"en\" class=\"handsfree tv\">", 1)
         .replacen("<head>", &head, 1)
 }
 
@@ -763,14 +749,14 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-async fn cast_page(RawQuery(query): RawQuery) -> impl IntoResponse {
+async fn tv_sound_page(RawQuery(query): RawQuery) -> impl IntoResponse {
     let app = tv_app_params(query.as_deref());
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        cast_page_body(&index_body(), app.as_ref().map(|(i, n)| (i.as_str(), n.as_str()))),
+        tv_sound_page_body(&index_body(), app.as_ref().map(|(i, n)| (i.as_str(), n.as_str()))),
     )
 }
 
@@ -794,28 +780,6 @@ async fn hello(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             state.https_port.map(|p| p.to_string()).unwrap_or_else(|| "null".into()),
             state.cert_sha256.as_deref().map(json_str).unwrap_or_else(|| "null".into()),
         ),
-    )
-}
-
-/// Which Cast device the asking page runs on, matched by its address against the devices found on the
-/// network: `{"id":"cast-…","name":"Living Room TV"}`. A device that was not found (opened from Google's
-/// test tool before a search, say) still gets a stable id from its address.
-async fn cast_whoami(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    let ip = peer.ip().to_canonical();
-    let found = state.cast_devices.lock().ok().and_then(|d| d.get(&ip).cloned());
-    let (id, name) = match found {
-        Some(d) => (crate::cast::client_id(&d.id), d.name),
-        None => (crate::cast::client_id(&ip.to_string()), format!("TV at {ip}")),
-    };
-    (
-        [
-            (header::CONTENT_TYPE, "application/json"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        format!("{{\"id\":{},\"name\":{}}}", json_str(&id), json_str(&name)),
     )
 }
 
@@ -1258,14 +1222,14 @@ async fn ws_upgrade(
     State(state): State<Arc<AppState>>,
     RawQuery(query): RawQuery,
 ) -> impl IntoResponse {
-    // `?cast=1`: the Google Cast page. It has no WebCodecs (plain HTTP), so it is sent PCM.
-    let is_cast = query.as_deref().is_some_and(|q| q.split('&').any(|kv| kv == "cast=1"));
+    // `?pcm=1`: the TV app's sound-only page. It has no WebCodecs (plain HTTP), so it is sent PCM.
+    let pcm = query.as_deref().is_some_and(|q| q.split('&').any(|kv| kv == "pcm=1"));
     // Cap WS message/frame size well below tungstenite's 64 MiB default so a malicious/buggy caster
     // can't force huge per-message allocations (each fanned out to every receiver). Above any legit
     // payload (see MAX_UP_* — largest is a 4 MiB video AU).
     ws.max_message_size(8 * 1024 * 1024)
         .max_frame_size(8 * 1024 * 1024)
-        .on_upgrade(move |socket| ws_client(socket, state, is_cast))
+        .on_upgrade(move |socket| ws_client(socket, state, pcm))
 }
 
 /// Removes this client from the registry and decrements the connected-client
@@ -1291,7 +1255,7 @@ impl Drop for ClientGuard {
     }
 }
 
-async fn ws_client(socket: WebSocket, state: Arc<AppState>, is_cast: bool) {
+async fn ws_client(socket: WebSocket, state: Arc<AppState>, pcm: bool) {
     let n = state.clients.fetch_add(1, Ordering::Relaxed) + 1;
     let conn_id = state.next_id.fetch_add(1, Ordering::Relaxed);
     tracing::info!(conn_id, clients = n, "client connected");
@@ -1313,8 +1277,8 @@ async fn ws_client(socket: WebSocket, state: Arc<AppState>, is_cast: bool) {
                 identified: false,
                 stream_info: None,
                 frames_dropped: Arc::new(AtomicU64::new(0)),
-                is_cast,
-                cast_probe: String::new(),
+                pcm,
+                tv_report: String::new(),
             },
         );
     }
@@ -1324,7 +1288,7 @@ async fn ws_client(socket: WebSocket, state: Arc<AppState>, is_cast: bool) {
         cast: state.cast.clone(),
         conn_id,
     };
-    serve(socket, &state, conn_id, ctrl_rx, is_cast).await;
+    serve(socket, &state, conn_id, ctrl_rx, pcm).await;
 }
 
 /// Per-connection sliding ~1 s byte-rate limiter for caster uplinks. Returns true once the caster has
@@ -1447,7 +1411,7 @@ async fn serve(
     state: &AppState,
     conn_id: u64,
     mut ctrl_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    is_cast: bool,
+    pcm: bool,
 ) {
     let (sender, mut receiver) = socket.split();
 
@@ -1506,20 +1470,20 @@ async fn serve(
         }
     });
 
-    // A Cast page gets PCM (it has no WebCodecs), decoded here from the stream's Opus, and no video
-    // (it could not decode that either, and a TV is here for the sound).
-    let mut pcm_decoder = if is_cast && active.audio_codec == "opus" {
+    // The TV app's sound-only page gets PCM (it has no WebCodecs), decoded here from the stream's Opus,
+    // and no video (it could not decode that either).
+    let mut pcm_decoder = if pcm && active.audio_codec == "opus" {
         match newfoundsync_core::codec::Decoder::new(newfoundsync_core::codec::CodecKind::Opus) {
             Ok(d) => Some(d),
             Err(e) => {
-                tracing::warn!(conn_id, "Cast page: no Opus decoder ({e:#}); it will hear nothing");
+                tracing::warn!(conn_id, "TV sound-only page: no Opus decoder ({e:#}); it will hear nothing");
                 None
             }
         }
     } else {
         None
     };
-    let config_json = if is_cast {
+    let config_json = if pcm {
         active.config_json.replace("\"video\":true", "\"video\":false")
     } else {
         active.config_json.clone()
@@ -1631,17 +1595,17 @@ async fn serve(
                             }
                         }
                     }
-                    // A TV page's report on the device it runs on (a Cast device, or the Android TV app
-                    // on either page) → log it and keep it for the GUI. Size-capped and sanitized.
-                    Some(Ok(Message::Binary(b))) if b.first() == Some(&MSG_CAST_PROBE) => {
-                        let text: String = String::from_utf8_lossy(&b[1..b.len().min(1 + MAX_CAST_PROBE_BYTES)])
+                    // The TV app page's report on the TV it runs on → log it and keep it. Size-capped and
+                    // sanitized.
+                    Some(Ok(Message::Binary(b))) if b.first() == Some(&MSG_TV_REPORT) => {
+                        let text: String = String::from_utf8_lossy(&b[1..b.len().min(1 + MAX_TV_REPORT_BYTES)])
                             .chars()
                             .filter(|c| !c.is_control())
                             .collect();
-                        tracing::info!(conn_id, report = %text, "Google Cast device report");
+                        tracing::info!(conn_id, report = %text, "TV report");
                         if let Ok(mut reg) = state.clients_reg.lock() {
                             if let Some(e) = reg.get_mut(&conn_id) {
-                                e.cast_probe = text;
+                                e.tv_report = text;
                             }
                         }
                     }
@@ -1774,7 +1738,7 @@ async fn serve(
                     Err(broadcast::error::RecvError::Closed) => { exit = Exit::SourceSwapped; break }
                 }
             }
-            video = vrx.recv(), if !is_cast => {
+            video = vrx.recv(), if !pcm => {
                 match video {
                     Ok(frame) => match video_tx.try_send(Message::Binary((*frame).clone())) {
                         Ok(()) => {}
@@ -1849,20 +1813,25 @@ mod tests {
     #[test]
     fn tv_app_page_is_hands_free_with_video() {
         let page = super::tv_app_page_body("<html lang=\"en\"><head></head>", "tv-1", "Den TV</script>");
-        assert!(page.contains("class=\"cast tv\""));
+        assert!(page.contains("class=\"handsfree tv\""));
         assert!(page.contains("window.NFS_TV"));
-        assert!(!page.contains("NFS_CAST"), "not the PCM page: it decodes with WebCodecs");
+        assert!(!page.contains("NFS_PCM"), "not the PCM page: it decodes with WebCodecs");
         assert!(!page.contains("Den TV</script>"));
     }
 
     #[test]
-    fn app_page_cannot_break_out_of_its_script() {
-        let page = super::cast_page_body("<html lang=\"en\"><head></head>", Some(("tv-1", "</script><b>")));
+    fn tv_sound_page_cannot_break_out_of_its_script() {
+        let page = super::tv_sound_page_body("<html lang=\"en\"><head></head>", Some(("tv-1", "</script><b>")));
         assert!(!page.contains("</script><b>"));
         assert!(page.contains("window.NFS_APP"));
-        assert!(!page.contains("cast_receiver_framework"), "the app does not load Google's Cast library");
-        let cast = super::cast_page_body("<html lang=\"en\"><head></head>", None);
-        assert!(cast.contains("cast_receiver_framework"));
+        assert!(page.contains("window.NFS_PCM = true"));
+        assert!(page.contains("class=\"handsfree\""));
+    }
+
+    #[test]
+    fn tv_port_is_the_next_one() {
+        assert_eq!(super::tv_port(47000), 47001);
+        assert_eq!(super::tv_port(u16::MAX), u16::MAX - 1);
     }
 
     use super::*;

@@ -5,14 +5,14 @@ and plays in sync, full screen, with the logo and visualizer. The TV then shows 
 window's Devices list like any other device (volume, mute, sync, remembered by name).
 
 It is a thin shell: a full-screen WebView on the server's own page, so all the sync logic is the code
-every other device runs. No Google Cast registration is involved.
+every other device runs.
 
 - **Sound and video:** it opens the HTTPS page (`https://<server>:47000/?app=1…`), where the WebView
   has WebCodecs. Video, when the server shares a screen or a phone casts a tab, fills the screen;
   otherwise the logo and visualizer show. The server's certificate is self-signed, and the app
   accepts it only when its SHA-256 matches the `certSha256` the server reports in `/hello`.
 - **Fallback, sound only:** if that page cannot load, the plain-HTTP TV page
-  (`http://<server>:47001/cast?app=1…`, the one a Google Cast device runs), which the server feeds
+  (`http://<server>:47001/tv?app=1…`), which the server feeds
   PCM. The HTTPS page also sends itself there if the WebView turns out to have no WebCodecs.
 
 ## Finding the server

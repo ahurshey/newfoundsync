@@ -439,18 +439,18 @@ window.__NFS_BUILD = "__NFS_BUILD__";
   }
   body.immersive canvas { object-fit: contain; background: #000; }
 
-  /* Google Cast (a TV across the room, served at /cast): nobody holds it, so no controls; the logo
-     and its ring large in the middle, the state in words under it. Margins stay inside the TV's
-     overscan-safe area (5% each side). Volume and sync are set in the server window. */
-  html.cast header .iconbtn, html.cast #morebtn, html.cast #controls, html.cast #viztoggle,
-  html.cast #start, html.cast #hint, html.cast #hero, html.cast footer, html.cast #castbar,
-  html.cast #namemodal { display: none !important; }
-  html.cast body { overflow: hidden; cursor: none; }
-  html.cast header { position: static; background: none; backdrop-filter: none; padding: 5vh 5vw 0; }
-  html.cast main { justify-content: center; padding: 0 5vw 7vh; }
-  html.cast .vstage { width: min(54vh, 60vw); height: min(54vh, 60vw); }
-  html.cast .vstage img { width: 66%; height: 66%; }
-  html.cast #status { font-size: 1.5em; }
+  /* The Android TV app (a TV across the room): nobody holds it, so no controls; the logo and its ring
+     large in the middle, the state in words under it. Margins stay inside the TV's overscan-safe area
+     (5% each side). Volume and sync are set in the server window. */
+  html.handsfree header .iconbtn, html.handsfree #morebtn, html.handsfree #controls, html.handsfree #viztoggle,
+  html.handsfree #start, html.handsfree #hint, html.handsfree #hero, html.handsfree footer, html.handsfree #castbar,
+  html.handsfree #namemodal { display: none !important; }
+  html.handsfree body { overflow: hidden; cursor: none; }
+  html.handsfree header { position: static; background: none; backdrop-filter: none; padding: 5vh 5vw 0; }
+  html.handsfree main { justify-content: center; padding: 0 5vw 7vh; }
+  html.handsfree .vstage { width: min(54vh, 60vw); height: min(54vh, 60vw); }
+  html.handsfree .vstage img { width: 66%; height: 66%; }
+  html.handsfree #status { font-size: 1.5em; }
   /* The Android TV app on the HTTPS page: video, when there is any, fills the screen. app.js shows
      #stage only while frames arrive, so the logo and visualizer come back by themselves without. */
   html.tv #stage {

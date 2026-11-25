@@ -602,17 +602,22 @@ impl ServerApp {
         #[cfg(target_os = "linux")]
         const ALL_APPS: &str = "Everything this computer plays.";
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-        const ALL_APPS: &str = "Everything this computer plays.";
+        const ALL_APPS: &str = "Everything this Mac plays.";
         #[cfg(target_os = "windows")]
         const SYSTEM: &str = "Mirrors the speakers. Goes silent when Windows is muted.";
         #[cfg(not(target_os = "windows"))]
         const SYSTEM: &str = "Mirrors the speakers and follows system mute.";
 
-        if option_row(ui, self.source == SourceKind::AllApps, "All apps", ALL_APPS, |_| {}) {
+        if option_row(ui, self.source == SourceKind::AllApps, "All apps", ALL_APPS, |ui| {
+            #[cfg(target_os = "macos")]
+            self.ui_silent_toggle(ui);
+            #[cfg(not(target_os = "macos"))]
+            let _ = ui;
+        }) {
             self.pick_local(SourceKind::AllApps);
         }
 
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         {
             // The wording differs per platform because the underlying thing differs. Windows lists
             // windows and audio sessions, so "one window or app" is honest. Linux can only see
@@ -622,8 +627,16 @@ impl ServerApp {
             const ONE_APP: (&str, &str) = ("One window or app", "Only the window or app you pick.");
             #[cfg(target_os = "linux")]
             const ONE_APP: (&str, &str) = ("One app", "Only that app. It appears once it is playing.");
+            // macOS lists every app that has opened audio, playing or not; helper processes
+            // (browser audio, WebKit) are folded into the app that owns them.
+            #[cfg(target_os = "macos")]
+            const ONE_APP: (&str, &str) = ("One app", "Only the app you pick. It appears once it has played sound.");
             let selected = self.source == SourceKind::App;
-            if option_row(ui, selected, ONE_APP.0, ONE_APP.1, |ui| self.ui_app_picker(ui)) {
+            if option_row(ui, selected, ONE_APP.0, ONE_APP.1, |ui| {
+                self.ui_app_picker(ui);
+                #[cfg(target_os = "macos")]
+                self.ui_silent_toggle(ui);
+            }) {
                 self.pick_local(SourceKind::App);
                 // Arriving at the per-app source: enumerate now, so the list is current the first
                 // time it is opened rather than whatever was cached at startup.
@@ -709,8 +722,19 @@ impl ServerApp {
         }
     }
 
+    /// "Silent on this Mac" under All apps and One app: the capture's process tap mutes what it
+    /// captures, so the Mac does not play it a whole buffer ahead of every synced device. The
+    /// macOS counterpart of Linux's "Newfoundsync output device".
+    #[cfg(target_os = "macos")]
+    fn ui_silent_toggle(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.silent_local, "Silent on this Mac").on_hover_text(
+            "Mutes what is being streamed on this Mac's own speakers while it streams, so you only \
+             hear it in sync on your devices. The sound comes back when you stop or switch source.",
+        );
+    }
+
     /// The app list under "One app": a picker and a refresh button.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     fn ui_app_picker(&mut self, ui: &mut egui::Ui) {
         let apps = self.apps.clone();
         ui.horizontal(|ui| {
@@ -733,6 +757,8 @@ impl ServerApp {
                         ui.label("No windows or apps found. Press refresh.");
                         #[cfg(target_os = "linux")]
                         ui.label("Nothing is playing right now. Start playback and it appears here.");
+                        #[cfg(target_os = "macos")]
+                        ui.label("No app has played sound yet. Start playback, then refresh.");
                     }
                 });
             // Opening the picker enumerates. With no background scan, this is what keeps the list
@@ -1674,7 +1700,7 @@ impl eframe::App for ServerApp {
         if self.applied.is_none() {
             self.applied = Some(self.current_config());
         }
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         {
             #[cfg(target_os = "linux")]
             self.poll_routes(&ctx);

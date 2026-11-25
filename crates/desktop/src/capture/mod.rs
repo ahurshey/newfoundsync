@@ -39,6 +39,13 @@ pub mod sessions;
 #[cfg(target_os = "linux")]
 #[path = "linux_sessions.rs"]
 pub mod sessions;
+// macOS: CoreAudio process taps (14.2+) for "One app" and "Silent on this Mac". Same module path
+// again, see mac_sessions.rs.
+#[cfg(target_os = "macos")]
+pub mod mac_tap;
+#[cfg(target_os = "macos")]
+#[path = "mac_sessions.rs"]
+pub mod sessions;
 
 #[cfg(not(target_os = "linux"))]
 #[allow(unused_imports)]

@@ -25,7 +25,7 @@ fn f32_to_i16(s: f32) -> i16 {
 /// Streaming linear resampler from `src_rate` to the canonical 48 kHz, stereo.
 /// State persists across cpal callbacks (carries the previous input sample and
 /// the fractional read position).
-struct Resampler {
+pub(super) struct Resampler {
     inc: f64, // input samples consumed per output sample = src_rate / 48000
     t: f64,   // fractional position within [prev, cur]
     prev_l: f32,
@@ -34,7 +34,7 @@ struct Resampler {
 }
 
 impl Resampler {
-    fn new(src_rate: u32) -> Self {
+    pub(super) fn new(src_rate: u32) -> Self {
         Resampler {
             inc: src_rate as f64 / config::SAMPLE_RATE as f64,
             t: 0.0,
@@ -46,7 +46,7 @@ impl Resampler {
 
     /// Feed one stereo input sample; emit interpolated 48 kHz samples into `acc`
     /// (interleaved L,R i16), flushing a full frame to `on_frame` each 20 ms.
-    fn push<F: FnMut(&[i16])>(&mut self, l: f32, r: f32, acc: &mut Vec<i16>, on_frame: &mut F) {
+    pub(super) fn push<F: FnMut(&[i16])>(&mut self, l: f32, r: f32, acc: &mut Vec<i16>, on_frame: &mut F) {
         if !self.have_prev {
             self.prev_l = l;
             self.prev_r = r;

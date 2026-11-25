@@ -100,6 +100,10 @@ struct Cli {
     /// source is never restored: its PID does not survive a restart.)
     #[arg(long)]
     capture: Option<String>,
+    /// macOS: keep what is captured silent on this Mac while it streams (all apps or one app).
+    /// Omitted ⇒ the choice last applied in the GUI.
+    #[arg(long)]
+    silent: bool,
     /// PID to capture when --capture app.
     #[arg(long, required_if_eq("capture", "app"))]
     app_pid: Option<u32>,
@@ -205,6 +209,14 @@ fn main() -> Result<()> {
         }
         other => return Err(anyhow!("unknown capture '{other}' (use allapps|system|app|sink|web)")),
     };
+    if cli.silent && !cfg!(target_os = "macos") {
+        return Err(anyhow!(
+            "--silent is macOS-only. On Linux use --capture sink (the Newfoundsync output device); on \
+             Windows the all-apps and app sources keep streaming with the PC muted."
+        ));
+    }
+    let silent_local = cfg!(target_os = "macos")
+        && (cli.silent || settings::get("silent").as_deref() == Some("1"));
     let video = if cli.video {
         // A request for local screen capture used to be accepted here and then dropped deep in
         // media.rs with nothing but a warn! — so `--video` appeared to work, the stream came up
@@ -264,6 +276,7 @@ fn main() -> Result<()> {
                 name,
                 gui::InitialConfig {
                     capture_source,
+                    silent_local,
                     video,
                     encoder,
                     encode_device,
@@ -289,6 +302,7 @@ fn main() -> Result<()> {
     let result = run_headless(
         name,
         capture_source,
+        silent_local,
         video,
         encoder,
         encode_device,
@@ -310,6 +324,7 @@ fn main() -> Result<()> {
 fn run_headless(
     name: String,
     capture_source: CaptureSource,
+    silent_local: bool,
     video: Option<VideoConfig>,
     encoder: EncoderBackend,
     encode_device: EncodeDevice,
@@ -327,6 +342,7 @@ fn run_headless(
         lead_ms: config::DEFAULT_LEAD_MS,
         buffer_ms,
         capture_source,
+        silent_local,
         video,
         av_offset_ns,
         video_target: media::VideoTarget::PrimaryMonitor, // headless: whole monitor (no window picker)

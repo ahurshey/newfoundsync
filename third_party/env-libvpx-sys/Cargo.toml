@@ -1,0 +1,29 @@
+[package]
+name = "env-libvpx-sys"
+authors = ["Richard Diamond <wichard@vitalitystudios.com>", "Kornel Lesiński <kornel@geekhood.net>", "Andrew Straw <strawman@astraw.com>"]
+description = "Rust bindings to libvpx"
+license = "MPL-2.0"
+links = "vpx"
+repository = "https://github.com/astraw/env-libvpx-sys"
+version = "5.1.3"
+edition = "2018"
+keywords = ["vp8", "vp9", "webm", "bindings", "video"]
+categories = ["external-ffi-bindings", "multimedia::images", "multimedia::encoding", "multimedia::video"]
+
+[build-dependencies]
+pkg-config = "0.3.5"
+
+# NEWFOUNDSYNC CHANGE — the only difference from the published 5.1.3 (see VENDORED.md).
+# Was "0.68.1". bindgen older than 0.72.1 misreads the headers under libclang 21 and newer: every
+# struct that is named before it is defined (vpx_codec_enc_cfg, vpx_codec_dec_cfg) comes
+# out as an empty one-byte opaque type, with no error from bindgen.
+[build-dependencies.bindgen]
+optional = true
+version = "0.72.1"
+
+[features]
+default = []
+generate = ["bindgen"]
+
+[lib]
+name = "vpx_sys"

@@ -6,3 +6,7 @@
 # "invalid option name" because the option carries a trailing \r — aborting the Flatpak build script
 # on its seventh line. Diagnosed once the hard way; pinned here so it cannot recur.
 *.sh text eol=lf
+
+# Vendored third-party source stays byte-for-byte as published, so it can be diffed against the
+# upstream release; some of it has mixed line endings that `text=auto` would otherwise rewrite.
+third_party/** -text linguist-vendored

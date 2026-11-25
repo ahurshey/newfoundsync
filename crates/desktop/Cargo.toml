@@ -31,6 +31,9 @@ vp9 = ["dep:env-libvpx-sys", "video-encode"]
 # 1.14.1 — because the version is not just a label: using 1.13 bindings against a 1.14 library is a
 # struct-layout mismatch, i.e. silent memory corruption rather than a link error. Costs a libclang
 # dependency at build time, which the Flatpak already carries for pipewire-sys and SVT-AV1.
+#
+# The generating is done by the copy of env-libvpx-sys in third_party/, not the crates.io release:
+# that one pins a bindgen which emits empty structs under libclang 21+ (see VENDORED.md there).
 vp9-bindgen = ["vp9", "env-libvpx-sys/generate"]
 # `video-encode` (NOT default): compile the AV1 encoder on non-Windows hosts.
 #

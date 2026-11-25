@@ -12,7 +12,7 @@ set -euo pipefail
 root="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 sha="$(git -C "$root" rev-parse --short=12 HEAD)"
 if [ -n "$(git -C "$root" status --porcelain --untracked-files=no -- \
-      crates/desktop/src crates/desktop/web crates/desktop/Cargo.toml crates/core Cargo.lock)" ]; then
+      crates/desktop/src crates/desktop/web crates/desktop/Cargo.toml crates/core Cargo.lock third_party)" ]; then
   sha="${sha}-dirty"
 fi
 printf '%s\n' "$sha" > "$root/.nfs-git-sha"

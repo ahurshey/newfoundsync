@@ -37,7 +37,7 @@ mod view;
 // Both platforms now supply `sessions::{AudioApp, list_sources}` — Windows from a window/session
 // enumeration, Linux from the live PulseAudio sink-input list. Same types, different semantics
 // (see capture/linux_sessions.rs); the picker below is written to tolerate both.
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 use crate::capture::sessions::{self, AudioApp};
 #[cfg(target_os = "linux")]
 use crate::capture::pulse::{self, RouteSnapshot};
@@ -117,6 +117,8 @@ const VP9_HINT: &str =
 /// Initial server config (from CLI flags) used to seed the GUI + first stream.
 pub struct InitialConfig {
     pub capture_source: CaptureSource,
+    /// macOS: start with the "Silent on this Mac" option on (see `MediaOptions::silent_local`).
+    pub silent_local: bool,
     pub video: Option<VideoConfig>,
     pub encoder: EncoderBackend,
     pub encode_device: EncodeDevice,
@@ -138,6 +140,7 @@ impl InitialConfig {
             buffer_ms: self.buffer_ms,
             av_offset_ns: self.av_offset_ns.clone(),
             capture_source: self.capture_source,
+            silent_local: self.silent_local,
             video: self.video,
             video_target: VideoTarget::PrimaryMonitor, // CLI/initial stream starts on the monitor
             encoder: self.encoder,
@@ -375,11 +378,11 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         source,
         last_local_source,
         last_local_video: if video_kind == VideoSourceKind::WebCast { VideoSourceKind::Off } else { video_kind },
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         apps: Vec::new(),
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         apps_rx: None,
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         refreshing: false,
         #[cfg(target_os = "linux")]
         routing: AppRouting {
@@ -388,6 +391,7 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         },
         selected_pid,
         selected_name: String::new(),
+        silent_local: init.silent_local,
         video_kind,
         #[cfg(target_os = "windows")]
         video_pid: None,
@@ -414,7 +418,7 @@ pub fn run(port: u16, server_name: String, init: InitialConfig) -> Result<()> {
         zoom,
         did_initial_zoom: false,
     };
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     app.refresh_apps();
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -785,6 +789,7 @@ fn control_loop(
 struct AppliedConfig {
     source: SourceKind,
     selected_pid: Option<u32>,
+    silent_local: bool,
     video_kind: VideoSourceKind,
     #[cfg(target_os = "windows")]
     video_hwnd: Option<isize>,
@@ -933,18 +938,20 @@ struct ServerApp {
     /// The local source / screen choice to come back to when leaving "A device casts".
     last_local_source: SourceKind,
     last_local_video: VideoSourceKind,
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     apps: Vec<AudioApp>,
     // Async source enumeration: refresh_apps() spawns a worker and stashes the receiver here;
     // poll_refresh() (called each frame) applies the result. Never blocks the GUI thread.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     apps_rx: Option<mpsc::Receiver<Vec<AudioApp>>>,
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     refreshing: bool,
     #[cfg(target_os = "linux")]
     routing: AppRouting,
     selected_pid: Option<u32>,
     selected_name: String,
+    /// macOS: "Silent on this Mac" — the capture's process tap mutes what it captures.
+    silent_local: bool,
     // Screen sharing: off / whole screen / a specific window / the caster's screen.
     video_kind: VideoSourceKind,
     #[cfg(target_os = "windows")]
@@ -1295,7 +1302,7 @@ impl ServerApp {
         } else {
             self.source = self.last_local_source;
             self.video_kind = self.last_local_video;
-            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
             if self.source == SourceKind::App {
                 self.refresh_apps();
             }
@@ -1318,7 +1325,8 @@ impl ServerApp {
         let Some(a) = &self.applied else { return 0 };
         let c = self.current_config();
         let mut n = 0;
-        n += (a.source != c.source || a.selected_pid != c.selected_pid) as usize;
+        n += (a.source != c.source || a.selected_pid != c.selected_pid || a.silent_local != c.silent_local)
+            as usize;
         #[cfg(target_os = "windows")]
         let window_changed = a.video_hwnd != c.video_hwnd;
         #[cfg(not(target_os = "windows"))]
@@ -1351,6 +1359,7 @@ impl ServerApp {
         let Some(a) = self.applied.clone() else { return };
         self.source = a.source;
         self.selected_pid = a.selected_pid;
+        self.silent_local = a.silent_local;
         self.selected_name = if a.selected_pid.is_some() { self.applied_audio_name.clone() } else { String::new() };
         self.video_kind = a.video_kind;
         #[cfg(target_os = "windows")]
@@ -1392,6 +1401,7 @@ impl ServerApp {
         AppliedConfig {
             source: self.source,
             selected_pid: self.selected_pid,
+            silent_local: self.silent_local,
             video_kind: self.video_kind,
             #[cfg(target_os = "windows")]
             video_hwnd: self.video_hwnd,
@@ -1450,7 +1460,7 @@ impl ServerApp {
     /// `list_sources` internally spawns an MTA thread and joins it, so joining it on the
     /// GUI/STA thread would freeze the window (and could deadlock against the worker's COM
     /// teardown). The result is applied later by `poll_refresh`.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     fn refresh_apps(&mut self) {
         if self.refreshing {
             return; // one already in flight
@@ -1470,7 +1480,7 @@ impl ServerApp {
     }
 
     /// Apply a finished refresh, if one is ready. Called once per frame; never blocks.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     fn poll_refresh(&mut self) {
         let Some(rx) = &self.apps_rx else { return };
         match rx.try_recv() {
@@ -1658,6 +1668,7 @@ impl ServerApp {
             buffer_ms: config::clamp_buffer_ms(self.buffer_ms as i64),
             av_offset_ns: self.av_offset_ns.clone(),
             capture_source,
+            silent_local: self.silent_local,
             video,
             video_target,
             encoder,
@@ -1687,6 +1698,7 @@ impl ServerApp {
         };
         let saved = crate::settings::set_many(&[
             ("source", source.to_string()),
+            ("silent", (self.silent_local as u8).to_string()),
             ("buffer_ms", config::clamp_buffer_ms(self.buffer_ms as i64).to_string()),
             ("codec", self.codec.as_str().to_string()),
             ("bitrate", self.bitrate.to_string()),

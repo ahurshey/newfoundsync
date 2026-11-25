@@ -357,6 +357,10 @@ pub struct MediaOptions {
     pub lead_ms: i64,
     pub buffer_ms: i64,
     pub capture_source: CaptureSource,
+    /// macOS: mute what is captured on this machine while it streams (the process tap's mute), so
+    /// the Mac does not play it a buffer ahead of every synced client. Applies to the all-apps and
+    /// one-app sources; ignored elsewhere and by other sources.
+    pub silent_local: bool,
     pub video: Option<VideoConfig>,
     /// What the screen-video capture grabs (whole monitor or a single window).
     pub video_target: VideoTarget,
@@ -518,7 +522,7 @@ pub fn start(opts: MediaOptions) -> Result<Media> {
                 }
             }));
         };
-        AudioCapture::start(opts.capture_source, on_frame)?
+        AudioCapture::start(opts.capture_source, opts.silent_local, on_frame)?
     };
 
     // --- local video producer (skipped for a web uplink, which relays the caster's own frames) ---
@@ -649,15 +653,19 @@ enum AudioCapture {
     Pulse(crate::capture::pulse::PulseCapture),
     #[cfg(target_os = "windows")]
     Process(crate::capture::process::ProcessCapture),
+    #[cfg(target_os = "macos")]
+    Tap(crate::capture::mac_tap::TapCapture),
     /// No local capture (web-uplink source — frames arrive over the WebSocket).
     None,
 }
 
 impl AudioCapture {
-    fn start<F>(source: CaptureSource, on_frame: F) -> Result<(AudioCapture, String)>
+    fn start<F>(source: CaptureSource, silent: bool, on_frame: F) -> Result<(AudioCapture, String)>
     where
         F: FnMut(&[i16]) + Send + 'static,
     {
+        #[cfg(not(target_os = "macos"))]
+        let _ = silent;
         match source {
             // The web-uplink source never reaches here — start() handles it without local capture.
             CaptureSource::WebUplink => unreachable!("WebUplink has no local capture"),
@@ -739,7 +747,42 @@ impl AudioCapture {
                     .context("start per-app process-loopback capture")?;
                 Ok((AudioCapture::Process(c), format!("App (PID {render_pid}, survives mute)")))
             }
-            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            // macOS all apps, audible: cpal's own process tap (unchanged since 0.1.5).
+            #[cfg(target_os = "macos")]
+            CaptureSource::AllExceptSelf if !silent => {
+                tracing::info!("[capture] starting audio source = ALL APPS (cpal process tap)");
+                let c = SystemCapture::start(on_frame).context("start system capture")?;
+                let name = c.device_name.clone();
+                Ok((AudioCapture::System(c), name))
+            }
+            // macOS all apps, silent on this Mac: our own tap over every process but us, muted.
+            #[cfg(target_os = "macos")]
+            CaptureSource::AllExceptSelf => {
+                use crate::capture::mac_tap::{TapCapture, TapTarget};
+                tracing::info!("[capture] starting audio source = ALL APPS, silent on this Mac (muted process tap)");
+                let target = TapTarget::AllExcept(crate::capture::sessions::own_objects());
+                let c = TapCapture::start(target, true, "All apps", on_frame)
+                    .context("start the all-apps audio tap")?;
+                let name = c.device_name.clone();
+                Ok((AudioCapture::Tap(c), name))
+            }
+            // macOS one app: a tap over that app's process objects (its helpers included). Fails
+            // loudly rather than broadening to all apps — this arm used to quietly capture the whole
+            // Mac under a label naming one app.
+            #[cfg(target_os = "macos")]
+            CaptureSource::App { pid } => {
+                use crate::capture::mac_tap::{TapCapture, TapTarget};
+                let (objects, name) = crate::capture::sessions::tap_objects_for(pid)?;
+                tracing::info!(
+                    "[capture] starting audio source = SINGLE APP: {name} (pid {pid}, {} process object(s), silent={silent})",
+                    objects.len()
+                );
+                let c = TapCapture::start(TapTarget::Processes(objects), silent, &name, on_frame)
+                    .with_context(|| format!("start the audio tap for {name}"))?;
+                let name = c.device_name.clone();
+                Ok((AudioCapture::Tap(c), name))
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
             CaptureSource::AllExceptSelf | CaptureSource::App { .. } => {
                 tracing::warn!("process-loopback is Windows-only; using system loopback");
                 let c = SystemCapture::start(on_frame).context("start system capture")?;
